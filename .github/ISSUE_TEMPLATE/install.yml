@@ -1,0 +1,61 @@
+name: Installation problem
+description: Something went wrong during install
+labels: ["install"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Help us fix installation issues. Please tell us which step failed.
+  - type: dropdown
+    id: step
+    attributes:
+      label: Which step failed?
+      options:
+        - "claude plugin marketplace add"
+        - "claude plugin install"
+        - "awm binary install (brew or script)"
+        - "awm init"
+        - "First note injection"
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: error
+    attributes:
+      label: Exact error message
+      description: Copy and paste the exact error (redact any credentials or file paths with personal data)
+      placeholder: "error: command not found: awm"
+      render: text
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - macOS
+        - Linux
+        - Windows (WSL2)
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: shell
+    attributes:
+      label: Shell
+      description: Run `echo $SHELL` or `echo $0`
+      placeholder: "/bin/bash or /bin/zsh"
+  - type: textarea
+    id: awm_path
+    attributes:
+      label: Output of `command -v awm`
+      description: Shows where the awm binary is (if it was found)
+      placeholder: "/Users/you/.local/bin/awm"
+  - type: input
+    id: minutes
+    attributes:
+      label: How long did it take?
+      description: Approximately how many minutes did the installation process take before it failed?
+      placeholder: "5"
+    validations:
+      required: true

@@ -1,0 +1,44 @@
+name: Configuration question
+description: How to configure agent-web-memory for your workflow
+labels: ["docs"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have a question about configuration? We are happy to help.
+  - type: textarea
+    id: question
+    attributes:
+      label: What would you like to configure?
+      description: Describe what you want to change and why
+      placeholder: |
+        I want to turn off matching on certain URLs.
+        I want to see more or fewer notes per session.
+        I want to know how to change the matching sensitivity.
+    validations:
+      required: true
+  - type: input
+    id: awm_version
+    attributes:
+      label: awm version
+      description: Run `awm --version`
+      placeholder: "awm 0.1.0"
+  - type: textarea
+    id: current_config
+    attributes:
+      label: Current configuration
+      description: Run `awm config` and paste the output
+      placeholder: |
+        mode: inject
+        notify: first
+        channels:
+          url: true
+          query: true
+          ...
+      render: text
+  - type: textarea
+    id: expected
+    attributes:
+      label: What should happen after the change?
+      description: Describe the expected behavior
+      placeholder: "I should see fewer notes, only from the URL channel."

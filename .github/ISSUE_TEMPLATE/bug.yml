@@ -1,0 +1,87 @@
+name: Bug report
+description: Something does not work as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a bug. Please include as much detail as you can.
+  - type: input
+    id: awm_version
+    attributes:
+      label: awm version
+      description: Run `awm --version`
+      placeholder: "awm 0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: claude_version
+    attributes:
+      label: Claude Code version
+      description: Run `claude --version`
+      placeholder: "claude 2.1.286"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - macOS
+        - Linux
+        - Windows (WSL2)
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: install_method
+    attributes:
+      label: Installation method
+      options:
+        - brew tap / brew install
+        - cargo install
+        - install.sh script
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Describe the exact steps that led to the bug.
+      placeholder: |
+        1. Start Claude Code in a project
+        2. Run `awm search example`
+        3. See the error...
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead of what you expected?
+      placeholder: "The command printed an error..."
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened?
+      placeholder: "The command should have printed the search results..."
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `awm doctor`
+      description: Run `awm doctor` and paste the output (or leave blank if not available)
+      placeholder: "Agent-web-memory installation check..."
+      render: text
+  - type: textarea
+    id: report
+    attributes:
+      label: Output of `awm report`
+      description: Run `awm report` and paste the output (contains no personal data)
+      placeholder: "Agent-web-memory statistics and metrics..."
+      render: text
