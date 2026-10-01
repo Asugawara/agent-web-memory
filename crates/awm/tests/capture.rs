@@ -548,10 +548,13 @@ fn hook_payload_agent_follows_the_payload() {
     let claude = fixture("PostToolUse-WebSearch-plugin-2.json");
     let rec = Record::from_hook(&claude, NOW, &[]).unwrap().unwrap();
     assert_eq!(rec.agent, Agent::Claude);
-    // A Codex-only key marks a Codex payload even for a Claude tool name.
+    // Only the tool name `webrun` marks Codex; an extra `turn_id` key does not.
     let mut with_turn = claude.clone();
     with_turn["turn_id"] = json!("turn-1");
     let rec = Record::from_hook(&with_turn, NOW, &[]).unwrap().unwrap();
+    assert_eq!(rec.agent, Agent::Claude);
+    let codex = fixture("codex-PostToolUse-webrun-search-1.json");
+    let rec = Record::from_hook(&codex, NOW, &[]).unwrap().unwrap();
     assert_eq!(rec.agent, Agent::Codex);
 }
 
@@ -578,7 +581,19 @@ fn spooled_records_keep_their_agent_and_old_spool_files_are_claude() {
     write_spool(&opts, &format!("{}-old.json", NOW + 1), &claude, |v| {
         v.as_object_mut().unwrap().remove("agent");
     });
-    assert_eq!(capture::drain_spool(&opts).unwrap(), 2);
+    // A Codex spool file written before migration 0002: `agent` follows `source`.
+    let mut old_codex = codex.clone();
+    old_codex.tool_use_id = "codex-old".to_string();
+    write_spool(
+        &opts,
+        &format!("{}-old-codex.json", NOW + 2),
+        &old_codex,
+        |v| {
+            assert_eq!(v["source"], "codex-hook");
+            v.as_object_mut().unwrap().remove("agent");
+        },
+    );
+    assert_eq!(capture::drain_spool(&opts).unwrap(), 3);
     let c = conn(&opts);
     let agent_of = |id: &str| -> String {
         c.query_row(
@@ -590,4 +605,96 @@ fn spooled_records_keep_their_agent_and_old_spool_files_are_claude() {
     };
     assert_eq!(agent_of(&codex.tool_use_id), "codex");
     assert_eq!(agent_of(&claude.tool_use_id), "claude");
+    assert_eq!(agent_of("codex-old"), "codex");
+}
+
+#[test]
+fn a_spool_file_without_agent_gets_the_agent_of_its_source() {
+    let base = Record::from_hook(&fixture("PostToolUse-WebSearch-plugin-2.json"), NOW, &[])
+        .unwrap()
+        .unwrap();
+    let read = |source: &str| -> Agent {
+        let mut v = serde_json::to_value(&base).unwrap();
+        v["source"] = json!(source);
+        v.as_object_mut().unwrap().remove("agent");
+        serde_json::from_value::<Record>(v).unwrap().agent
+    };
+    assert_eq!(read("codex-hook"), Agent::Codex);
+    assert_eq!(read("codex-rollout"), Agent::Codex);
+    assert_eq!(read("hook"), Agent::Claude);
+    assert_eq!(read("import"), Agent::Claude);
+    // An `agent` key wins over `source`.
+    let mut v = serde_json::to_value(&base).unwrap();
+    v["source"] = json!("codex-hook");
+    v["agent"] = json!("claude");
+    assert_eq!(
+        serde_json::from_value::<Record>(v).unwrap().agent,
+        Agent::Claude
+    );
+}
+
+#[test]
+fn drain_spool_keeps_files_while_the_database_is_at_an_older_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut c = db::open(&dir.path().join("awm.db"), Role::Cli).unwrap();
+        db::migrate_with(&mut c, &db::MIGRATIONS[..1]).unwrap();
+    }
+    let opts = CaptureOpts {
+        data_dir: dir.path().to_path_buf(),
+        config: Config::default(),
+        now_ms: NOW,
+    };
+    let rec = Record::from_hook(&fixture("PostToolUse-WebSearch-plugin-2.json"), NOW, &[])
+        .unwrap()
+        .unwrap();
+    let name = format!("{NOW}-old.json");
+    write_spool(&opts, &name, &rec, |v| {
+        v.as_object_mut().unwrap().remove("agent");
+    });
+    assert_eq!(capture::drain_spool(&opts).unwrap(), 0);
+    assert!(opts.data_dir.join("spool").join(&name).is_file());
+    assert_eq!(count(&conn(&opts), "SELECT COUNT(*) FROM event"), 0);
+
+    // After the migration the same file is stored and removed.
+    db::migrate(&mut conn(&opts)).unwrap();
+    assert_eq!(capture::drain_spool(&opts).unwrap(), 1);
+    assert!(!opts.data_dir.join("spool").join(&name).exists());
+    assert_eq!(
+        count(
+            &conn(&opts),
+            "SELECT COUNT(*) FROM event WHERE agent = 'claude'"
+        ),
+        1
+    );
+}
+
+#[test]
+fn capture_spools_while_the_database_is_at_an_older_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut c = db::open(&dir.path().join("awm.db"), Role::Cli).unwrap();
+        db::migrate_with(&mut c, &db::MIGRATIONS[..1]).unwrap();
+    }
+    let opts = CaptureOpts {
+        data_dir: dir.path().to_path_buf(),
+        config: Config::default(),
+        now_ms: NOW,
+    };
+    let p = fixture("PostToolUse-WebFetch-plugin-3.json");
+    assert_eq!(capture::run(&p, &opts).unwrap(), CaptureOutcome::Spooled);
+    let c = conn(&opts);
+    assert_eq!(count(&c, "SELECT COUNT(*) FROM event"), 0);
+    // The best-effort log row fits the version 1 `hook_run` table.
+    assert_eq!(
+        count(
+            &c,
+            "SELECT COUNT(*) FROM hook_run WHERE hook = 'capture' AND outcome = 'spooled'"
+        ),
+        1
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("spool")).unwrap().count(),
+        1
+    );
 }

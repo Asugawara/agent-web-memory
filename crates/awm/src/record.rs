@@ -45,6 +45,15 @@ pub enum Agent {
 }
 
 impl Agent {
+    /// The agent of a record that names none (a spool file written before
+    /// migration 0002): Codex sources are Codex's, everything else is Claude's.
+    fn of_source(source: &str) -> Agent {
+        match source {
+            "codex-hook" | "codex-rollout" => Agent::Codex,
+            _ => Agent::Claude,
+        }
+    }
+
     pub fn as_db_str(self) -> &'static str {
         match self {
             Agent::Claude => "claude",
@@ -55,6 +64,7 @@ impl Agent {
 
 /// Mirrors the `event` columns plus its `result` rows.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "RecordWire")]
 pub struct Record {
     pub tool_use_id: String,
     pub tool: Tool,
@@ -76,12 +86,68 @@ pub struct Record {
     /// `hook`, `import`, `codex-hook` or `codex-rollout`. The database stores
     /// [`Record::db_source`].
     pub source: String,
-    /// Spool files written before migration 0002 have no `agent`; they are Claude's.
-    #[serde(default)]
+    /// Spool files written before migration 0002 have no `agent`; it follows
+    /// `source` then (see [`RecordWire`]).
     pub agent: Agent,
     pub results: Vec<ResultRow>,
     /// Set by capture; not read from the payload.
     pub quarantine_reason: Option<String>,
+}
+
+/// The serialized [`Record`] as read back (spool files): the same fields, with
+/// `agent` optional so that an old file without it gets [`Agent::of_source`].
+#[derive(Deserialize)]
+struct RecordWire {
+    tool_use_id: String,
+    tool: Tool,
+    session_id: String,
+    agent_id: Option<String>,
+    agent_type: Option<String>,
+    cwd_hash: String,
+    created_at: i64,
+    query: Option<String>,
+    url: Option<String>,
+    url_norm: Option<String>,
+    fetch_prompt: Option<String>,
+    http_code: Option<i64>,
+    bytes: Option<i64>,
+    duration_ms: Option<i64>,
+    status: Status,
+    summary: Option<String>,
+    match_text: String,
+    source: String,
+    #[serde(default)]
+    agent: Option<Agent>,
+    results: Vec<ResultRow>,
+    quarantine_reason: Option<String>,
+}
+
+impl From<RecordWire> for Record {
+    fn from(w: RecordWire) -> Record {
+        Record {
+            agent: w.agent.unwrap_or_else(|| Agent::of_source(&w.source)),
+            tool_use_id: w.tool_use_id,
+            tool: w.tool,
+            session_id: w.session_id,
+            agent_id: w.agent_id,
+            agent_type: w.agent_type,
+            cwd_hash: w.cwd_hash,
+            created_at: w.created_at,
+            query: w.query,
+            url: w.url,
+            url_norm: w.url_norm,
+            fetch_prompt: w.fetch_prompt,
+            http_code: w.http_code,
+            bytes: w.bytes,
+            duration_ms: w.duration_ms,
+            status: w.status,
+            summary: w.summary,
+            match_text: w.match_text,
+            source: w.source,
+            results: w.results,
+            quarantine_reason: w.quarantine_reason,
+        }
+    }
 }
 
 /// Where a transcript tool call happened.
@@ -202,11 +268,8 @@ impl Record {
                 cwd: text_of(payload.get("cwd")).unwrap_or(""),
                 created_at: now_ms,
                 source: "hook",
-                agent: if is_codex_payload(payload) {
-                    Agent::Codex
-                } else {
-                    Agent::Claude
-                },
+                // Codex calls its web tool `webrun`, handled above.
+                agent: Agent::Claude,
                 input: payload.get("tool_input").unwrap_or(&null),
                 response,
                 duration_ms,
@@ -323,11 +386,6 @@ impl Record {
         parts.retain(|p| !p.is_empty());
         parts.join("\n")
     }
-}
-
-/// A hook payload from Codex: tool `webrun`, or a key Claude Code never sends (`turn_id`).
-fn is_codex_payload(payload: &Value) -> bool {
-    text_of(payload.get("tool_name")) == Some("webrun") || payload.get("turn_id").is_some()
 }
 
 fn is_refusal(summary: &str) -> bool {

@@ -92,6 +92,20 @@ impl Home {
         home
     }
 
+    /// A database at schema version 1 (before migration 0002) with recording consent:
+    /// a new binary is installed and `awm doctor` has not run yet.
+    fn v1() -> Home {
+        let home = Home::bare();
+        let mut conn = db::open(&home.db_path(), Role::Cli).unwrap();
+        db::migrate_with(&mut conn, &db::MIGRATIONS[..1]).unwrap();
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('consent.record', 'yes')",
+            [],
+        )
+        .unwrap();
+        home
+    }
+
     /// An empty data directory: `awm init` never ran.
     fn bare() -> Home {
         Home {
@@ -160,6 +174,30 @@ impl Home {
             stdout: String::from_utf8(o.stdout).unwrap(),
             elapsed: start.elapsed(),
         }
+    }
+
+    /// Runs `awm {args}` with `HOME` inside the temporary directory.
+    fn awm(&self, args: &[&str]) -> Out {
+        let home = self.dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let o = Command::new(env!("CARGO_BIN_EXE_awm"))
+            .args(args)
+            .env("AWM_HOME", self.dir.path())
+            .env("HOME", &home)
+            .env_remove("CODEX_HOME")
+            .env_remove("AWM_DEBUG")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        Out {
+            code: o.status.code(),
+            stdout: String::from_utf8(o.stdout).unwrap(),
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    fn spool_files(&self) -> usize {
+        std::fs::read_dir(self.dir.path().join("spool")).map_or(0, Iterator::count)
     }
 
     fn hook(&self, hook: &str, payload: &Value) -> Out {
@@ -1067,4 +1105,64 @@ fn codex_stop_and_session_start_record_nothing_and_print_nothing() {
     );
     assert_silent(&start);
     assert_eq!(home.count("SELECT COUNT(*) FROM event"), 0);
+}
+
+#[test]
+fn the_upgrade_window_keeps_captures_until_doctor_migrates() {
+    let home = Home::v1();
+    // A capture spooled before the upgrade (an older binary saw a locked database).
+    let old = awm::record::Record::from_hook(
+        &fixture("PostToolUse-WebSearch-plugin-2.json"),
+        now_ms() - DAY_MS,
+        &[],
+    )
+    .unwrap()
+    .unwrap();
+    let mut v = serde_json::to_value(&old).unwrap();
+    v.as_object_mut().unwrap().remove("agent");
+    std::fs::create_dir_all(home.path().join("spool")).unwrap();
+    std::fs::write(
+        home.path()
+            .join("spool")
+            .join(format!("{}-old.json", now_ms() - DAY_MS)),
+        v.to_string(),
+    )
+    .unwrap();
+
+    let fetch = fixture("PostToolUse-WebFetch-plugin-3.json");
+    assert_silent(&home.hook("capture", &fetch));
+    assert_eq!(home.count("SELECT COUNT(*) FROM event"), 0);
+    assert_eq!(home.spool_files(), 2);
+    assert_eq!(
+        home.run("session-start", "{}", &[]).json()["systemMessage"],
+        "agent-web-memory: database needs an upgrade. Run: awm doctor"
+    );
+
+    let doctor = home.awm(&["doctor"]);
+    assert_eq!(doctor.code, Some(0), "{}", doctor.stdout);
+    assert!(
+        doctor
+            .stdout
+            .contains("database upgraded from schema version 1 to 2"),
+        "{}",
+        doctor.stdout
+    );
+    assert!(
+        doctor
+            .stdout
+            .contains("spool: 2 file(s) found, 2 ingested, 0 left"),
+        "{}",
+        doctor.stdout
+    );
+    assert_eq!(home.count("SELECT COUNT(*) FROM event"), 2);
+    assert_eq!(
+        home.count("SELECT COUNT(*) FROM event WHERE agent = 'claude'"),
+        2
+    );
+    assert_eq!(home.spool_files(), 0);
+
+    // The same call again is a duplicate.
+    assert_silent(&home.hook("capture", &fetch));
+    assert_eq!(home.count("SELECT COUNT(*) FROM event"), 2);
+    assert_eq!(home.spool_files(), 0);
 }

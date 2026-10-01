@@ -303,8 +303,9 @@ fn holds_data(conn: &Connection, from: u32) -> anyhow::Result<bool> {
 /// Writes `{db}.bak-v{from}` with `VACUUM INTO`. The copy goes to a new 0600
 /// temporary file whose name is unique to this process and call
 /// (`{db}.bak-v{from}.tmp-{pid}-{nanos}`, created with `create_new`), is synced,
-/// then renamed over any older backup; on unix the directory is synced after the
-/// rename so the new name survives a power cut.
+/// checked to be at schema version `from` (another migrator may have committed
+/// since `from` was read), then renamed over any older backup; on unix the
+/// directory is synced after the rename so the new name survives a power cut.
 fn backup(conn: &Connection, from: u32) -> anyhow::Result<PathBuf> {
     let db = conn
         .path()
@@ -317,7 +318,7 @@ fn backup(conn: &Connection, from: u32) -> anyhow::Result<PathBuf> {
         std::process::id()
     ));
     create_new_private_file(&tmp).with_context(|| format!("cannot create {}", tmp.display()))?;
-    let result = write_backup(conn, &tmp, &target);
+    let result = write_backup(conn, from, &tmp, &target);
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -325,7 +326,7 @@ fn backup(conn: &Connection, from: u32) -> anyhow::Result<PathBuf> {
     Ok(target)
 }
 
-fn write_backup(conn: &Connection, tmp: &Path, target: &Path) -> anyhow::Result<()> {
+fn write_backup(conn: &Connection, from: u32, tmp: &Path, target: &Path) -> anyhow::Result<()> {
     let tmp_str = tmp
         .to_str()
         .ok_or_else(|| anyhow!("backup path is not valid UTF-8: {}", tmp.display()))?;
@@ -334,6 +335,20 @@ fn write_backup(conn: &Connection, tmp: &Path, target: &Path) -> anyhow::Result<
     std::fs::File::open(tmp)
         .and_then(|f| f.sync_all())
         .with_context(|| format!("cannot sync {}", tmp.display()))?;
+    let copied = {
+        let copy = Connection::open_with_flags(
+            tmp,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("cannot open {}", tmp.display()))?;
+        schema_version(&copy)?
+    };
+    if copied != from {
+        bail!(
+            "the database schema changed during the migration (version {from} -> {copied}); \
+             run the command again"
+        );
+    }
     std::fs::rename(tmp, target)
         .with_context(|| format!("cannot move backup to {}", target.display()))?;
     #[cfg(unix)]
@@ -379,4 +394,54 @@ fn table_exists(conn: &Connection, name: &str) -> anyhow::Result<bool> {
 fn now_ms() -> i64 {
     let ms = time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
     i64::try_from(ms).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leftovers(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".bak-v"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_backup_is_refused_when_the_copy_is_not_at_the_expected_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open(&dir.path().join("awm.db"), Role::Cli).unwrap();
+        migrate(&mut conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 2);
+
+        // `from` was read as 1, but the database is at 2 by the time of `VACUUM INTO`.
+        let err = backup(&conn, 1).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "the database schema changed during the migration (version 1 -> 2); \
+             run the command again"
+        );
+        assert_eq!(leftovers(dir.path()), Vec::<String>::new());
+
+        let target = backup(&conn, 2).unwrap();
+        assert_eq!(target.file_name().unwrap(), "awm.db.bak-v2");
+        assert_eq!(leftovers(dir.path()), ["awm.db.bak-v2"]);
+        let copy = Connection::open(&target).unwrap();
+        assert_eq!(schema_version(&copy).unwrap(), 2);
+    }
+
+    #[test]
+    fn a_refused_backup_leaves_the_existing_backup_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open(&dir.path().join("awm.db"), Role::Cli).unwrap();
+        migrate(&mut conn).unwrap();
+        let old = dir.path().join("awm.db.bak-v1");
+        std::fs::write(&old, b"older backup").unwrap();
+        assert!(backup(&conn, 1).is_err());
+        assert_eq!(std::fs::read(&old).unwrap(), b"older backup");
+        assert_eq!(leftovers(dir.path()), ["awm.db.bak-v1"]);
+    }
 }

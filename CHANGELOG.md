@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Database migration
-- **Schema version 2** (`0002_event_agent`): adds `event.agent` (`claude` or `codex`); existing records become `claude`. Run `awm doctor` once after upgrading: it writes a backup `awm.db.bak-v1` next to the database and migrates. Until then hooks record and show nothing, and other commands ask you to run `awm doctor`. Rollback: install the previous `awm`, close every agent session, delete `awm.db-wal` and `awm.db-shm` if present, and copy `awm.db.bak-v1` over `awm.db`.
+- **Schema version 2** (`0002_event_agent`): adds `event.agent` (`claude` or `codex`); existing records become `claude`. Run `awm doctor` once after upgrading: it writes a backup `awm.db.bak-v1` next to the database and migrates. Until then hooks show nothing and spool their captures, and other commands ask you to run `awm doctor`; `awm doctor` migrates and then ingests the spool, so nothing captured in between is lost. An older `awm` run against the migrated database skips its captures (that binary cannot be fixed), so keep `~/.local/bin/awm` first in `PATH`. Rollback: install the previous `awm`, close every agent session, delete `awm.db-wal` and `awm.db-shm` if present, and copy `awm.db.bak-v1` over `awm.db`.
 
 ### Added
 - **Record web research**: Every WebSearch and WebFetch call in Claude Code (main agent and subagents) is recorded to a local SQLite database.
