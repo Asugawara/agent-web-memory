@@ -8,8 +8,9 @@ use rusqlite::{params, Connection};
 use serde_json::Value;
 
 use crate::config;
+use crate::hook::pre_search;
 use crate::matching::{self, Hit, MatchOpts};
-use crate::note::{Channel, RenderCtx};
+use crate::note::{Channel, Note, RenderCtx};
 use crate::paths;
 use crate::render;
 
@@ -42,6 +43,7 @@ struct Item {
     transcript_path: Option<String>,
     trigger_text: Option<String>,
     cutoff: Option<f64>,
+    rendered: Option<String>,
 }
 
 /// What the agent did after a note, read from its transcript.
@@ -80,9 +82,14 @@ pub fn run_with(
         pending: VecDeque::new(),
     };
     let mut labelled = 0;
+    let mut hinted = false;
     for (i, item) in items.iter().enumerate() {
         show(conn, item, i + 1, total, out)?;
         loop {
+            if it_is_query_deny(item) && !hinted {
+                writeln!(out, "(query deny labels: 2 the earlier finding covered what the agent did next, 1 relevant but the agent needed the new results, 0 not the same need, h the earlier finding was wrong or stale)")?;
+                hinted = true;
+            }
             write!(out, "Label [2 changed next step, 1 relevant, 0 not relevant, h harmful, x quarantine, s skip, q quit]: ")?;
             out.flush()?;
             let Some(key) = keys.next() else {
@@ -128,6 +135,10 @@ pub fn run_with(
     Ok(())
 }
 
+fn it_is_query_deny(it: &Item) -> bool {
+    it.hook == "PreToolUse" && it.channel == "query"
+}
+
 /// Characters from a line-oriented input, whitespace skipped.
 struct Keys<'a> {
     input: &'a mut dyn BufRead,
@@ -154,7 +165,7 @@ fn unlabelled(conn: &Connection, limit: u32) -> anyhow::Result<Vec<Item>> {
     let mut st = conn.prepare(
         "SELECT ii.injection_id, ii.position, ii.event_id, ii.score, i.ref, i.created_at, \
                 i.hook, i.channel, i.mode, i.session_id, i.agent_id, i.tool_use_id, \
-                i.transcript_path, i.trigger_text, i.cutoff \
+                i.transcript_path, i.trigger_text, i.cutoff, i.rendered \
          FROM injection_item ii JOIN injection i ON i.id = ii.injection_id \
          WHERE NOT EXISTS (SELECT 1 FROM outcome o \
                            WHERE o.injection_id = ii.injection_id AND o.position = ii.position) \
@@ -178,6 +189,7 @@ fn unlabelled(conn: &Connection, limit: u32) -> anyhow::Result<Vec<Item>> {
             transcript_path: r.get(12)?,
             trigger_text: r.get(13)?,
             cutoff: r.get(14)?,
+            rendered: r.get(15)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -219,7 +231,11 @@ fn show(
         Some(c) => writeln!(out, "score {:.1} against cutoff {c:.1}", it.score)?,
         None => writeln!(out, "score {:.1}", it.score)?,
     }
-    let note_text = render_item(conn, it)?;
+    let note_text = if it.hook == "PreToolUse" && it.channel == "query" {
+        query_deny_text(conn, it)?
+    } else {
+        render_item(conn, it)?
+    };
     writeln!(
         out,
         "{}",
@@ -248,7 +264,64 @@ fn show(
     Ok(())
 }
 
-fn render_item(conn: &Connection, it: &Item) -> anyhow::Result<Option<String>> {
+/// A query deny: the relation and age of the earlier search, then the reason the agent got
+/// (stored for a deny, rebuilt for a shadow deny).
+fn query_deny_text(conn: &Connection, it: &Item) -> anyhow::Result<Option<String>> {
+    let note = item_note(conn, it)?;
+    let shadow = it.mode != "deny";
+    let who = pre_search::where_text(
+        &note,
+        &earlier_agent(conn, it.event_id),
+        caller_is_codex(it),
+    );
+    let ctx = RenderCtx {
+        channel: Channel::Query,
+        now_ms: it.created_at,
+        utc_offset_min: 0,
+        ref_id: it.ref_id.clone(),
+        max_notes: 1,
+    };
+    let reason = match (&it.rendered, shadow) {
+        (Some(r), false) => plain_block(r),
+        _ => render::deny_reason_search(&note, &ctx, &who),
+    };
+    Ok(Some(format!(
+        "{}: {who}, {}\n{reason}",
+        if shadow {
+            "query deny (shadow)"
+        } else {
+            "query deny"
+        },
+        render::age_string(note.created_at_ms, it.created_at),
+    )))
+}
+
+/// Control characters other than newlines become spaces.
+fn plain_block(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() && c != '\n' { ' ' } else { c })
+        .collect()
+}
+
+fn earlier_agent(conn: &Connection, event_id: i64) -> String {
+    conn.query_row("SELECT agent FROM event WHERE id = ?1", [event_id], |r| {
+        r.get(0)
+    })
+    .unwrap_or_else(|_| "claude".to_string())
+}
+
+/// The caller of a query deny is Codex (transcript under `/.codex/` or a Codex tool use id).
+fn caller_is_codex(it: &Item) -> bool {
+    it.transcript_path
+        .as_deref()
+        .is_some_and(|p| p.contains("/.codex/"))
+        || it
+            .tool_use_id
+            .as_deref()
+            .is_some_and(|t| t.starts_with("exec-"))
+}
+
+fn item_note(conn: &Connection, it: &Item) -> anyhow::Result<Note> {
     let cwd_hash: String = conn
         .query_row(
             "SELECT cwd_hash FROM event WHERE session_id = ?1 LIMIT 1",
@@ -268,7 +341,11 @@ fn render_item(conn: &Connection, it: &Item) -> anyhow::Result<Option<String>> {
         score: it.score,
         seen: 1,
     };
-    let note = matching::to_note(conn, &hit, &opts)?;
+    matching::to_note(conn, &hit, &opts)
+}
+
+fn render_item(conn: &Connection, it: &Item) -> anyhow::Result<Option<String>> {
+    let note = item_note(conn, it)?;
     let ctx = RenderCtx {
         channel: Channel::from_db_str(&it.channel).unwrap_or(Channel::Query),
         now_ms: it.created_at,

@@ -6,7 +6,7 @@
 - **File permissions**: The data directory is mode 0700 and the database file is mode 0600.
 - **Redaction before storage**: API keys, secrets, private IPs, file paths, and email addresses are redacted before being written to disk.
 - **Private hosts never stored**: URLs on private networks (`localhost`, `192.168.*`, `10.*`, etc.) are never recorded.
-- **Injected text is bounded**: Notes are wrapped in XML tags, sanitized, capped at 2,200 characters, and labeled with their source and age.
+- **Injected text is bounded**: Notes are wrapped in XML tags, sanitized, capped at 2,200 characters, and labeled with their source and age. A PreToolUse deny (optional, shadow by default) shows the agent the same sanitised excerpt of an earlier record in its reason text, capped at 800 characters.
 - **Deletion is verifiable**: `awm forget` deletes the selected records immediately (tombstones stop them coming back); `awm purge` deletes by date or everything.
 - **Quarantine for unreliable records**: Mark a note or URL as unreliable with `awm quarantine`; quarantined records are never injected.
 - **Build integrity**: Builds are local for now: `scripts/install-local.sh` builds from source with `--locked`; a committed `Cargo.lock`, no network dependencies (`scripts/check.sh` no-network step) and no telemetry.

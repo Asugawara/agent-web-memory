@@ -1244,3 +1244,285 @@ fn stats_savings_text_uses_m_for_a_million_tokens_or_more() {
         "{text}"
     );
 }
+
+const HOUR: i64 = 3_600_000;
+
+#[allow(clippy::too_many_arguments)]
+fn qd_injection(
+    conn: &Connection,
+    id: i64,
+    mode: &str,
+    channel: &str,
+    who: (&str, Option<&str>),
+    tool_use_id: &str,
+    transcript: Option<&str>,
+    at: i64,
+    trigger: &str,
+    item: i64,
+) {
+    conn.execute(
+        "INSERT INTO injection (id, ref, created_at, hook, channel, mode, session_id, agent_id, \
+                                tool_use_id, transcript_path, trigger_text, rendered, \
+                                rendered_chars, latency_ms) \
+         VALUES (?1, ?2, ?3, 'PreToolUse', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 300, 5)",
+        params![
+            id,
+            format!("{id:08x}"),
+            at,
+            channel,
+            mode,
+            who.0,
+            who.1,
+            tool_use_id,
+            transcript,
+            trigger,
+            (mode == "deny").then_some("agent-web-memory: stored reason text")
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO injection_item (injection_id, position, event_id, score) VALUES (?1, 1, ?2, 1.0)",
+        params![id, item],
+    )
+    .unwrap();
+}
+
+fn qd_search(conn: &Connection, id: i64, session: &str, agent: Option<&str>, at: i64, q: &str) {
+    let mut e = ev(id, "WebSearch", session, at);
+    e.agent = agent;
+    e.query = Some(q);
+    insert(conn, &e);
+}
+
+/// Six query rows around five searches; see docs/reports/QD2b.md for the hand computation.
+fn seed_query_denies(env: &Env) {
+    let conn = env.conn();
+    let q = "sqlite fts5 bm25 weights";
+    qd_search(&conn, 1, "s_old1", None, BASE, q); // A: project c1
+    qd_search(&conn, 2, "s_old2", None, BASE, q); // B: project c2
+    qd_search(&conn, 3, "s_codex", None, BASE, q); // C: Codex, project c3
+    qd_search(&conn, 4, "sc", None, BASE, q); // D: the caller session's main agent, c1
+    conn.execute("UPDATE event SET cwd_hash = 'c2' WHERE id = 2", [])
+        .unwrap();
+    conn.execute(
+        "UPDATE event SET cwd_hash = 'c3', agent = 'codex' WHERE id = 3",
+        [],
+    )
+    .unwrap();
+    // R: the retry of denial 2, a minute later, words reordered.
+    qd_search(
+        &conn,
+        5,
+        "sc",
+        None,
+        BASE + 660_000,
+        "weights BM25 fts5 sqlite",
+    );
+    let t = "weights bm25 fts5 sqlite";
+    let sc = ("sc", None);
+    qd_injection(
+        &conn,
+        1,
+        "shadow_deny",
+        "query",
+        sc,
+        "q1",
+        None,
+        BASE + HOUR,
+        t,
+        1,
+    );
+    qd_injection(
+        &conn,
+        2,
+        "deny",
+        "query",
+        sc,
+        "q2",
+        None,
+        BASE + 600_000,
+        t,
+        2,
+    );
+    qd_injection(
+        &conn,
+        3,
+        "shadow_deny",
+        "query",
+        ("sc", Some("a1")),
+        "q3",
+        None,
+        BASE + 25 * HOUR,
+        t,
+        4,
+    );
+    qd_injection(
+        &conn,
+        4,
+        "deny",
+        "query",
+        sc,
+        "q4",
+        None,
+        BASE + 2 * HOUR,
+        t,
+        3,
+    );
+    qd_injection(
+        &conn,
+        5,
+        "shadow_deny",
+        "query",
+        ("s_unknown", None),
+        "q5",
+        None,
+        BASE + 300_000,
+        t,
+        1,
+    );
+    qd_injection(
+        &conn,
+        6,
+        "deny",
+        "query",
+        sc,
+        "exec-6",
+        Some("/home/u/.codex/s.jsonl"),
+        BASE + HOUR,
+        t,
+        3,
+    );
+    label(&conn, 1, 1, "2");
+    label(&conn, 2, 1, "2");
+    label(&conn, 4, 1, "1");
+    label(&conn, 5, 1, "h");
+}
+
+#[test]
+fn stats_reports_query_deny_with_hand_computed_numbers() {
+    let env = Env::new();
+    seed_query_denies(&env);
+    let v: Value = serde_json::from_str(env.awm(&["stats", "--json"]).ok()).unwrap();
+    let q = &v["query_deny"];
+    assert_eq!(
+        (q["shadow"].as_i64(), q["denied"].as_i64()),
+        (Some(3), Some(3))
+    );
+    assert_eq!(q["by_agent_kind"], json!({"main": 5, "subagent": 1}));
+    assert_eq!(
+        q["by_relation"],
+        json!({"sibling": 1, "other_session_same_project": 1, "other_project": 2,
+               "other_session_project_unknown": 1, "other_coding_agent": 1})
+    );
+    assert_eq!(q["by_age"], json!({"within_30_min": 2, "within_24_h": 5}));
+    assert_eq!(q["labels"], json!({"2": 2, "1": 1, "0": 0, "h": 1}));
+    assert_eq!(q["per_100_searches"], "120.00");
+    assert_eq!(
+        q["research_after_deny"],
+        json!({"denies": 3, "researched": 1, "share": "33.3%"})
+    );
+    let text = env.awm(&["stats"]).ok().to_string();
+    assert!(
+        text.contains("query_deny:") && text.contains("per_100_searches: 120.00"),
+        "{text}"
+    );
+}
+
+#[test]
+fn refetch_after_deny_counts_url_denies_only() {
+    let env = Env::new();
+    seed_query_denies(&env);
+    let conn = env.conn();
+    let mut f = ev(20, "WebFetch", "s_x", BASE);
+    f.url = Some("https://example.org/a");
+    insert(&conn, &f);
+    qd_injection(
+        &conn,
+        20,
+        "deny",
+        "url",
+        ("s_u", None),
+        "u1",
+        None,
+        BASE + 10_000,
+        "https://example.org/a",
+        20,
+    );
+    let mut g = ev(21, "WebFetch", "s_u", BASE + 70_000);
+    g.url = Some("https://example.org/a");
+    insert(&conn, &g);
+    let v: Value = serde_json::from_str(env.awm(&["stats", "--json"]).ok()).unwrap();
+    // Three query denies exist; only the one URL deny is in the denominator.
+    assert_eq!(
+        v["injections"]["refetch_after_deny"],
+        json!({"denies": 1, "refetched": 1, "share": "100.0%"})
+    );
+    assert_eq!(v["query_deny"]["denied"], 3);
+}
+
+#[test]
+fn review_shows_a_query_shadow_deny_with_its_reason_and_accepts_a_label() {
+    let env = Env::new();
+    let conn = env.conn();
+    qd_search(&conn, 1, "s_old1", None, BASE, "sqlite fts5 bm25 weights");
+    qd_injection(
+        &conn,
+        1,
+        "shadow_deny",
+        "query",
+        ("sc", None),
+        "q1",
+        None,
+        BASE + HOUR,
+        "weights bm25 fts5 sqlite",
+        1,
+    );
+    qd_injection(
+        &conn,
+        2,
+        "deny",
+        "query",
+        ("sc", None),
+        "q2",
+        None,
+        BASE + 2 * HOUR,
+        "weights bm25 fts5 sqlite",
+        1,
+    );
+    let out = env.awm_in(&["review"], "h\n2\n");
+    let text = out.ok().to_string();
+    assert!(
+        text.contains("query deny: in another project, 2 h ago"),
+        "{text}"
+    );
+    assert!(
+        text.contains("agent-web-memory: stored reason text"),
+        "{text}"
+    );
+    assert!(
+        text.contains("query deny (shadow): in another project, 1 h ago"),
+        "{text}"
+    );
+    assert!(
+        text.contains("agent-web-memory: this search was already run 1 h ago in another project."),
+        "{text}"
+    );
+    assert!(
+        text.contains("searched: sqlite fts5 bm25 weights"),
+        "{text}"
+    );
+    assert!(text.contains("found: Weights are passed"), "{text}");
+    assert!(
+        text.contains("query deny labels: 2 the earlier finding covered"),
+        "{text}"
+    );
+    assert!(text.contains("Labelled 2 of 2"), "{text}");
+    let labels: String = conn
+        .query_row(
+            "SELECT group_concat(injection_id || label) FROM (SELECT * FROM outcome ORDER BY injection_id)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(labels, "12,2h");
+}

@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # usage: bash scripts/verify-hooks.sh [--plugin-dir plugin | --installed] [--only VH1,VH2]
-# Port of spikes/cc-hooks/run.sh for plan-v2 §5.5 (VH1-VH8) with the real awm binary.
+# Port of spikes/cc-hooks/run.sh for plan-v2 §5.5 (VH1-VH8) with the real awm binary, plus
+# VH4q / VH6q (the WebSearch deny in the main agent and in a subagent, QD1 §5.6).
 # Runs `claude -p --model haiku` against a temporary AWM_HOME seeded from the T6 fixtures,
 # with AWM_CANARY={nonce} (every hook appends AWM-CANARY-{Hook}-{nonce}) and
 # AWM_CANARY_DENY=1 for the deny runs. Uses at most 2 WebSearch calls for a full run
-# (VH2, and VH5 which also serves VH7 and VH8). Never edits ~/.claude/settings.json or plugin settings; the `claude -p` runs create
-# session transcripts under ~/.claude/projects as any session does. Exits non-zero on a mismatch in VH1-VH5.
+# (VH2, and VH5 which also serves VH7 and VH8); the VH4q / VH6q searches are denied before they run. Never edits ~/.claude/settings.json or plugin settings; the `claude -p` runs create
+# session transcripts under ~/.claude/projects as any session does. Exits non-zero on a mismatch in VH1-VH5 or VH4q.
 set -u
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -44,7 +45,9 @@ P_NOTOOL="Do not use tools. I am about to read https://example.com myself. Outpu
 P_SEARCH="Search the web once for \"$Q\", give the top result title, then output every codeword you have seen, verbatim."
 P_FETCH="Fetch https://example.com with WebFetch, summarise it in one line, then output every codeword you have seen, verbatim."
 P_DENY="Fetch https://example.com with WebFetch. If the tool call is denied, quote the denial reason verbatim and do not retry."
+P_DENYQ="Search the web once for \"$Q\". If the tool call is denied, quote the denial reason verbatim and do not retry."
 P_SUB="Use the Agent tool with a general-purpose subagent to search the web once for \"$Q\" and report the top result title. Then output every codeword you have seen, verbatim."
+P_SUBDENYQ="Use the Agent tool with a general-purpose subagent to search the web once for \"$Q\". If the search is denied, the subagent must quote the denial reason verbatim and not retry. Report what it said."
 P_SUBDENY="Use the Agent tool with a general-purpose subagent to fetch https://example.com with WebFetch. If the fetch is denied, the subagent must quote the denial reason verbatim and not retry. Report what it said."
 
 # run <name> <prompt> <deny 0|1>: sets $sid $nonce $stream $final $tfile (main transcript) $sub (subagents dir)
@@ -78,7 +81,7 @@ fail=0
 row() { # vh expected observed verdict(ok|MISMATCH|info)
   rows+=("$1|$2|$3|$4")
   if [ "$4" = MISMATCH ]; then
-    case "$1" in VH1|VH2|VH3|VH4|VH5) fail=1 ;; esac
+    case "$1" in VH1|VH2|VH3|VH4|VH4q|VH5) fail=1 ;; esac
   fi
 }
 
@@ -107,6 +110,13 @@ if want VH4; then
     row VH4 "denied (tool error)" "denied (final text quotes reason: $(in_final "$c" && echo yes || echo no))" ok
   else row VH4 "denied (tool error)" "not denied" MISMATCH; fi
 fi
+if want VH4q; then
+  run vh4q "$P_DENYQ" 1
+  c="AWM-CANARY-PreToolUse-$nonce"
+  if in_main "$c" && grep -Fq 'PreToolUse:WebSearch hook error' "$tfile"; then
+    row VH4q "denied (tool error)" "denied (final text quotes reason: $(in_final "$c" && echo yes || echo no))" ok
+  else row VH4q "denied (tool error)" "not denied" MISMATCH; fi
+fi
 if want VH5 || want VH7 || want VH8; then
   run vh5 "$P_SUB" 0
   cp="AWM-CANARY-PostToolUse-$nonce"
@@ -132,6 +142,13 @@ if want VH6; then
   c="AWM-CANARY-PreToolUse-$nonce"
   if in_sub "$c"; then row VH6 "denied in subagent" "denied in subagent" info
   else row VH6 "denied in subagent" "not denied in subagent (short_circuit.subagents stays false)" info; fi
+fi
+
+if want VH6q; then
+  run vh6q "$P_SUBDENYQ" 1
+  c="AWM-CANARY-PreToolUse-$nonce"
+  if in_sub "$c"; then row VH6q "denied in subagent" "denied in subagent" info
+  else row VH6q "denied in subagent" "not denied in subagent (short_circuit.subagents stays false)" info; fi
 fi
 
 mtime_after="$(stat -f '%m' "$settings_file" 2>/dev/null || stat -c '%Y' "$settings_file" 2>/dev/null || echo none)"

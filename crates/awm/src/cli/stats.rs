@@ -68,6 +68,7 @@ pub fn collect(conn: &Connection, args: &Args) -> anyhow::Result<Value> {
     if !any {
         out.insert("by_agent".into(), by_agent(conn)?);
         out.insert("injections".into(), injections(conn)?);
+        out.insert("query_deny".into(), query_deny(conn)?);
     }
     if args.latency {
         out.insert("latency".into(), latency(conn)?);
@@ -201,11 +202,14 @@ fn injections(conn: &Connection) -> anyhow::Result<Value> {
 }
 
 fn refetch_after_deny(conn: &Connection) -> anyhow::Result<Value> {
-    let denies = count(conn, "SELECT COUNT(*) FROM injection WHERE mode = 'deny'")?;
+    let denies = count(
+        conn,
+        "SELECT COUNT(*) FROM injection WHERE mode = 'deny' AND channel = 'url'",
+    )?;
     let refetched = count(
         conn,
         &format!(
-            "SELECT COUNT(*) FROM injection i WHERE i.mode = 'deny' AND EXISTS ( \
+            "SELECT COUNT(*) FROM injection i WHERE i.mode = 'deny' AND i.channel = 'url' AND EXISTS ( \
                SELECT 1 FROM injection_item ii JOIN event src ON src.id = ii.event_id \
                JOIN event e ON e.url_norm = src.url_norm \
                  AND e.session_id = i.session_id AND e.agent_id IS i.agent_id \
@@ -215,6 +219,123 @@ fn refetch_after_deny(conn: &Connection) -> anyhow::Result<Value> {
         ),
     )?;
     Ok(json!({"denies": denies, "refetched": refetched, "share": super::pct(refetched, denies)}))
+}
+
+/// Time window of `research_after_deny`: a repeat of the denied search by the same agent.
+const RETRY_WINDOW_MS: i64 = 120_000;
+
+/// Session, agent id, time, tool use id and trigger text of a deny.
+type DenyRow = (String, Option<String>, i64, Option<String>, Option<String>);
+
+/// QD1 §5.4: the PreToolUse deny on repeated searches (`hook = 'PreToolUse'`, `channel = 'query'`).
+/// Counts cover shadow and real denies. `relation` is read from the earlier record against the
+/// caller: another coding agent first, then the same session (a sibling), then the caller's
+/// project (from any event of the caller's session; `other_session_project_unknown` when none
+/// was captured). The caller's coding agent is Codex when its transcript is under `/.codex/` or its
+/// tool use id starts with `exec-`. `by_age` is cumulative.
+fn query_deny(conn: &Connection) -> anyhow::Result<Value> {
+    const ROWS: &str = "FROM injection i JOIN injection_item ii ON ii.injection_id = i.id \
+        JOIN event e ON e.id = ii.event_id \
+        WHERE i.hook = 'PreToolUse' AND i.channel = 'query' AND ii.position = 1";
+    let codex = "COALESCE(i.transcript_path LIKE '%/.codex/%' OR i.tool_use_id LIKE 'exec-%', 0)";
+    let shadow = count(
+        conn,
+        "SELECT COUNT(*) FROM injection WHERE hook = 'PreToolUse' AND channel = 'query' AND mode = 'shadow_deny'",
+    )?;
+    let denied = count(
+        conn,
+        "SELECT COUNT(*) FROM injection WHERE hook = 'PreToolUse' AND channel = 'query' AND mode = 'deny'",
+    )?;
+    let mut by_kind = json!({"main": 0, "subagent": 0});
+    if let (Value::Object(m), Value::Object(found)) = (
+        &mut by_kind,
+        grouped(
+            conn,
+            "SELECT CASE WHEN agent_id IS NULL THEN 'main' ELSE 'subagent' END, COUNT(*) \
+             FROM injection WHERE hook = 'PreToolUse' AND channel = 'query' GROUP BY 1",
+        )?,
+    ) {
+        m.extend(found);
+    }
+    let mut by_relation = json!({
+        "sibling": 0, "other_session_same_project": 0, "other_project": 0,
+        "other_session_project_unknown": 0, "other_coding_agent": 0
+    });
+    let relation = format!(
+        "SELECT CASE \
+           WHEN (e.agent = 'codex') != {codex} THEN 'other_coding_agent' \
+           WHEN e.session_id = i.session_id THEN 'sibling' \
+           WHEN NOT EXISTS (SELECT 1 FROM event c WHERE c.session_id = i.session_id) \
+             THEN 'other_session_project_unknown' \
+           WHEN EXISTS (SELECT 1 FROM event c WHERE c.session_id = i.session_id \
+                          AND c.cwd_hash = e.cwd_hash) THEN 'other_session_same_project' \
+           ELSE 'other_project' END, COUNT(*) {ROWS} GROUP BY 1"
+    );
+    if let (Value::Object(m), Value::Object(found)) = (&mut by_relation, grouped(conn, &relation)?)
+    {
+        m.extend(found);
+    }
+    let within = |ms: i64| {
+        count(
+            conn,
+            &format!("SELECT COUNT(*) {ROWS} AND i.created_at - e.created_at <= {ms}"),
+        )
+    };
+    let mut labels = json!({"2": 0, "1": 0, "0": 0, "h": 0});
+    if let (Value::Object(m), Value::Object(found)) = (
+        &mut labels,
+        grouped(
+            conn,
+            "SELECT o.label, COUNT(*) FROM outcome o JOIN injection i ON i.id = o.injection_id \
+             WHERE i.hook = 'PreToolUse' AND i.channel = 'query' GROUP BY o.label",
+        )?,
+    ) {
+        m.extend(found);
+    }
+    let searches = count(conn, "SELECT COUNT(*) FROM event WHERE tool = 'WebSearch'")?;
+    let per_100 = (searches > 0)
+        .then(|| format!("{:.2}", (shadow + denied) as f64 * 100.0 / searches as f64));
+
+    // Research after a deny: the same agent searches the same token set within 2 minutes.
+    let mut st = conn.prepare(
+        "SELECT session_id, agent_id, created_at, tool_use_id, trigger_text FROM injection \
+         WHERE hook = 'PreToolUse' AND channel = 'query' AND mode = 'deny'",
+    )?;
+    let denies: Vec<DenyRow> = st
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut again = conn.prepare(
+        "SELECT query FROM event WHERE tool = 'WebSearch' AND session_id = ?1 AND agent_id IS ?2 \
+           AND created_at > ?3 AND created_at <= ?3 + ?4 AND (?5 IS NULL OR tool_use_id != ?5)",
+    )?;
+    let mut researched = 0;
+    for (session, agent, at, tool_use_id, trigger) in &denies {
+        let key = crate::normalize::token_set(trigger.as_deref().unwrap_or(""));
+        let queries = again.query_map(
+            rusqlite::params![session, agent, at, RETRY_WINDOW_MS, tool_use_id],
+            |r| r.get::<_, Option<String>>(0),
+        )?;
+        let mut hit = false;
+        for q in queries {
+            hit |= q?.is_some_and(|q| crate::normalize::token_set(&q) == key);
+        }
+        researched += i64::from(hit);
+    }
+    let n = i64::try_from(denies.len()).unwrap_or(i64::MAX);
+    Ok(json!({
+        "shadow": shadow,
+        "denied": denied,
+        "by_agent_kind": by_kind,
+        "by_relation": by_relation,
+        "by_age": {"within_30_min": within(1_800_000)?, "within_24_h": within(86_400_000)?},
+        "labels": labels,
+        "per_100_searches": per_100,
+        "research_after_deny": {
+            "denies": n, "researched": researched, "share": super::pct(researched, n)
+        },
+    }))
 }
 
 /// Total times, search times and deadline hits of one hook and agent kind.

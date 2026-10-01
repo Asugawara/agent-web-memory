@@ -92,6 +92,23 @@ main_input_per_mtok = 0.0          # your main model's input price; 0 = not pric
 
 Main-model tokens are priced only when `main_input_per_mtok` is set; the summary line then also shows a net cost after the note overhead. A subscription pays none of this per call, so read the cost as what the same calls would cost on API billing.
 
+### Blocking repeats (short-circuit, optional)
+
+Two settings can block a repeated call once and hand over the earlier answer instead. Both are in shadow mode by default: they only log what they would have blocked (`awm stats`, `awm review`), and nothing is denied until you turn one on.
+
+| Key | Default | Values | Meaning |
+|-----|---------|--------|---------|
+| `short_circuit.mode` | `shadow` | off, shadow, on | WebFetch of a URL a sibling agent of the same session already fetched (`short_circuit.window_minutes`, default 30) |
+| `short_circuit.query` | `shadow` | off, shadow, on | WebSearch (Claude Code) or `webrun` (Codex) with the same words, in any order, as a search made by another agent |
+| `short_circuit.query_window_minutes` | 1440 | 1-10080 | how far back a query deny looks (24 hours) |
+| `short_circuit.subagents` | false | true, false | allow either deny inside subagents (needs the installed plugin check, `scripts/verify-hooks.sh`) |
+
+A **query deny** needs an earlier WebSearch by another agent (a sibling subagent, another session or project, or the other coding agent; never the agent's own earlier search) inside the window, with status ok and a non-empty finding, and the same token set (case, order and punctuation ignored, at least 3 words). Searches with `allowed_domains` / `blocked_domains` and Codex calls other than a plain search are never denied. The agent gets a reason with the earlier query, top result and a short finding, and the same search run again always passes; at most one deny per search and 3 per agent. The global `mode = "shadow"` also downgrades `on` to shadow.
+
+Turn it on with `awm config set short_circuit.query on`, and back with `awm config set short_circuit.query shadow`. The suggested bar for `on` is at least 20 shadow denies labelled in `awm review`, at least 80% of them label 2 and none h, and at least 1 shadow deny per 100 searches.
+
+`awm stats` prints a `query_deny` object: `shadow` and `denied` counts, by agent kind (main, subagent), by relation (sibling, other session in the same project or another project, other coding agent), by age (within 30 minutes, within 24 hours, cumulative), labels 2 / 1 / 0 / h from `awm review`, `per_100_searches`, and `research_after_deny` (denies followed within 2 minutes by the same agent repeating the same search, with its share). `refetch_after_deny` counts URL denies only. In `awm review` a query deny shows the earlier search's relation and age and the reason text (label 2: the earlier finding covered what the agent did next; 1: relevant, but the agent needed the new results; 0: not the same need; h: the earlier finding was wrong or stale).
+
 ## Codex
 
 Codex support is experimental (started 2026-10-02; spike in `docs/reports/codex-hooks.md`, tested with Codex CLI 0.159.3).
