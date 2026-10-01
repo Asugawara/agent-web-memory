@@ -364,6 +364,10 @@ where
     let Ok(config) = config::load(&data_dir.join(paths::CONFIG_FILE)) else {
         return;
     };
+    // `mode = "off"`: nothing is read, written or logged (§2.3).
+    if config.mode == Mode::Off {
+        return;
+    }
     let env = Env {
         hook,
         input,
@@ -466,9 +470,6 @@ where
     let check = db::check_version(&conn).map_err(|e| Stop::from_error(&e))?;
     if check != VersionCheck::Current {
         return Err(Stop::silent());
-    }
-    if env.config.mode == Mode::Off {
-        return Ok((conn, Verdict::quiet("off")));
     }
     if !recording_consented(&conn).map_err(|e| Stop::from_error(&e))? {
         return Err(Stop::silent());

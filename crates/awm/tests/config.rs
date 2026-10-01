@@ -92,3 +92,17 @@ fn set_rejects_bad_keys_and_values() {
     assert_eq!(c, Config::default());
     assert_eq!(c.get("nope"), None);
 }
+
+#[cfg(unix)]
+#[test]
+fn save_writes_the_file_with_mode_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    // An existing world-readable file is tightened too.
+    std::fs::write(&path, "").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    Config::default().save(&path).unwrap();
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+}

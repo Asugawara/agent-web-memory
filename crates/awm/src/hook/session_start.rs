@@ -36,7 +36,6 @@ pub fn run(args: HookArgs) -> anyhow::Result<()> {
         started,
     };
     if config.mode == Mode::Off {
-        meta.log_standalone("off", None);
         return Ok(());
     }
     if !db_path.is_file() {

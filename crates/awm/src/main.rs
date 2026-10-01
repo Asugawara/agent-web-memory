@@ -70,7 +70,39 @@ enum HookCommand {
     Capture(HookArgs),
 }
 
+fn debug_enabled() -> bool {
+    std::env::var_os("AWM_DEBUG").is_some_and(|v| v == "1")
+}
+
+/// A hook always exits 0: Claude Code reads exit 2 as "block". Parse errors and
+/// panics print nothing (stderr only with `AWM_DEBUG=1`).
+fn run_hook() -> ! {
+    if !debug_enabled() {
+        std::panic::set_hook(Box::new(|_| {}));
+    }
+    let outcome = std::panic::catch_unwind(|| match Cli::try_parse() {
+        Ok(cli) => dispatch(cli.command),
+        Err(e) => {
+            if debug_enabled() {
+                eprintln!("awm: {e}");
+            }
+            Ok(())
+        }
+    });
+    if debug_enabled() {
+        match outcome {
+            Ok(Err(e)) => eprintln!("awm: {e:#}"),
+            Err(_) => eprintln!("awm: hook panicked"),
+            Ok(Ok(())) => {}
+        }
+    }
+    std::process::exit(0);
+}
+
 fn main() {
+    if std::env::args_os().nth(1).is_some_and(|a| a == "hook") {
+        run_hook();
+    }
     let cli = Cli::parse();
     if let Err(err) = dispatch(cli.command) {
         eprintln!("awm: {err}");

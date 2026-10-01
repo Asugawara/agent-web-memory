@@ -128,7 +128,7 @@ fn note_lines(note: &Note, index: usize, ctx: &RenderCtx) -> Option<Vec<String>>
     )];
     let field = |v: &Option<String>| {
         v.as_deref()
-            .map(|s| sanitize::line(s, FIELD_CAP).text)
+            .map(|s| sanitize::line_text(s, FIELD_CAP).text)
             .filter(|s| !s.is_empty())
     };
     match note.tool {
@@ -210,7 +210,7 @@ pub fn deny_reason(note: &Note, ctx: &RenderCtx, who: &str) -> String {
     if let Some(a) = note
         .asked
         .as_deref()
-        .map(|s| sanitize::line(s, FIELD_CAP).text)
+        .map(|s| sanitize::line_text(s, FIELD_CAP).text)
         .filter(|s| !s.is_empty())
     {
         out.push_str(&format!("asked: {a}\n"));

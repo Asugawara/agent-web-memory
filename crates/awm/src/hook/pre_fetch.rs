@@ -9,8 +9,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use super::{canary_line, deny_json, Env, HookArgs, Injection, Verdict};
 use crate::config::{Mode, ShortCircuitMode};
 use crate::matching::{self, Hit};
-use crate::normalize::norm_url;
 use crate::note::{Channel, Relation};
+use crate::record::redact_url;
 use crate::render;
 
 const EVENT: &str = "PreToolUse";
@@ -35,7 +35,12 @@ fn handle(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
     if input.tool_name != "WebFetch" || (mode == ShortCircuitMode::Off && !forced) {
         return Ok(Verdict::quiet("no_match"));
     }
-    let Some(norm) = input.tool_input_str("url").and_then(norm_url) else {
+    // The stored `url_norm` comes from the redacted URL; look up the same form.
+    let terms = &env.config.capture.redact_terms;
+    let Some((_, norm)) = input
+        .tool_input_str("url")
+        .and_then(|u| redact_url(u, terms))
+    else {
         return Ok(Verdict::quiet("no_match"));
     };
     let start = std::time::Instant::now();
@@ -56,7 +61,7 @@ fn handle(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
             ..Verdict::quiet("no_match")
         });
     }
-    let trigger: String = norm.chars().take(super::TRIGGER_CHARS).collect();
+    let trigger = env.trigger_text(&norm);
     if already_logged(env, conn, log_mode, &trigger)? {
         return Ok(Verdict {
             search_ms: Some(search_ms),

@@ -220,7 +220,7 @@ impl Config {
             crate::paths::ensure_private_dir(parent)?;
         }
         let text = toml::to_string_pretty(self).context("cannot serialise the configuration")?;
-        std::fs::write(path, text).with_context(|| format!("cannot write {}", path.display()))
+        write_private(path, &text).with_context(|| format!("cannot write {}", path.display()))
     }
 
     /// The value of a dotted key as text (lists are comma-separated); `None` for an unknown key.
@@ -326,4 +326,24 @@ pub fn load(path: &Path) -> anyhow::Result<Config> {
         .with_context(|| format!("invalid configuration {}", path.display()))?;
     config.clamp_all();
     Ok(config)
+}
+
+/// Writes `text` to `path`; the file is 0600 on unix (`capture.redact_terms` may hold names).
+fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        open.mode(0o600);
+        let mut f = open.open(path)?;
+        // An existing file keeps its old mode through `open`.
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.write_all(text.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        open.open(path)?.write_all(text.as_bytes())
+    }
 }

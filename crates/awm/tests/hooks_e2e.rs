@@ -389,6 +389,25 @@ fn mode_off_prints_nothing() {
     seed_example_fetch(&home);
     assert_silent(&home.hook("post-tool", &new_fetch()));
     assert_eq!(home.count("SELECT COUNT(*) FROM injection"), 0);
+    // The seed's capture row is the only one.
+    assert_eq!(
+        home.count("SELECT COUNT(*) FROM hook_run WHERE hook <> 'capture'"),
+        0
+    );
+}
+
+#[test]
+fn mode_off_session_start_does_not_open_the_database() {
+    // No database file: opening one would create it or fail; neither may happen,
+    // and an existing one must not get a row.
+    let home = Home::new();
+    home.config(|c| c.mode = Mode::Off);
+    assert_silent(&home.run("session-start", "{}", &[]));
+    assert_eq!(home.count("SELECT COUNT(*) FROM hook_run"), 0);
+    // A file that is not a database proves it is never opened: no notice, no error.
+    std::fs::write(home.db_path(), b"not a database").unwrap();
+    assert_silent(&home.run("session-start", "{}", &[]));
+    assert_silent(&home.run("prompt", "{}", &[]));
 }
 
 #[test]
@@ -549,6 +568,25 @@ fn the_default_short_circuit_mode_only_logs_a_shadow_deny() {
         "shadow"
     );
     assert_eq!(home.count("SELECT COUNT(*) FROM injection_item"), 1);
+}
+
+#[test]
+fn the_pre_fetch_trigger_text_is_redacted() {
+    let key = "AKIAIOSFODNN7EXAMPLE";
+    let url = format!("https://example.com/doc?k={key}");
+    let mut sibling = sibling_fetch(Some(("agent-a", "researcher")), "toolu_a");
+    sibling["tool_input"]["url"] = json!(url);
+    sibling["tool_response"]["url"] = json!(url);
+    let mut request = pre_fetch(None, "toolu_main_1");
+    request["tool_input"]["url"] = json!(url);
+    let home = Home::new();
+    home.seed(&sibling, 60_000);
+    assert_silent(&home.hook("pre-fetch", &request));
+    let trigger = home.text("SELECT trigger_text FROM injection WHERE hook = 'PreToolUse'");
+    assert!(
+        trigger.contains("example.com") && !trigger.contains(key),
+        "{trigger}"
+    );
 }
 
 #[test]
@@ -722,6 +760,27 @@ fn bad_or_empty_stdin_exits_zero_silently() {
         assert_silent(&home.run(hook, "not json {", &[]));
     }
     assert_eq!(home.count("SELECT COUNT(*) FROM hook_run"), 0);
+}
+
+#[test]
+fn unknown_hook_arguments_exit_zero_silently() {
+    warm_up();
+    let home = Home::new();
+    for args in [
+        &["hook", "prompt", "--unknown-flag"][..],
+        &["hook", "bogus"][..],
+        &["hook"][..],
+    ] {
+        let o = Command::new(env!("CARGO_BIN_EXE_awm"))
+            .args(args)
+            .env("AWM_HOME", home.dir.path())
+            .env_remove("AWM_DEBUG")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(o.status.code(), Some(0), "{args:?}");
+        assert!(o.stdout.is_empty(), "{args:?}");
+    }
 }
 
 #[test]

@@ -1,6 +1,7 @@
 //! A captured Web search or fetch, built from hook stdin or a transcript (plan-v2 §3.2, §4.3, §6.1).
 
 use anyhow::bail;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -26,7 +27,7 @@ const REFUSAL_PATTERNS: [&str; 5] = [
 const PLACEHOLDER_TEXT: &str = "Web search was not performed";
 
 /// One `result` row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResultRow {
     pub rank: i64,
     pub url: String,
@@ -35,7 +36,7 @@ pub struct ResultRow {
 }
 
 /// Mirrors the `event` columns plus its `result` rows.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Record {
     pub tool_use_id: String,
     pub tool: Tool,
@@ -293,6 +294,18 @@ fn red(text: &str, terms: &[String]) -> String {
     redact(text, terms).0
 }
 
+/// Redacts `url`; when the result no longer parses, drops the query and
+/// fragment and tries again. `None` when it still does not parse.
+pub fn redact_url(url: &str, terms: &[String]) -> Option<(String, String)> {
+    let redacted = red(url.trim(), terms);
+    if let Some(norm) = norm_url(&redacted) {
+        return Some((redacted, norm));
+    }
+    let cut = redacted.find(['?', '#']).map_or(redacted.len(), |i| i);
+    let bare = &redacted[..cut];
+    norm_url(bare).map(|norm| (bare.to_string(), norm))
+}
+
 fn build(p: Parts, terms: &[String]) -> Option<Record> {
     let mut rec = Record {
         tool_use_id: p.tool_use_id.to_string(),
@@ -335,12 +348,12 @@ fn build(p: Parts, terms: &[String]) -> Option<Record> {
                             let Some(url) = text_of(hit.get("url")) else {
                                 continue;
                             };
-                            let Some(url_norm) = norm_url(url) else {
+                            let Some((url, url_norm)) = redact_url(url, terms) else {
                                 continue;
                             };
                             rec.results.push(ResultRow {
                                 rank: i64::try_from(rec.results.len()).unwrap_or(i64::MAX) + 1,
-                                url: url.to_string(),
+                                url,
                                 url_norm,
                                 title: owned(hit.get("title")).map(|t| red(&t, terms)),
                             });
@@ -355,7 +368,8 @@ fn build(p: Parts, terms: &[String]) -> Option<Record> {
         }
         Tool::WebFetch => {
             let url = owned(p.input.get("url")).or_else(|| owned(p.response.get("url")))?;
-            rec.url_norm = Some(norm_url(&url)?);
+            let (url, url_norm) = redact_url(&url, terms)?;
+            rec.url_norm = Some(url_norm);
             rec.url = Some(url);
             rec.fetch_prompt = owned(p.input.get("prompt")).map(|t| red(&t, terms));
             rec.http_code = whole_number(p.response.get("code"));
