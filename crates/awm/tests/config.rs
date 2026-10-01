@@ -10,6 +10,10 @@ fn defaults_match_the_plan() {
     assert_eq!(c.short_circuit.mode, ShortCircuitMode::Shadow);
     assert_eq!(c.short_circuit.window_minutes, 30);
     assert!(!c.short_circuit.subagents);
+    assert_eq!(c.short_circuit.query, ShortCircuitMode::Shadow);
+    assert_eq!(c.short_circuit.query_window_minutes, 1440);
+    assert_eq!(c.get("short_circuit.query").unwrap(), "shadow");
+    assert_eq!(c.get("short_circuit.query_window_minutes").unwrap(), "1440");
     assert_eq!((c.inject.max_notes, c.inject.max_per_agent), (3, 10));
     assert_eq!(c.hooks.deadline_ms, 500);
     assert!(c.capture.exclude_hosts.is_empty() && c.capture.redact_terms.is_empty());
@@ -145,4 +149,37 @@ fn save_writes_the_file_with_mode_0600() {
     Config::default().save(&path).unwrap();
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
+}
+
+#[test]
+fn the_query_deny_keys_set_validate_and_clamp() {
+    let mut c = Config::default();
+    c.set("short_circuit.query", "on").unwrap();
+    c.set("short_circuit.query_window_minutes", "10080")
+        .unwrap();
+    assert_eq!(c.short_circuit.query, ShortCircuitMode::On);
+    assert_eq!(
+        c.get("short_circuit.query_window_minutes").unwrap(),
+        "10080"
+    );
+    assert!(c.set("short_circuit.query", "maybe").is_err());
+    assert!(c.set("short_circuit.query_window_minutes", "0").is_err());
+    assert!(c
+        .set("short_circuit.query_window_minutes", "10081")
+        .is_err());
+    assert_eq!(c.short_circuit.query_window_minutes, 10080);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    c.save(&path).unwrap();
+    assert_eq!(config::load(&path).unwrap(), c);
+    std::fs::write(
+        &path,
+        "[short_circuit]\nquery = \"off\"\nquery_window_minutes = 99999\n",
+    )
+    .unwrap();
+    let loaded = config::load(&path).unwrap();
+    assert_eq!(loaded.short_circuit.query, ShortCircuitMode::Off);
+    assert_eq!(loaded.short_circuit.query_window_minutes, 10080);
+    assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
 }

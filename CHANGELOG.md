@@ -12,6 +12,7 @@
 - **URL in prompt**: If you name a URL in your prompt, the tool shows any earlier research on that URL before the agent decides.
 - **Note injection**: Earlier research arrives alongside the result of the new call, never blocking or replacing it.
 - **Short-circuit deny** (optional): Block an exact repeat fetch within 30 minutes and show the earlier result instead (off by default; opt-in via `awm config`).
+- **Search deny** (optional, shadow by default): `awm hook pre-fetch` now also sees WebSearch (Claude Code) and `webrun` (Codex); with `short_circuit.query = "on"` a search whose words (any order) match a usable search of another agent within `short_circuit.query_window_minutes` (24 h) is denied once with that finding, and the retry passes. Shadow mode only logs it.
 - **Subagent support**: Notes are shown to the subagent that made the call, with sibling research visible.
 - **Import past research**: `awm init` extracts your research from Claude Code transcript files and imports it in seconds.
 - **Redaction**: API keys, secrets, private IPs, file paths, and email addresses are redacted before storage.

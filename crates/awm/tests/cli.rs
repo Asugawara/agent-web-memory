@@ -771,6 +771,38 @@ fn setup_refuses_without_yes_when_there_is_no_terminal_and_round_trips() {
 }
 
 #[test]
+fn setup_replaces_an_old_webfetch_pre_tool_use_group() {
+    let env = Env::new();
+    let settings = env.home().join(".claude/settings.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    let old = json!({"hooks": {"PreToolUse": [
+        {"matcher": "WebFetch", "hooks": [
+            {"type": "command", "command": "awm hook pre-fetch", "timeout": 5},
+            {"type": "command", "command": "echo mine"}]},
+        {"matcher": "WebFetch", "hooks": [{"type": "command", "command": "awm hook pre-fetch"}]},
+    ]}});
+    std::fs::write(&settings, serde_json::to_string_pretty(&old).unwrap()).unwrap();
+    env.awm(&["setup", "--hooks-in-settings", "--yes"]).ok();
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    let groups = v["hooks"]["PreToolUse"].as_array().unwrap();
+    let pre_fetch: Vec<&Value> = groups
+        .iter()
+        .flat_map(|g| g["hooks"].as_array().unwrap())
+        .filter(|h| h["command"] == "awm hook pre-fetch")
+        .collect();
+    assert_eq!(pre_fetch.len(), 1, "{v}");
+    let ours = groups
+        .iter()
+        .find(|g| g["hooks"][0]["command"] == "awm hook pre-fetch")
+        .unwrap();
+    assert_eq!(ours["matcher"], "WebFetch|WebSearch");
+    // The user's own hook stays under its group.
+    assert!(groups
+        .iter()
+        .any(|g| g["matcher"] == "WebFetch" && g["hooks"][0]["command"] == "echo mine"));
+}
+
+#[test]
 fn setup_creates_the_settings_file_and_removes_the_empty_hooks_key() {
     let env = Env::new();
     let settings = env.home().join(".claude/settings.json");

@@ -72,7 +72,7 @@ fn entries(target: Target) -> Vec<Entry> {
         h
     };
     let (tools, fetch_tools) = if claude {
-        (Some("WebSearch|WebFetch"), Some("WebFetch"))
+        (Some("WebSearch|WebFetch"), Some("WebFetch|WebSearch"))
     } else {
         (Some("webrun"), Some("webrun"))
     };
@@ -125,6 +125,21 @@ fn add_hooks(settings: &mut Value, entries: Vec<Entry>) -> anyhow::Result<usize>
             .or_insert_with(|| Value::Array(Vec::new()))
             .as_array_mut()
             .ok_or_else(|| anyhow!("hooks.{event} in the hooks file is not an array"))?;
+        // An older entry of ours under another matcher (a `WebFetch` group from before the
+        // search deny) would run the same hook twice; a group it leaves empty goes too.
+        for g in groups.iter_mut() {
+            if g["matcher"].as_str() == matcher {
+                continue;
+            }
+            if let Some(hs) = g["hooks"].as_array_mut() {
+                let before = hs.len();
+                hs.retain(|h| !(is_ours(h) && h["command"] == hook["command"]));
+                if hs.is_empty() && before > 0 {
+                    g["hooks"] = Value::Null;
+                }
+            }
+        }
+        groups.retain(|g| !g["hooks"].is_null());
         let present = groups.iter().any(|g| {
             g["hooks"]
                 .as_array()

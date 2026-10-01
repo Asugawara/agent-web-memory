@@ -1,4 +1,4 @@
-use awm::normalize::{norm_query, norm_url, words};
+use awm::normalize::{norm_query, norm_url, token_set, words};
 
 #[test]
 fn url_cases() {
@@ -155,4 +155,24 @@ fn mixed_script_split() {
 fn query_normalisation_is_idempotent() {
     let once = norm_query("Hello,  World!!");
     assert_eq!(norm_query(&once), once);
+}
+
+#[test]
+fn token_set_ignores_case_order_punctuation_and_repeats() {
+    let a = token_set("SQLite FTS5: bm25 column weights");
+    assert_eq!(a, token_set("weights, column BM25 (fts5) sqlite sqlite"));
+    assert_eq!(a, ["bm25", "column", "fts5", "sqlite", "weights"]);
+    // An added word changes the set.
+    assert_ne!(a, token_set("sqlite fts5 bm25 column weights 2026"));
+    assert!(token_set("  ...  ").is_empty());
+}
+
+#[test]
+fn token_set_splits_cjk_runs_and_a_codex_join_is_one_set() {
+    assert_eq!(
+        token_set("rust\u{3067}\u{691c}\u{7d22}"),
+        ["rust", "\u{3067}\u{691c}\u{7d22}"]
+    );
+    assert_eq!(token_set("b query | a query"), ["a", "b", "query"]);
+    assert_eq!(token_set("a query | b query"), token_set("b query a query"));
 }

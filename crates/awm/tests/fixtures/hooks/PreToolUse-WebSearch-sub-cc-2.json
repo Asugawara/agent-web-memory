@@ -1,0 +1,15 @@
+{
+  "session_id": "00000000-0000-4000-a000-000000000009",
+  "transcript_path": "/home/user/.claude/projects/-home-user-dev-agent-web-memory-spikes-query-deny-cc-variant/00000000-0000-4000-a000-000000000009.jsonl",
+  "cwd": "/home/user/dev/agent-web-memory/spikes/query-deny/cc-variant",
+  "prompt_id": "00000000-0000-4000-a000-000000000019",
+  "permission_mode": "dontAsk",
+  "agent_id": "a0000000000000002",
+  "agent_type": "general-purpose",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "WebSearch",
+  "tool_input": {
+    "query": "SQLite FTS5 bm25 column weights"
+  },
+  "tool_use_id": "toolu_fixture000000000009"
+}
