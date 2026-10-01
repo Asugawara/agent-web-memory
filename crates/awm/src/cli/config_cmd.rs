@@ -35,6 +35,8 @@ const KEYS: &[&str] = &[
     "short_circuit.mode",
     "short_circuit.window_minutes",
     "short_circuit.subagents",
+    "short_circuit.query",
+    "short_circuit.query_window_minutes",
     "inject.max_notes",
     "inject.max_per_agent",
     "hooks.deadline_ms",
