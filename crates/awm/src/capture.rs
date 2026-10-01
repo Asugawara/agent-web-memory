@@ -28,6 +28,9 @@ pub enum CaptureOutcome {
     Captured,
     Skipped(&'static str),
     Spooled,
+    /// The database schema is not this binary's (§5.4 upgrade window, or an older
+    /// binary): nothing was stored, and a spool file holding the record must stay.
+    SchemaMismatch,
     Off,
 }
 
@@ -45,8 +48,9 @@ pub fn run(payload: &Value, opts: &CaptureOpts) -> anyhow::Result<CaptureOutcome
 }
 
 /// Re-runs every spool file, oldest first. Files that were captured or skipped
-/// (and files that are not JSON) are deleted; a file that hits a lock again stays
-/// and ends the pass. Returns the number of files deleted.
+/// for a final reason (and files that are not JSON) are deleted; a file that hits
+/// a lock or a schema mismatch stays and ends the pass. Returns the number of
+/// files deleted.
 pub fn drain_spool(opts: &CaptureOpts) -> anyhow::Result<usize> {
     let dir = opts.data_dir.join(paths::SPOOL_DIR);
     let entries = match std::fs::read_dir(&dir) {
@@ -76,7 +80,7 @@ pub fn drain_spool(opts: &CaptureOpts) -> anyhow::Result<usize> {
         let mut o = opts.clone();
         o.now_ms = ts;
         match store(rec, &o, false) {
-            Ok(CaptureOutcome::Spooled) => break,
+            Ok(CaptureOutcome::Spooled | CaptureOutcome::SchemaMismatch) => break,
             Ok(_) => {
                 if std::fs::remove_file(&path).is_ok() {
                     deleted += 1;
@@ -119,7 +123,8 @@ fn capture_one(payload: &Value, opts: &CaptureOpts) -> anyhow::Result<CaptureOut
     store(rec, opts, true)
 }
 
-/// Stores a redacted record, spooling it when the database is locked.
+/// Stores a redacted record. With `spool_on_busy` (the live hook) the record is
+/// spooled when the database is locked or still at an older schema version.
 fn store(
     mut rec: Record,
     opts: &CaptureOpts,
@@ -131,8 +136,13 @@ fn store(
         return Ok(CaptureOutcome::Skipped("no database"));
     }
     let mut conn = db::open(&db_path, Role::Capture)?;
-    if db::check_version(&conn)? != VersionCheck::Current {
-        return Ok(CaptureOutcome::Skipped("schema"));
+    match db::check_version(&conn)? {
+        VersionCheck::Current => {}
+        // `awm doctor` has not migrated yet; it drains the spool after migrating.
+        VersionCheck::Older { .. } if spool_on_busy => return spool(&rec, opts, &conn),
+        VersionCheck::Older { .. } | VersionCheck::Newer { .. } => {
+            return Ok(CaptureOutcome::SchemaMismatch)
+        }
     }
     let agent_kind = if rec.agent_id.is_some() {
         "subagent"
@@ -344,7 +354,8 @@ fn spool(rec: &Record, opts: &CaptureOpts, conn: &Connection) -> anyhow::Result<
     }
     std::fs::rename(&tmp, &target)
         .with_context(|| format!("cannot move the spool file to {}", target.display()))?;
-    // Best effort and without waiting: the database is locked.
+    // Best effort and without waiting: the database is locked, or at an older
+    // schema (`hook_run` is unchanged since version 1).
     let _ = conn.busy_timeout(std::time::Duration::ZERO);
     let _ = conn.execute(
         "INSERT INTO hook_run (started_at, hook, session_id, agent_kind, total_ms, outcome) \
