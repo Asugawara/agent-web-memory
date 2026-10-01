@@ -173,7 +173,8 @@ fn store(
 }
 
 /// Reads tombstones and `purged_before`, applies the private-host rules and
-/// drops private result rows. Returns the reason to skip, if any.
+/// drops private and forgotten result rows. Returns the reason to skip, if any.
+/// `import.rs::decide` is a copy; keep the two in step.
 fn decide(
     conn: &Connection,
     rec: &mut Record,
@@ -181,24 +182,6 @@ fn decide(
 ) -> anyhow::Result<Option<&'static str>> {
     let exclude = &config.capture.exclude_hosts;
     let private = |u: &str| Url::parse(u).map_or(true, |u| hosts::is_private(&u, exclude));
-    match &rec.url {
-        Some(url) => {
-            if private(url) {
-                return Ok(Some("private host"));
-            }
-        }
-        None => {
-            if !rec.results.is_empty() && rec.results.iter().all(|r| private(&r.url)) {
-                return Ok(Some("private host"));
-            }
-            rec.results.retain(|r| !private(&r.url));
-            for (i, r) in rec.results.iter_mut().enumerate() {
-                r.rank = i64::try_from(i).unwrap_or(i64::MAX) + 1;
-            }
-            rec.match_text = rec.match_text();
-        }
-    }
-
     let tombstoned = |kind: &str, value: &str| -> anyhow::Result<bool> {
         Ok(conn
             .query_row(
@@ -209,6 +192,39 @@ fn decide(
             .optional()?
             .is_some())
     };
+    match &rec.url {
+        Some(url) => {
+            if private(url) {
+                return Ok(Some("private host"));
+            }
+        }
+        None => {
+            // Result rows of private hosts and of forgotten URLs (`url_hash`
+            // tombstones, §6.4) are dropped; a search left with none is skipped.
+            let listed = rec.results.len();
+            let (mut private_rows, mut kept) = (0, Vec::with_capacity(listed));
+            for r in std::mem::take(&mut rec.results) {
+                if private(&r.url) {
+                    private_rows += 1;
+                } else if !tombstoned("url_hash", &sha256_hex(&r.url_norm))? {
+                    kept.push(r);
+                }
+            }
+            if listed > 0 && kept.is_empty() {
+                return Ok(Some(if private_rows == listed {
+                    "private host"
+                } else {
+                    "tombstone"
+                }));
+            }
+            rec.results = kept;
+            for (i, r) in rec.results.iter_mut().enumerate() {
+                r.rank = i64::try_from(i).unwrap_or(i64::MAX) + 1;
+            }
+            rec.match_text = rec.match_text();
+        }
+    }
+
     if tombstoned("tool_use_id", &rec.tool_use_id)? {
         return Ok(Some("tombstone"));
     }

@@ -10,7 +10,11 @@
 //! them from the index), tombstones, then `optimize` of the FTS index and
 //! `wal_checkpoint(TRUNCATE)`. `secure_delete=ON` (set by `db::open`) zeroes
 //! freed pages and deleted cells. Backups `{db}.bak-v*` and spool files are
-//! deleted last, because neither can be scrubbed partially.
+//! deleted last, because neither can be scrubbed partially; they are deleted
+//! even when `optimize` or the checkpoint fails after the commit.
+//!
+//! `forget <url>` and `purge --before` select their records again inside the
+//! deleting transaction, so a record stored while the question waited goes too.
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, IsTerminal, Write};
@@ -90,13 +94,15 @@ pub enum Outcome {
     Declined,
     /// No terminal and no `--yes`; nothing changed.
     Refused,
+    /// `purge --all`: the data dir holds entries awm did not create; nothing changed.
+    Foreign,
 }
 
 impl Outcome {
     /// Process exit code: 2 for a refusal, else 0.
     pub fn exit_code(self) -> i32 {
         match self {
-            Outcome::Refused => 2,
+            Outcome::Refused | Outcome::Foreign => 2,
             _ => 0,
         }
     }
@@ -145,13 +151,18 @@ pub fn with_stdio<T>(f: impl FnOnce(&mut Io<'_>) -> anyhow::Result<T>) -> anyhow
     f(&mut io)
 }
 
-/// Exits with code 2 after a refusal.
+/// Exits with code 2 after a refusal or when `purge --all` found foreign entries.
 pub fn finish(outcome: Outcome) -> anyhow::Result<()> {
-    if outcome == Outcome::Refused {
+    if outcome.exit_code() != 0 {
         std::io::stdout().flush()?;
         std::process::exit(outcome.exit_code());
     }
     Ok(())
+}
+
+/// Quotes `s` for a POSIX shell: single quotes, with `'` written as `'\''`.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -270,14 +281,17 @@ fn plain(s: &str) -> String {
 }
 
 /// A URL given to `forget <url>`.
+#[derive(Clone)]
 struct UrlTarget {
+    /// The argument as given.
+    arg: String,
     norm: String,
     /// ASCII-lowercased spellings searched for in kept text, longest first.
     needles: Vec<String>,
 }
 
 impl UrlTarget {
-    fn new(norm: String, spellings: impl IntoIterator<Item = String>) -> UrlTarget {
+    fn new(arg: &str, norm: String, spellings: impl IntoIterator<Item = String>) -> UrlTarget {
         let mut set: BTreeSet<String> = spellings
             .into_iter()
             .map(|s| s.trim().to_ascii_lowercase())
@@ -286,7 +300,11 @@ impl UrlTarget {
         set.insert(norm.to_ascii_lowercase());
         let mut needles: Vec<String> = set.into_iter().collect();
         needles.sort_by_key(|n| std::cmp::Reverse(n.len()));
-        UrlTarget { norm, needles }
+        UrlTarget {
+            arg: arg.to_string(),
+            norm,
+            needles,
+        }
     }
 
     fn mentioned_in(&self, text: &str) -> bool {
@@ -336,7 +354,7 @@ fn matches_of(hay: &str, needle: &str) -> Vec<(usize, usize)> {
 }
 
 /// What a deletion removes.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Selection {
     event_ids: Vec<i64>,
     tool_use_ids: Vec<String>,
@@ -353,6 +371,42 @@ impl Selection {
             ..Selection::default()
         }
     }
+
+    /// `forget <url>` and `purge --before` select again (inside the deleting
+    /// transaction), so records stored after the question are included.
+    /// `forget last`, `--id` and `--ref` keep the confirmed set (`None`).
+    fn reselect(&self, conn: &Connection) -> anyhow::Result<Option<Selection>> {
+        if let Some(u) = &self.url {
+            let (rows, url) = select_url(conn, &u.arg, &u.norm)?;
+            return Ok(Some(Selection {
+                url: Some(url),
+                ..Selection::of_rows(&rows)
+            }));
+        }
+        if let Some(before) = self.before {
+            let rows = rows(conn, "created_at < ?1", [before])?;
+            return Ok(Some(Selection {
+                before: Some(before),
+                ..Selection::of_rows(&rows)
+            }));
+        }
+        Ok(None)
+    }
+}
+
+/// Records with the URL's `url_norm`, and the spellings searched for in kept
+/// text: the argument, the stored URLs of those records and of result rows.
+fn select_url(conn: &Connection, arg: &str, norm: &str) -> anyhow::Result<(Vec<Row>, UrlTarget)> {
+    let rows = rows(conn, "url_norm = ?1", [norm])?;
+    let mut spellings: Vec<String> = vec![arg.to_string()];
+    spellings.extend(rows.iter().map(|r| r.target.clone()));
+    let mut st = conn.prepare("SELECT DISTINCT url FROM result WHERE url_norm = ?1")?;
+    for u in st.query_map([norm], |r| r.get::<_, String>(0))? {
+        spellings.push(u?);
+    }
+    drop(st);
+    let url = UrlTarget::new(arg, norm.to_string(), spellings);
+    Ok((rows, url))
 }
 
 // ---------------------------------------------------------------------------
@@ -360,12 +414,14 @@ impl Selection {
 
 pub fn run_forget(args: &Args, io: &mut Io<'_>) -> anyhow::Result<Outcome> {
     let mut conn = open_db(&io.data_dir)?;
-    let (rows, url, rerun) = if let Some(id) = args.id {
+    // `rerun`: the command as typed, for the refusal hint. `again`: the same
+    // command when running it again is safe (it selects by URL), for the busy-WAL hint.
+    let (rows, url, rerun, again) = if let Some(id) = args.id {
         let rows = rows(&conn, "id = ?1", [id])?;
         if rows.is_empty() {
             bail!("no record with id {id}");
         }
-        (rows, None, format!("awm forget --id {id}"))
+        (rows, None, format!("awm forget --id {id}"), None)
     } else if let Some(r) = &args.ref_id {
         let injection: Option<i64> = conn
             .query_row("SELECT id FROM injection WHERE ref = ?1", [r], |x| x.get(0))
@@ -376,7 +432,12 @@ pub fn run_forget(args: &Args, io: &mut Io<'_>) -> anyhow::Result<Outcome> {
             "id IN (SELECT event_id FROM injection_item WHERE injection_id = ?1)",
             [injection],
         )?;
-        (rows, None, format!("awm forget --ref {r}"))
+        (
+            rows,
+            None,
+            format!("awm forget --ref {}", shell_quote(r)),
+            None,
+        )
     } else {
         let target = args.target.as_deref().unwrap_or_default();
         if target == "last" {
@@ -385,23 +446,13 @@ pub fn run_forget(args: &Args, io: &mut Io<'_>) -> anyhow::Result<Outcome> {
                 "id = (SELECT id FROM event ORDER BY created_at DESC, id DESC LIMIT 1)",
                 [],
             )?;
-            (rows, None, "awm forget last".to_string())
+            (rows, None, "awm forget last".to_string(), None)
         } else {
             let norm = norm_url(target)
                 .ok_or_else(|| anyhow!("not a URL: {target:?} (use last, --id N or --ref REF)"))?;
-            let rows = rows(&conn, "url_norm = ?1", [&norm])?;
-            let mut spellings: Vec<String> = vec![target.to_string()];
-            spellings.extend(rows.iter().map(|r| r.target.clone()));
-            let mut st = conn.prepare("SELECT DISTINCT url FROM result WHERE url_norm = ?1")?;
-            for u in st.query_map([&norm], |r| r.get::<_, String>(0))? {
-                spellings.push(u?);
-            }
-            drop(st);
-            (
-                rows,
-                Some(UrlTarget::new(norm, spellings)),
-                format!("awm forget '{target}'"),
-            )
+            let (rows, url) = select_url(&conn, target, &norm)?;
+            let rerun = format!("awm forget {}", shell_quote(target));
+            (rows, Some(url), rerun.clone(), Some(rerun))
         }
     };
 
@@ -432,19 +483,23 @@ pub fn run_forget(args: &Args, io: &mut Io<'_>) -> anyhow::Result<Outcome> {
         "Injection log entries to delete: {}.",
         preview.injections
     )?;
-    let question = if rows.is_empty() && preview.updated == 0 && preview.injections == 0 {
+    let question = if !rows.is_empty() {
+        format!("Forget {} record(s) permanently?", rows.len())
+    } else if preview.updated == 0 && preview.injections == 0 {
         "Nothing stored for it. Skip it in future records?".to_string()
     } else {
-        format!("Forget {} record(s) permanently?", rows.len())
+        format!(
+            "Remove it from {} kept search record(s), delete {} injection log entr{} and skip it in future records?",
+            preview.updated,
+            preview.injections,
+            if preview.injections == 1 { "y" } else { "ies" }
+        )
     };
     if let Some(o) = confirm(io, args.yes, &question, &rerun)? {
         return Ok(o);
     }
     let deleted = apply(&mut conn, &sel, io.now_ms)?;
-    drop(conn);
-    let deleted = cleanup_files(&io.data_dir, deleted)?;
-    print_deleted(io.out, &deleted)?;
-    Ok(Outcome::Done)
+    finish_deletion(io, conn, deleted, again.as_deref())
 }
 
 /// Counts shown before the question; computed with the same rules as [`apply`].
@@ -567,10 +622,13 @@ fn count(conn: &Connection, table: &str) -> anyhow::Result<usize> {
     Ok(usize::try_from(n).unwrap_or(0))
 }
 
-/// Steps 1-5 of §6.4: one transaction, then FTS optimize and WAL truncation.
+/// Steps 1-4 of §6.4 in one transaction. `forget <url>` and `purge --before`
+/// select again inside it ([`Selection::reselect`]).
 fn apply(conn: &mut Connection, sel: &Selection, now_ms: i64) -> anyhow::Result<Deleted> {
     let mut d = Deleted::default();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let fresh = sel.reselect(&tx)?;
+    let sel = fresh.as_ref().unwrap_or(sel);
     let affected = match &sel.url {
         Some(u) => affected_events(&tx, u, &sel.event_ids)?,
         None => Affected::default(),
@@ -628,13 +686,38 @@ fn apply(conn: &mut Connection, sel: &Selection, now_ms: i64) -> anyhow::Result<
     d.results = results_before - count(&tx, "result")?;
     d.injections = injections_before - count(&tx, "injection")?;
     tx.commit()?;
+    Ok(d)
+}
 
-    // Step 5: merge the FTS segments so deleted terms leave the index pages
-    // (the freed pages are zeroed by secure_delete), then empty the WAL.
+/// Step 5: merge the FTS segments so deleted terms leave the index pages
+/// (the freed pages are zeroed by secure_delete), then empty the WAL.
+/// Returns whether the checkpoint was blocked by another connection.
+fn scrub(conn: &Connection) -> anyhow::Result<bool> {
     conn.execute("INSERT INTO event_fts(event_fts) VALUES('optimize')", [])?;
     let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
-    d.wal_busy = busy != 0;
-    Ok(d)
+    Ok(busy != 0)
+}
+
+/// After the commit: step 5, then step 6 even if step 5 failed, then the
+/// report; errors are returned after the report. `again` is the command to
+/// run again when the WAL could not be emptied (only when that is safe).
+fn finish_deletion(
+    io: &mut Io<'_>,
+    conn: Connection,
+    mut d: Deleted,
+    again: Option<&str>,
+) -> anyhow::Result<Outcome> {
+    let scrubbed = scrub(&conn);
+    drop(conn);
+    let cleaned = cleanup_files(&io.data_dir, &mut d);
+    d.wal_busy = matches!(scrubbed, Ok(true));
+    print_deleted(io.out, &d, again)?;
+    scrubbed.context(
+        "the records are deleted, but the search index could not be compacted or awm.db-wal \
+         emptied; awm.db and awm.db-wal may still hold old copies of the deleted data",
+    )?;
+    cleaned?;
+    Ok(Outcome::Done)
 }
 
 /// Removes the forgotten URL from a kept record: its text and titles are
@@ -721,8 +804,10 @@ fn rewrite_event(conn: &Connection, id: i64, u: &UrlTarget) -> anyhow::Result<()
     Ok(())
 }
 
-/// Step 6: backups `{db}.bak-v*` (also unfinished `.tmp` copies) and spool files.
-fn cleanup_files(data_dir: &Path, mut d: Deleted) -> anyhow::Result<Deleted> {
+/// Step 6: backups `{db}.bak-v*` (also unfinished `.tmp` copies) and the
+/// `*.json` files of `spool/`. A `spool` that is not a real directory (a
+/// symlink) is not followed.
+fn cleanup_files(data_dir: &Path, d: &mut Deleted) -> anyhow::Result<()> {
     let prefix = format!("{}.bak-v", paths::DB_FILE);
     if let Ok(entries) = std::fs::read_dir(data_dir) {
         for e in entries.flatten() {
@@ -734,19 +819,31 @@ fn cleanup_files(data_dir: &Path, mut d: Deleted) -> anyhow::Result<Deleted> {
         }
     }
     d.backups.sort();
-    if let Ok(entries) = std::fs::read_dir(data_dir.join(paths::SPOOL_DIR)) {
+    let spool = data_dir.join(paths::SPOOL_DIR);
+    if !std::fs::symlink_metadata(&spool).is_ok_and(|m| m.is_dir()) {
+        return Ok(());
+    }
+    if let Ok(entries) = std::fs::read_dir(&spool) {
         for e in entries.flatten() {
-            if e.path().is_file() {
+            if spool_file(&e) {
                 std::fs::remove_file(e.path())
                     .with_context(|| format!("cannot delete {}", e.path().display()))?;
                 d.spool_files += 1;
             }
         }
     }
-    Ok(d)
+    Ok(())
 }
 
-fn print_deleted(out: &mut dyn Write, d: &Deleted) -> anyhow::Result<()> {
+/// A pending capture in `spool/`: a regular `*.json` file (symlinks are not files here).
+fn spool_file(e: &std::fs::DirEntry) -> bool {
+    e.file_type().is_ok_and(|t| t.is_file())
+        && Path::new(&e.file_name())
+            .extension()
+            .is_some_and(|x| x == "json")
+}
+
+fn print_deleted(out: &mut dyn Write, d: &Deleted, again: Option<&str>) -> anyhow::Result<()> {
     writeln!(
         out,
         "Deleted {} record(s), {} result row(s), {} injection log entr{} and {} hook run(s).",
@@ -780,12 +877,27 @@ fn print_deleted(out: &mut dyn Write, d: &Deleted) -> anyhow::Result<()> {
             names.join(", ")
         )?;
     }
-    writeln!(out, "Deleted {} spool file(s).", d.spool_files)?;
-    if d.wal_busy {
+    if d.spool_files == 0 {
+        writeln!(out, "Deleted 0 spool file(s).")?;
+    } else {
         writeln!(
             out,
-            "Warning: another process has the database open, so awm.db-wal could not be emptied; \
-             it may hold old copies of the deleted data until SQLite overwrites that space."
+            "Deleted {} spool file(s): pending captures were discarded; `awm import` reads them \
+             again from the Claude Code transcripts.",
+            d.spool_files
+        )?;
+    }
+    if d.wal_busy {
+        let when = match again {
+            Some(cmd) => format!("Re-run `{cmd} --yes` when no Claude Code session is active."),
+            None => "They are emptied when the last process closes the database; make sure no \
+                     Claude Code session is active."
+                .to_string(),
+        };
+        writeln!(
+            out,
+            "Warning: another process has the database open, so awm.db and awm.db-wal could not \
+             be scrubbed; they may hold old copies of the deleted data. {when}"
         )?;
     }
     Ok(())
@@ -828,19 +940,13 @@ pub fn run_purge_with(args: &PurgeArgs, io: &mut Io<'_>) -> anyhow::Result<Outco
         "Records older than {date} found later by capture or import are skipped."
     )?;
     let question = format!("Delete {} record(s) permanently?", rows.len());
-    if let Some(o) = confirm(
-        io,
-        args.yes,
-        &question,
-        &format!("awm purge --before {date}"),
-    )? {
+    // `date` passed `parse_date`, so it needs no quoting.
+    let rerun = format!("awm purge --before {date}");
+    if let Some(o) = confirm(io, args.yes, &question, &rerun)? {
         return Ok(o);
     }
     let deleted = apply(&mut conn, &sel, io.now_ms)?;
-    drop(conn);
-    let deleted = cleanup_files(&io.data_dir, deleted)?;
-    print_deleted(io.out, &deleted)?;
-    Ok(Outcome::Done)
+    finish_deletion(io, conn, deleted, Some(&rerun))
 }
 
 /// What `purge --all` found in the data dir before deleting it.
@@ -851,7 +957,8 @@ pub struct DirSummary {
     pub records: Option<i64>,
 }
 
-/// Names in the data dir that awm creates (plan-v2 §5.7, §6.2, `capture` spool).
+/// File names in the data dir that awm creates (plan-v2 §5.7, §6.2); `spool/`
+/// and `config.toml` are checked by [`foreign_entries`].
 fn ours(name: &str) -> bool {
     let db = paths::DB_FILE;
     name == db
@@ -859,9 +966,74 @@ fn ours(name: &str) -> bool {
         || name == format!("{db}-shm")
         || name == format!("{db}-journal")
         || name.starts_with(&format!("{db}.bak-v"))
-        || name == paths::CONFIG_FILE
-        || name == paths::SPOOL_DIR
         || name == ".DS_Store"
+}
+
+/// Whether `path` reads as an awm configuration: TOML whose top-level keys
+/// are all keys of [`Config`](crate::config::Config). Values are not checked,
+/// so a mistyped value does not make the owner's own file foreign.
+fn awm_config(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(table) = text.parse::<toml::Table>() else {
+        return false;
+    };
+    let Ok(known) = toml::Table::try_from(crate::config::Config::default()) else {
+        return false;
+    };
+    table.keys().all(|k| known.contains_key(k))
+}
+
+/// Entries of the data dir that awm did not create, as paths relative to it.
+/// A symlink with an awm name is ours (only the link is deleted); `spool/`
+/// must be a symlink or a directory of regular `*.json` files.
+fn foreign_entries(dir: &Path) -> anyhow::Result<Vec<String>> {
+    let mut foreign = Vec::new();
+    for e in std::fs::read_dir(dir)
+        .with_context(|| format!("cannot read {}", dir.display()))?
+        .flatten()
+    {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Ok(kind) = e.file_type() else {
+            foreign.push(name);
+            continue;
+        };
+        let ok = if kind.is_symlink() {
+            ours(&name) || name == paths::CONFIG_FILE || name == paths::SPOOL_DIR
+        } else if name == paths::SPOOL_DIR && kind.is_dir() {
+            for f in std::fs::read_dir(e.path())
+                .with_context(|| format!("cannot read {}", e.path().display()))?
+                .flatten()
+            {
+                if !spool_file(&f) {
+                    foreign.push(format!("{name}/{}", f.file_name().to_string_lossy()));
+                }
+            }
+            true
+        } else if name == paths::CONFIG_FILE && kind.is_file() {
+            awm_config(&e.path())
+        } else {
+            ours(&name) && kind.is_file()
+        };
+        if !ok {
+            foreign.push(name);
+        }
+    }
+    foreign.sort();
+    Ok(foreign)
+}
+
+/// Prints the refusal of `purge --all` when the data dir holds foreign entries.
+fn refuse_foreign(io: &mut Io<'_>, dir: &Path, foreign: &[String]) -> anyhow::Result<Outcome> {
+    writeln!(
+        io.out,
+        "Not deleting {}: it holds entries awm did not create: {}. Nothing changed. \
+         Check AWM_HOME, or move those entries out and run the command again.",
+        dir.display(),
+        foreign.join(", ")
+    )?;
+    Ok(Outcome::Foreign)
 }
 
 fn dir_bytes(dir: &Path) -> u64 {
@@ -912,8 +1084,10 @@ fn describe(s: &DirSummary) -> String {
 }
 
 /// `purge --all` (also the data part of `awm uninstall`): prints the data dir,
-/// its size and record count, asks, then deletes it. Only entries awm creates
-/// are deleted; anything else is listed and the directory is kept.
+/// its size and record count, asks, then deletes it. If the directory holds
+/// any entry awm did not create, nothing is deleted: the entries are listed
+/// and the outcome is [`Outcome::Foreign`] (exit code 2). The check runs
+/// before the question and again after it.
 /// Returns `(Outcome::Nothing, None)` when the directory does not exist.
 pub fn purge_all(
     io: &mut Io<'_>,
@@ -929,6 +1103,10 @@ pub fn purge_all(
         )?;
         return Ok((Outcome::Nothing, None));
     }
+    let foreign = foreign_entries(&dir)?;
+    if !foreign.is_empty() {
+        return Ok((refuse_foreign(io, &dir, &foreign)?, None));
+    }
     let summary = DirSummary {
         bytes: dir_bytes(&dir),
         records: record_count(&dir),
@@ -943,43 +1121,40 @@ pub fn purge_all(
     if let Some(o) = confirm(io, yes, &question, rerun)? {
         return Ok((o, Some(summary)));
     }
-    let mut foreign = Vec::new();
+    let foreign = foreign_entries(&dir)?;
+    if !foreign.is_empty() {
+        return Ok((refuse_foreign(io, &dir, &foreign)?, Some(summary)));
+    }
+    // Only awm's entries are left: files and symlinks (removed as links, never
+    // followed), and a real `spool/` holding only `*.json` files.
     for e in std::fs::read_dir(&dir)
         .with_context(|| format!("cannot read {}", dir.display()))?
         .flatten()
     {
-        let name = e.file_name().to_string_lossy().into_owned();
         let path = e.path();
-        if !ours(&name) {
-            foreign.push(name);
-            continue;
-        }
-        let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
-        let removed = if is_dir {
-            std::fs::remove_dir_all(&path)
+        if e.file_type().is_ok_and(|t| t.is_dir()) {
+            for f in std::fs::read_dir(&path)
+                .with_context(|| format!("cannot read {}", path.display()))?
+                .flatten()
+                .filter(spool_file)
+            {
+                std::fs::remove_file(f.path())
+                    .with_context(|| format!("cannot delete {}", f.path().display()))?;
+            }
+            // Fails, deleting nothing more, if anything else appeared meanwhile.
+            std::fs::remove_dir(&path)
         } else {
             std::fs::remove_file(&path)
-        };
-        removed.with_context(|| format!("cannot delete {}", path.display()))?;
+        }
+        .with_context(|| format!("cannot delete {}", path.display()))?;
     }
-    if foreign.is_empty() {
-        std::fs::remove_dir(&dir).with_context(|| format!("cannot delete {}", dir.display()))?;
-        writeln!(
-            io.out,
-            "Deleted {} ({}).",
-            dir.display(),
-            describe(&summary)
-        )?;
-    } else {
-        foreign.sort();
-        writeln!(
-            io.out,
-            "Deleted awm's files in {} ({}). Kept the directory: it also holds {}, which awm did not create.",
-            dir.display(),
-            describe(&summary),
-            foreign.join(", ")
-        )?;
-    }
+    std::fs::remove_dir(&dir).with_context(|| format!("cannot delete {}", dir.display()))?;
+    writeln!(
+        io.out,
+        "Deleted {} ({}).",
+        dir.display(),
+        describe(&summary)
+    )?;
     Ok((Outcome::Done, Some(summary)))
 }
 
@@ -1054,7 +1229,8 @@ pub fn run_quarantine_with(
     print_rows(io.out, &picked)?;
     let verb = if on { "quarantine" } else { "unquarantine" };
     let question = format!("{} {} record(s)?", capitalise(verb), ids.len());
-    if let Some(o) = confirm(io, args.yes, &question, &format!("awm {verb} '{target}'"))? {
+    let rerun = format!("awm {verb} {}", shell_quote(target));
+    if let Some(o) = confirm(io, args.yes, &question, &rerun)? {
         return Ok(o);
     }
     let n = if on {
