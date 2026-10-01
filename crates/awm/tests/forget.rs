@@ -75,6 +75,7 @@ impl Env {
     fn import(&self) -> ImportSummary {
         import::import_all(&ImportOpts {
             projects_dir: self.projects(),
+            codex_dir: None,
             data_dir: self.data(),
             config: Config::default(),
             only_ids: None,
