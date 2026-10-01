@@ -77,7 +77,7 @@ awm purge --all
 
 ### How savings are estimated
 
-`awm stats --savings` counts a shown note as avoided when the same session and agent did not call its URL or query again afterwards, and prices it at the median duration and summary length (chars / 4) of earlier calls of the same URL or query. This is an estimate of something that did not happen, so it also prints the part you confirmed in `awm review` (label 2), the token overhead of the notes, and the repeat calls in your history as an upper bound.
+`awm stats --savings` counts a shown note as avoided when the same session and agent did not call its URL or query again afterwards, and prices it at the median duration and summary length (chars / 4) of earlier calls of the same URL or query. This is an estimate of something that did not happen, so it also prints the part you confirmed in `awm review` (label 2), the token overhead of the notes, and the repeat calls in your history as an upper bound. It also prints a separate line, the page bytes not fetched: for each avoided fetch, the median size of earlier fetches of that URL, with summariser tokens = bytes / 4. That is an upper bound and is kept apart from the token figures above, because the page is read by Claude Code's fetch summariser and the main model never sees those tokens; on API billing they are cost, on a subscription they are usage, not dollars. Searches add 0.
 
 ## Codex
 

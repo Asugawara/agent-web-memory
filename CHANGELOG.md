@@ -20,6 +20,7 @@
 - **Search locally**: `awm search` queries your stored research without leaving your machine.
 - **Review notes**: `awm review` shows you the notes your agents saw and lets you label them (saved time, relevant, irrelevant, misleading).
 - **Statistics**: `awm stats` shows record counts by tool and agent, quarantined records, and injection metrics.
+- **Savings estimate**: `awm stats --savings` estimates time and tokens saved by shown notes, and prints a separate upper-bound line for the page bytes the fetch summariser did not read (summariser tokens = bytes / 4; searches add 0).
 - **Logging**: `awm log` shows the notes injected into your agents this session.
 - **Configuration**: `awm config` lets you enable/disable channels, adjust matching thresholds, and control when notes are shown.
 - **Installation verification**: `awm doctor` checks that the plugin and binary are correctly installed.

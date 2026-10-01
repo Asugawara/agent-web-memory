@@ -937,16 +937,21 @@ fn commands_need_an_initialised_database() {
     }
 }
 
-/// Three past fetches of A (4, 8, 20 s; 400, 800, 1200 chars), two injections showing A.
+/// Three past fetches of A (4, 8, 20 s; 400, 800, 1200 chars; 4000, 8000, 20000 bytes), two
+/// injections showing A, and a fourth ok fetch of A with no `bytes`.
 fn seed_savings(env: &Env) -> Connection {
     let conn = env.conn();
-    for (id, ms, chars) in [(1, 4_000, 400), (2, 8_000, 800), (3, 20_000, 1_200)] {
+    for (id, ms, chars, bytes) in [
+        (1, 4_000, 400, 4_000),
+        (2, 8_000, 800, 8_000),
+        (3, 20_000, 1_200, 20_000),
+    ] {
         let mut e = ev(id, "WebFetch", "s0", BASE + id * 1_000);
         e.url = Some("https://example.org/a");
         insert(&conn, &e);
         conn.execute(
-            "UPDATE event SET duration_ms = ?1, summary = ?2 WHERE id = ?3",
-            params![ms, "x".repeat(chars), id],
+            "UPDATE event SET duration_ms = ?1, summary = ?2, bytes = ?3 WHERE id = ?4",
+            params![ms, "x".repeat(chars), bytes, id],
         )
         .unwrap();
     }
@@ -972,7 +977,9 @@ fn stats_savings_matches_hand_computed_numbers() {
     seed_savings(&env);
     // Injection 1 avoided: median of 4, 8, 20 s is 8 s = 0.1 min; median 800 chars / 4 = 200 tokens.
     // Overhead (800 + 400) / 4 = 300, net -100. Repeats of A: events 2, 3, 4 (8 + 20 + 1 s,
-    // 800 + 1200 + 46 chars).
+    // 800 + 1200 + 46 chars). Page bytes: median of 4000, 8000, 20000 is 8000 (event 4 has NULL
+    // bytes and is ignored), so 8.0 KB and 8000 / 4 = 2000 summariser tokens; the same for the
+    // confirmed item. Repeat fetches: 8000 + 20000 + 0 (event 4) = 28000 bytes, 7000 tokens.
     let text = env.awm(&["stats", "--savings"]).ok().to_string();
     for want in [
         "  shown:            2\n",
@@ -982,9 +989,11 @@ fn stats_savings_matches_hand_computed_numbers() {
         "  est. tokens saved: 0.2k\n",
         "  overhead tokens:  0.3k\n",
         "  net tokens:       -0.1k\n",
-        "  confirmed:        1 items, 0.1 min, 0.2k tokens\n",
-        "  ceiling, repeat fetches: 3 (0.5 min, 0.5k tokens;",
-        "  ceiling, repeat searches: 0 (0.0 min, 0.0k tokens;",
+        "  est. page bytes not fetched: 8.0 KB (summariser tokens <= 2.0k)\n",
+        "  confirmed:        1 items, 0.1 min, 0.2k tokens, 8.0 KB page bytes\n",
+        "  ceiling, repeat fetches: 3 (0.5 min, 0.5k tokens, 28.0 KB page bytes;",
+        "  ceiling, repeat searches: 0 (0.0 min, 0.0k tokens, 0.0 KB page bytes;",
+        "  page bytes not fetched: per avoided fetch, median bytes of past ok fetches",
     ] {
         assert!(text.contains(want), "missing {want:?} in:\n{text}");
     }
@@ -1004,6 +1013,38 @@ fn stats_savings_matches_hand_computed_numbers() {
     assert_eq!(s["ceiling"]["repeat_fetches"]["duration_ms"], 29_000);
     assert_eq!(s["ceiling"]["repeat_fetches"]["tokens"], 511.5);
     assert_eq!(s["ceiling"]["repeat_searches"]["count"], 0);
+    assert_eq!(s["est_bytes_not_fetched"], 8_000);
+    assert_eq!(s["est_summariser_tokens"], 2_000);
+    assert_eq!(s["confirmed"]["est_bytes_not_fetched"], 8_000);
+    assert_eq!(s["confirmed"]["est_summariser_tokens"], 2_000);
+    assert_eq!(s["ceiling"]["repeat_fetches"]["bytes"], 28_000);
+    assert_eq!(s["ceiling"]["repeat_fetches"]["summariser_tokens"], 7_000);
+    assert_eq!(s["ceiling"]["repeat_searches"]["bytes"], 0);
+}
+
+#[test]
+fn stats_savings_avoided_search_adds_no_page_bytes() {
+    let env = Env::new();
+    let conn = env.conn();
+    let mut e = ev(1, "WebSearch", "s0", BASE + 1_000);
+    e.query = Some("bm25 column weights");
+    insert(&conn, &e);
+    // Even a recorded size must not count: a search reads no page.
+    conn.execute("UPDATE event SET bytes = 9999 WHERE id = 1", [])
+        .unwrap();
+    injection(
+        &conn,
+        1,
+        "inject",
+        "query",
+        "s1",
+        BASE + 100_000,
+        &[(1, 1.0)],
+    );
+    let v: Value = serde_json::from_str(env.awm(&["stats", "--savings", "--json"]).ok()).unwrap();
+    assert_eq!(v["savings"]["avoided"], 1);
+    assert_eq!(v["savings"]["est_bytes_not_fetched"], 0);
+    assert_eq!(v["savings"]["est_summariser_tokens"], 0);
 }
 
 #[test]
@@ -1024,6 +1065,8 @@ fn stats_savings_since_limits_the_injections_but_not_the_ceiling() {
     assert_eq!(v["savings"]["shown"], 0);
     assert_eq!(v["savings"]["avoided"], 0);
     assert_eq!(v["savings"]["ceiling"]["repeat_fetches"]["count"], 3);
+    assert_eq!(v["savings"]["est_bytes_not_fetched"], 0);
+    assert_eq!(v["savings"]["ceiling"]["repeat_fetches"]["bytes"], 28_000);
     let text = env
         .awm(&["stats", "--savings", "--since", &late])
         .ok()
