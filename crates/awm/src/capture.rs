@@ -41,7 +41,7 @@ pub fn run(payload: &Value, opts: &CaptureOpts) -> anyhow::Result<CaptureOutcome
             eprintln!("awm: cannot drain the spool: {e:#}");
         }
     }
-    capture_one(payload, opts, true)
+    capture_one(payload, opts)
 }
 
 /// Re-runs every spool file, oldest first. Files that were captured or skipped
@@ -66,7 +66,8 @@ pub fn drain_spool(opts: &CaptureOpts) -> anyhow::Result<usize> {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let Ok(payload) = serde_json::from_str::<Value>(&text) else {
+        // The spool holds the redacted record; anything else is not ours to keep.
+        let Ok(rec) = serde_json::from_str::<Record>(&text) else {
             if std::fs::remove_file(&path).is_ok() {
                 deleted += 1;
             }
@@ -74,13 +75,14 @@ pub fn drain_spool(opts: &CaptureOpts) -> anyhow::Result<usize> {
         };
         let mut o = opts.clone();
         o.now_ms = ts;
-        match capture_one(&payload, &o, false) {
+        match store(rec, &o, false) {
             Ok(CaptureOutcome::Spooled) => break,
             Ok(_) => {
                 if std::fs::remove_file(&path).is_ok() {
                     deleted += 1;
                 }
             }
+            Err(e) if is_busy(&e) => break,
             Err(_) => {}
         }
     }
@@ -106,8 +108,20 @@ fn is_busy(e: &anyhow::Error) -> bool {
     })
 }
 
-fn capture_one(
-    payload: &Value,
+fn capture_one(payload: &Value, opts: &CaptureOpts) -> anyhow::Result<CaptureOutcome> {
+    if !opts.data_dir.join(paths::DB_FILE).is_file() {
+        return Ok(CaptureOutcome::Skipped("no database"));
+    }
+    let terms = &opts.config.capture.redact_terms;
+    let Some(rec) = Record::from_hook(payload, opts.now_ms, terms)? else {
+        return Ok(CaptureOutcome::Skipped("not a web tool"));
+    };
+    store(rec, opts, true)
+}
+
+/// Stores a redacted record, spooling it when the database is locked.
+fn store(
+    mut rec: Record,
     opts: &CaptureOpts,
     spool_on_busy: bool,
 ) -> anyhow::Result<CaptureOutcome> {
@@ -116,10 +130,6 @@ fn capture_one(
     if !db_path.is_file() {
         return Ok(CaptureOutcome::Skipped("no database"));
     }
-    let terms = &opts.config.capture.redact_terms;
-    let Some(mut rec) = Record::from_hook(payload, opts.now_ms, terms)? else {
-        return Ok(CaptureOutcome::Skipped("not a web tool"));
-    };
     let mut conn = db::open(&db_path, Role::Capture)?;
     if db::check_version(&conn)? != VersionCheck::Current {
         return Ok(CaptureOutcome::Skipped("schema"));
@@ -132,7 +142,7 @@ fn capture_one(
 
     let skip = match decide(&conn, &mut rec, &opts.config) {
         Ok(skip) => skip,
-        Err(e) if is_busy(&e) && spool_on_busy => return spool(payload, &rec, opts, &conn),
+        Err(e) if is_busy(&e) && spool_on_busy => return spool(&rec, opts, &conn),
         Err(e) => return Err(e),
     };
     let outcome = match skip {
@@ -142,7 +152,7 @@ fn capture_one(
             match insert(&mut conn, &rec) {
                 Ok(true) => CaptureOutcome::Captured,
                 Ok(false) => CaptureOutcome::Skipped("duplicate"),
-                Err(e) if is_busy(&e) && spool_on_busy => return spool(payload, &rec, opts, &conn),
+                Err(e) if is_busy(&e) && spool_on_busy => return spool(&rec, opts, &conn),
                 Err(e) => return Err(e),
             }
         }
@@ -222,19 +232,14 @@ fn decide(
     Ok(None)
 }
 
-/// Sets `quarantine_reason` when the sanitiser finds a marker phrase in the
-/// summary, fetch prompt or query, or keeps too little of the text.
+/// Sets `quarantine_reason` (§4.3): the summary decides; a marker phrase in the
+/// fetch prompt or query also quarantines.
 fn quarantine(rec: &mut Record) {
-    let mut reasons = Vec::new();
-    if let Some(s) = &rec.summary {
-        reasons.extend(sanitize::quarantine_reason(&sanitize::excerpt(s, 200)));
-    }
-    for line in [&rec.fetch_prompt, &rec.query].into_iter().flatten() {
-        reasons.extend(sanitize::quarantine_reason(&sanitize::line(line, 120)));
-    }
-    if !reasons.is_empty() {
-        rec.quarantine_reason = Some(reasons.join("; "));
-    }
+    rec.quarantine_reason = sanitize::record_quarantine_reason(
+        rec.summary.as_deref(),
+        rec.fetch_prompt.as_deref(),
+        rec.query.as_deref(),
+    );
 }
 
 /// Inserts the event and its results in one transaction; `false` when the
@@ -287,13 +292,8 @@ fn insert(conn: &mut Connection, rec: &Record) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-/// Writes the payload to `{data_dir}/spool/{now_ms}-{tool_use_id}.json` (0600).
-fn spool(
-    payload: &Value,
-    rec: &Record,
-    opts: &CaptureOpts,
-    conn: &Connection,
-) -> anyhow::Result<CaptureOutcome> {
+/// Writes the redacted record to `{data_dir}/spool/{now_ms}-{tool_use_id}.json` (0600).
+fn spool(rec: &Record, opts: &CaptureOpts, conn: &Connection) -> anyhow::Result<CaptureOutcome> {
     let dir = opts.data_dir.join(paths::SPOOL_DIR);
     paths::ensure_private_dir(&dir)?;
     let id: String = rec
@@ -322,7 +322,7 @@ fn spool(
         let mut f = open
             .open(&tmp)
             .with_context(|| format!("cannot write {}", tmp.display()))?;
-        f.write_all(serde_json::to_string(payload)?.as_bytes())?;
+        f.write_all(serde_json::to_string(rec)?.as_bytes())?;
         f.sync_all()?;
     }
     std::fs::rename(&tmp, &target)

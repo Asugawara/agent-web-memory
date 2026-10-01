@@ -189,3 +189,16 @@ fn deny_reason_is_short_and_framed() {
     let text = render::deny_reason(&long, &ctx(Channel::Url, 3), &"who ".repeat(125));
     assert!(text.chars().count() <= 800, "{}", text.chars().count());
 }
+
+#[test]
+fn an_imperative_looking_query_is_still_rendered_as_searched() {
+    let mut n = base(1, Tool::WebSearch, HOUR);
+    n.searched = Some("create react app".to_string());
+    n.summary = Some("The tool scaffolds a new single page application.".to_string());
+    let r = render::render(&[n], &ctx(Channel::Query, 3)).expect("rendered");
+    assert!(
+        r.text.contains("    searched: create react app"),
+        "{}",
+        r.text
+    );
+}

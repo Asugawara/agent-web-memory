@@ -512,6 +512,10 @@ impl Run<'_> {
                 scores.push(hit.score);
             }
         }
+        // Too few scores would overwrite a better stored value (§3.3 minimum).
+        if scores.len() < calibrate::MIN_RECORDS {
+            return Ok(());
+        }
         calibrate::set_prompt_cutoff(&self.conn, &scores)
     }
 
@@ -650,16 +654,11 @@ fn decide(
 
 /// Sets `quarantine_reason` as async capture does.
 fn quarantine(rec: &mut Record) {
-    let mut reasons = Vec::new();
-    if let Some(s) = &rec.summary {
-        reasons.extend(sanitize::quarantine_reason(&sanitize::excerpt(s, 200)));
-    }
-    for line in [&rec.fetch_prompt, &rec.query].into_iter().flatten() {
-        reasons.extend(sanitize::quarantine_reason(&sanitize::line(line, 120)));
-    }
-    if !reasons.is_empty() {
-        rec.quarantine_reason = Some(reasons.join("; "));
-    }
+    rec.quarantine_reason = sanitize::record_quarantine_reason(
+        rec.summary.as_deref(),
+        rec.fetch_prompt.as_deref(),
+        rec.query.as_deref(),
+    );
 }
 
 /// `false` when the `tool_use_id` already exists.

@@ -46,9 +46,6 @@ pub const IMPERATIVE_VERBS: &[&str] = &[
     "wget",
     "sudo",
     "remove",
-    "rm",
-    "cat",
-    "echo",
     "respond",
     "override",
     "bypass",
@@ -61,16 +58,7 @@ pub const IMPERATIVE_VERBS: &[&str] = &[
     "eval",
     "exec",
     "kill",
-    "drop",
     "submit",
-    "show",
-    "give",
-    "create",
-    "edit",
-    "read",
-    "load",
-    "move",
-    "save",
     "forward",
     "leak",
     "dump",
@@ -305,7 +293,7 @@ fn truncate(text: &str, cap: usize) -> String {
     format!("{cut}...")
 }
 
-fn run(text: &str, cap: usize, single_line: bool) -> Sanitized {
+fn run(text: &str, cap: usize, single_line: bool, rules: bool) -> Sanitized {
     let p = patterns();
     // 1
     let s = normalise(text);
@@ -346,8 +334,8 @@ fn run(text: &str, cap: usize, single_line: bool) -> Sanitized {
             .replace('\u{2019}', "'")
             .replace(LT_PIPE, "<");
         let found = find_markers(&lower);
-        let drop =
-            !found.is_empty() || starts_with_imperative(&lower) || starts_with_directive(&lower);
+        let drop = !found.is_empty()
+            || (rules && (starts_with_imperative(&lower) || starts_with_directive(&lower)));
         for m in found {
             if !markers.contains(&m) {
                 markers.push(m);
@@ -376,12 +364,19 @@ fn run(text: &str, cap: usize, single_line: bool) -> Sanitized {
 
 /// Sanitise a multi-line text (a fetch answer or search summary) to at most `cap` characters.
 pub fn excerpt(text: &str, cap: usize) -> Sanitized {
-    run(text, cap, false)
+    run(text, cap, false, true)
 }
 
 /// Same pipeline for a single line (a fetch prompt or a query): newlines become spaces.
 pub fn line(text: &str, cap: usize) -> Sanitized {
-    run(text, cap, true)
+    run(text, cap, true, true)
+}
+
+/// Like [`line`] for text that is a request, not prose (a fetch prompt, a query):
+/// steps 5a (imperative verb) and 5c (second-person directive) do not apply, so
+/// "create react app" survives. Markers (5b), tags, URLs and the caps still do.
+pub fn line_text(text: &str, cap: usize) -> Sanitized {
+    run(text, cap, true, false)
 }
 
 /// A reason to quarantine the source record, or `None`.
@@ -396,6 +391,26 @@ pub fn quarantine_reason(s: &Sanitized) -> Option<String> {
         ));
     }
     None
+}
+
+/// Quarantine reason for a record (§4.3): the summary is checked in full; a fetch
+/// prompt or query only for marker phrases.
+pub fn record_quarantine_reason(
+    summary: Option<&str>,
+    fetch_prompt: Option<&str>,
+    query: Option<&str>,
+) -> Option<String> {
+    let mut reasons = Vec::new();
+    if let Some(s) = summary {
+        reasons.extend(quarantine_reason(&excerpt(s, 200)));
+    }
+    for text in [fetch_prompt, query].into_iter().flatten() {
+        let found = line_text(text, 120);
+        if !found.markers.is_empty() {
+            reasons.extend(quarantine_reason(&found));
+        }
+    }
+    (!reasons.is_empty()).then(|| reasons.join("; "))
 }
 
 /// True for an `https://` URL that is safe to show (§4.3.1 step 9).
