@@ -7,9 +7,9 @@
 - **Redaction before storage**: API keys, secrets, private IPs, file paths, and email addresses are redacted before being written to disk.
 - **Private hosts never stored**: URLs on private networks (`localhost`, `192.168.*`, `10.*`, etc.) are never recorded.
 - **Injected text is bounded**: Notes are wrapped in XML tags, sanitized, capped at 2,200 characters, and labeled with their source and age.
-- **Deletion is verifiable**: `awm forget` marks records for deletion, `awm purge` removes them from the database and all indices.
+- **Deletion is verifiable**: `awm forget` deletes the selected records immediately (tombstones stop them coming back); `awm purge` deletes by date or everything.
 - **Quarantine for unreliable records**: Mark a note or URL as unreliable with `awm quarantine`; quarantined records are never injected.
-- **Release integrity**: Release archives include SHA256 checksums. Install with `cargo install --locked` to verify dependencies.
+- **Build integrity**: Builds are local for now: `scripts/install-local.sh` builds from source with `--locked`; a committed `Cargo.lock`, no network dependencies (`scripts/check.sh` no-network step) and no telemetry.
 - **No telemetry**: No metrics, counters, or analytics are collected or sent anywhere.
 
 ## What is *not* defended
@@ -30,4 +30,4 @@ Future versions may add:
 
 To report a vulnerability, please email security@example.invalid with the subject line `[SECURITY] agent-web-memory vulnerability`.
 
-Do not open a public issue. We will acknowledge receipt within 48 hours and follow up with a fix timeline.
+Do not open a public issue. We will acknowledge receipt within 48 hours and follow up with a fix timeline. GitHub private vulnerability reporting will replace this when the repository is public.

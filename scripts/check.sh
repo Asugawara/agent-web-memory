@@ -7,9 +7,11 @@ cargo fmt --all --check
 
 echo "step: clippy"
 cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy -p agent-web-memory --all-targets --locked --features bench -- -D warnings
 
 echo "step: test"
 cargo test --workspace --locked
+cargo test -p agent-web-memory --locked --features bench
 
 echo "step: no-network"
 tree_out="$(cargo tree -p agent-web-memory -e normal)"

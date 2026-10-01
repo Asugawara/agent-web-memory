@@ -4,8 +4,8 @@
 # Runs `claude -p --model haiku` against a temporary AWM_HOME seeded from the T6 fixtures,
 # with AWM_CANARY={nonce} (every hook appends AWM-CANARY-{Hook}-{nonce}) and
 # AWM_CANARY_DENY=1 for the deny runs. Uses at most 2 WebSearch calls for a full run
-# (VH2, and VH5 which also serves VH7 and VH8). Never writes under ~/.claude; it only
-# reads the session transcripts there. Exits non-zero on a mismatch in VH1-VH5.
+# (VH2, and VH5 which also serves VH7 and VH8). Never edits ~/.claude/settings.json or plugin settings; the `claude -p` runs create
+# session transcripts under ~/.claude/projects as any session does. Exits non-zero on a mismatch in VH1-VH5.
 set -u
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

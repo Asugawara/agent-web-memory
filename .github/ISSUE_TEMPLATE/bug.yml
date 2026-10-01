@@ -38,10 +38,9 @@ body:
     attributes:
       label: Installation method
       options:
-        - brew tap / brew install
-        - cargo install
-        - install.sh script
-        - Other
+        - scripts/install-local.sh
+        - cargo install --path crates/awm
+        - other (describe)
     validations:
       required: true
   - type: textarea
