@@ -1,0 +1,36 @@
+# build output
+dist/
+build/
+*.tsbuildinfo
+
+# dependencies
+node_modules/
+
+# local data
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+.env
+.env.*
+!.env.example
+
+# logs and queues
+*.log
+*.jsonl
+!**/fixtures/**/*.jsonl
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# spikes
+target/
+spikes/data/
+.fastembed_cache/
+
+# spikes are local-only
+spikes/
