@@ -25,6 +25,12 @@ pub struct Args {
     /// Transcript directory (default ~/.claude/projects)
     #[arg(long, value_name = "DIR")]
     pub projects: Option<PathBuf>,
+    /// Codex CLI sessions directory (default $CODEX_HOME/sessions or ~/.codex/sessions)
+    #[arg(long, value_name = "DIR")]
+    pub codex_dir: Option<PathBuf>,
+    /// Do not import Codex CLI rollouts
+    #[arg(long)]
+    pub no_codex: bool,
     /// Answer yes to both questions
     #[arg(long)]
     pub yes: bool,
@@ -120,7 +126,24 @@ pub fn run_with(
         .map(|m| m.len())
         .sum();
 
+    let codex =
+        import::resolve_codex_dir(args.codex_dir.clone(), args.no_codex).filter(|d| d.is_dir());
     writeln!(out, "{}", consent_text(&data_dir.display().to_string()))?;
+    if let Some(dir) = &codex {
+        let files = import::codex_files(dir);
+        let bytes: u64 = files
+            .iter()
+            .filter_map(|f| std::fs::metadata(f).ok())
+            .map(|m| m.len())
+            .sum();
+        writeln!(
+            out,
+            "Also imports Codex CLI rollouts from {} ({} files, {}).\n",
+            dir.display(),
+            files.len(),
+            human_size(bytes)
+        )?;
+    }
 
     let mut record = args.record || args.yes;
     let mut import_wanted = args.import || args.yes;
@@ -173,6 +196,7 @@ pub fn run_with(
         drop(conn);
         summary = Some(import::import_all(&ImportOpts {
             projects_dir: projects,
+            codex_dir: codex,
             data_dir: data_dir.to_path_buf(),
             config,
             only_ids,

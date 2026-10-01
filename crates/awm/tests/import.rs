@@ -58,6 +58,7 @@ impl Env {
     fn opts(&self, only_ids: Option<HashSet<String>>) -> ImportOpts {
         ImportOpts {
             projects_dir: self.projects.clone(),
+            codex_dir: None,
             data_dir: self.data.clone(),
             config: Config::default(),
             only_ids,
@@ -374,6 +375,7 @@ fn awm(env_home: &Path, args: &[&str]) -> (String, bool) {
     let out = Command::new(env!("CARGO_BIN_EXE_awm"))
         .args(args)
         .env("AWM_HOME", env_home)
+        .env("CODEX_HOME", env_home.join("no-codex"))
         .stdin(Stdio::null())
         .output()
         .unwrap();
@@ -505,6 +507,7 @@ fn declining_on_a_terminal_stores_consent_no() {
     awm::init::run_with(
         awm::init::Args {
             projects: Some(env.projects.clone()),
+            no_codex: true,
             ..Default::default()
         },
         &home,
@@ -615,4 +618,305 @@ fn a_small_import_keeps_the_stored_prompt_cutoff() {
         )
         .unwrap();
     assert_eq!(v, "0.77");
+}
+
+// ---- Codex rollouts (CX3) ----
+
+const CODEX_MAIN: &str = "01a00000-0000-7000-8000-000000000001";
+const CODEX_SUB: &str = "01a00000-0000-7000-8000-000000000002";
+/// 2026-10-02T01:07:00Z, the time of the synthetic `web__run` call.
+const CODEX_CALL_MS: i64 = 1_790_903_220_000;
+
+impl Env {
+    /// A private copy of the synthetic Codex sessions.
+    fn with_codex(&self) -> PathBuf {
+        let dir = self.data.parent().unwrap().join("codex");
+        copy_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/projects-codex/sessions"),
+            &dir,
+        );
+        dir
+    }
+
+    fn codex_opts(&self, codex: &Path) -> ImportOpts {
+        ImportOpts {
+            codex_dir: Some(codex.to_path_buf()),
+            ..self.opts(None)
+        }
+    }
+}
+
+fn rollout(codex: &Path, name: &str) -> PathBuf {
+    codex.join("2026/10/02").join(name)
+}
+
+#[test]
+fn codex_rollouts_import_search_open_find_and_web_run() {
+    let env = Env::new();
+    let codex = env.with_codex();
+    let s = import::import_all(&env.codex_opts(&codex)).unwrap();
+    assert_eq!(s.codex_files, 2);
+    assert_eq!(s.codex_records, 5);
+    assert_eq!(s.records_inserted, 4 + 5);
+    let n = |sql: &str| env.count(sql);
+    assert_eq!(n("SELECT COUNT(*) FROM event WHERE agent = 'codex'"), 5);
+    assert_eq!(
+        n("SELECT COUNT(*) FROM event WHERE agent = 'codex' AND source = 'import' AND import_source_id IS NOT NULL"),
+        5
+    );
+    assert_eq!(
+        n("SELECT COUNT(*) FROM event WHERE agent = 'codex' AND tool = 'WebSearch'"),
+        3
+    );
+    assert_eq!(
+        n("SELECT COUNT(*) FROM event WHERE agent = 'codex' AND tool = 'WebFetch'"),
+        2
+    );
+    assert_eq!(
+        n("SELECT COUNT(*) FROM event WHERE query = 'example caching guide' AND agent = 'codex'"),
+        1
+    );
+    assert!(n("SELECT COUNT(*) FROM result r JOIN event e ON e.id = r.event_id WHERE e.agent = 'codex'") >= 3);
+    // The Claude Code rows are untouched.
+    assert_eq!(n("SELECT COUNT(*) FROM event WHERE agent = 'claude'"), 4);
+    let line = import::summary_line(&s, false);
+    assert!(
+        line.contains("from 2 Claude Code files and 2 Codex rollouts in "),
+        "{line}"
+    );
+    assert!(line.contains("22.2% from subagents"), "{line}");
+}
+
+#[test]
+fn codex_subagent_rows_carry_agent_id_and_the_parent_session() {
+    let env = Env::new();
+    let codex = env.with_codex();
+    import::import_all(&env.codex_opts(&codex)).unwrap();
+    let (session, agent_id, agent_type): (String, String, String) = env
+        .conn()
+        .query_row(
+            "SELECT session_id, agent_id, agent_type FROM event WHERE query = 'example subagent query'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(session, CODEX_MAIN);
+    assert_eq!(agent_id, CODEX_SUB);
+    assert_eq!(agent_type, "subagent");
+    assert_eq!(
+        env.count(&format!(
+            "SELECT COUNT(*) FROM event WHERE session_id = '{CODEX_MAIN}' AND agent_id IS NULL"
+        )),
+        4
+    );
+}
+
+#[test]
+fn codex_rerun_inserts_nothing() {
+    let env = Env::new();
+    let codex = env.with_codex();
+    import::import_all(&env.codex_opts(&codex)).unwrap();
+    let s = import::import_all(&env.codex_opts(&codex)).unwrap();
+    assert_eq!(s.records_inserted, 0);
+    assert_eq!(s.codex_records, 0);
+    assert_eq!(s.codex_files, 2);
+    assert_eq!(
+        env.count("SELECT COUNT(*) FROM event WHERE agent = 'codex'"),
+        5
+    );
+    // A rescan from 0 (bookkeeping lost) is caught by the unique ids.
+    env.conn().execute("DELETE FROM import_source", []).unwrap();
+    let s = import::import_all(&env.codex_opts(&codex)).unwrap();
+    assert_eq!(s.records_inserted, 0);
+    assert_eq!(s.skipped_duplicate, 4 + 5);
+}
+
+#[test]
+fn no_codex_imports_none_of_them() {
+    let env = Env::new();
+    let _codex = env.with_codex();
+    let s = env.import();
+    assert_eq!(s.codex_files, 0);
+    assert_eq!(s.codex_records, 0);
+    assert_eq!(
+        env.count("SELECT COUNT(*) FROM event WHERE agent = 'codex'"),
+        0
+    );
+    assert!(!import::summary_line(&s, false).contains("Codex"));
+    let (out, ok) = awm(
+        &env.data.join("fresh"),
+        &[
+            "init",
+            "--record",
+            "--import",
+            "--projects",
+            env.projects.to_str().unwrap(),
+            "--codex-dir",
+            _codex.to_str().unwrap(),
+            "--no-codex",
+        ],
+    );
+    assert!(ok);
+    assert!(!out.contains("Codex"), "{out}");
+    let c = db::open(&env.data.join("fresh/awm.db"), Role::Cli).unwrap();
+    let n: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM event WHERE agent = 'codex'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn a_web_run_call_without_output_holds_the_offset_back() {
+    let env = Env::new();
+    let codex = env.with_codex();
+    let f = rollout(&codex, "rollout-synthetic.jsonl");
+    let full = std::fs::read_to_string(&f).unwrap();
+    let lines: Vec<&str> = full.split_inclusive('\n').collect();
+    // Lines 1..=8 end with the `web__run` call; line 9 is its output.
+    assert!(lines[7].contains("custom_tool_call\""));
+    assert!(lines[8].contains("custom_tool_call_output"));
+    let call_start: usize = lines[..7].iter().map(|l| l.len()).sum();
+    std::fs::write(&f, lines[..8].concat()).unwrap();
+    let s = import::import_all(&env.codex_opts(&codex)).unwrap();
+    assert_eq!(s.codex_records, 3 + 1); // search, open_page, find_in_page + the subagent search
+    assert_eq!(s.files_partial, 1);
+    let (offset, status): (i64, String) = env
+        .conn()
+        .query_row(
+            "SELECT last_offset, status FROM import_source WHERE path LIKE '%rollout-synthetic.jsonl'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(offset, i64::try_from(call_start).unwrap());
+    assert_eq!(status, "partial");
+    // The output arrives: the pair is stored once, with the line number of the call.
+    append(&f, &lines[8..].concat());
+    let s = import::import_all(&env.codex_opts(&codex)).unwrap();
+    assert_eq!(s.codex_records, 1);
+    assert_eq!(
+        env.count("SELECT COUNT(*) FROM event WHERE agent = 'codex'"),
+        5
+    );
+    assert_eq!(
+        env.count(
+            "SELECT COUNT(*) FROM event WHERE tool_use_id = 'codex:rollout-synthetic:8' AND status = 'ok'"
+        ),
+        1
+    );
+    let status: String = env
+        .conn()
+        .query_row(
+            "SELECT status FROM import_source WHERE path LIKE '%rollout-synthetic.jsonl'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "ok");
+}
+
+#[test]
+fn a_hook_captured_web_run_is_not_stored_again_by_the_rollout() {
+    let env = Env::new();
+    let codex = env.with_codex();
+    let mut payload: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/hooks/codex-PostToolUse-webrun-search-1.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    payload["session_id"] = json!(CODEX_MAIN);
+    payload["tool_input"]["search_query"][0]["q"] = json!("example caching guide");
+    let out = awm::capture::run(
+        &payload,
+        &awm::capture::CaptureOpts {
+            data_dir: env.data.clone(),
+            config: Config::default(),
+            now_ms: CODEX_CALL_MS + 30_000,
+        },
+    )
+    .unwrap();
+    assert_eq!(out, awm::capture::CaptureOutcome::Captured);
+    let s = import::import_all(&env.codex_opts(&codex)).unwrap();
+    assert_eq!(s.skipped_duplicate, 1);
+    assert_eq!(s.codex_records, 4); // 5 rollout records minus the hook copy
+    assert_eq!(
+        env.count("SELECT COUNT(*) FROM event WHERE query = 'example caching guide'"),
+        1
+    );
+    assert_eq!(
+        env.count(
+            "SELECT COUNT(*) FROM event WHERE query = 'example caching guide' AND source = 'hook'"
+        ),
+        1
+    );
+}
+
+#[test]
+fn a_distant_or_foreign_session_search_is_not_a_hook_duplicate() {
+    let env = Env::new();
+    let codex = env.with_codex();
+    let hook = |session: &str, at: i64| {
+        let mut payload: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/hooks/codex-PostToolUse-webrun-search-1.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        payload["session_id"] = json!(session);
+        payload["tool_input"]["search_query"][0]["q"] = json!("example caching guide");
+        awm::capture::run(
+            &payload,
+            &awm::capture::CaptureOpts {
+                data_dir: env.data.clone(),
+                config: Config::default(),
+                now_ms: at,
+            },
+        )
+        .unwrap();
+    };
+    hook("another-session", CODEX_CALL_MS);
+    let s = import::import_all(&env.codex_opts(&codex)).unwrap();
+    assert_eq!(s.skipped_duplicate, 0);
+    assert_eq!(s.codex_records, 5);
+}
+
+#[test]
+fn s4_shows_the_codex_line_only_when_the_directory_exists() {
+    let env = Env::new();
+    let codex = env.with_codex();
+    let s4 = |codex_dir: Option<PathBuf>, no_codex: bool| {
+        let mut out = Vec::new();
+        awm::init::run_with(
+            awm::init::Args {
+                projects: Some(env.projects.clone()),
+                codex_dir,
+                no_codex,
+                ..Default::default()
+            },
+            &env.data.join("s4"),
+            false,
+            &mut std::io::Cursor::new(""),
+            &mut out,
+            NOW,
+        )
+        .unwrap();
+        String::from_utf8(out).unwrap()
+    };
+    let text = s4(Some(codex.clone()), false);
+    let want = format!(
+        "Also imports Codex CLI rollouts from {} (2 files, ",
+        codex.display()
+    );
+    assert!(text.contains(&want), "{text}");
+    assert!(!s4(Some(env.data.join("missing")), false).contains("Codex"));
+    assert!(!s4(Some(codex), true).contains("Codex"));
 }

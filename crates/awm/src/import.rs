@@ -25,7 +25,7 @@ use crate::matching::calibrate;
 use crate::matching::{query_channel, MatchOpts};
 use crate::note::Tool;
 use crate::paths;
-use crate::record::{sha256_hex, Record, TranscriptCtx};
+use crate::record::{self, sha256_hex, Agent, CodexCtx, Record, TranscriptCtx};
 use crate::sanitize;
 
 /// Records per transaction.
@@ -45,11 +45,19 @@ pub struct Args {
     /// Import only the tool_use ids listed in FILE (one per line)
     #[arg(long, value_name = "FILE")]
     pub only_ids: Option<PathBuf>,
+    /// Codex CLI sessions directory (default $CODEX_HOME/sessions or ~/.codex/sessions)
+    #[arg(long, value_name = "DIR")]
+    pub codex_dir: Option<PathBuf>,
+    /// Do not import Codex CLI rollouts
+    #[arg(long)]
+    pub no_codex: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct ImportOpts {
     pub projects_dir: PathBuf,
+    /// Codex rollouts directory; `None` skips Codex.
+    pub codex_dir: Option<PathBuf>,
     pub data_dir: PathBuf,
     pub config: Config,
     pub only_ids: Option<HashSet<String>>,
@@ -77,6 +85,10 @@ pub struct ImportSummary {
     pub secs: f64,
     /// Records sampled by `calibrate::run` (the "{c} recent searches" of S5).
     pub calibrated: usize,
+    /// Codex rollout files looked at; the `files_*` fields count Claude Code files only.
+    pub codex_files: usize,
+    /// Inserted records that came from Codex rollouts.
+    pub codex_records: usize,
 }
 
 /// `~/.claude/projects`.
@@ -84,6 +96,37 @@ pub fn default_projects_dir() -> anyhow::Result<PathBuf> {
     let base = directories::BaseDirs::new()
         .ok_or_else(|| anyhow::anyhow!("cannot find the home directory; use --projects"))?;
     Ok(base.home_dir().join(".claude").join("projects"))
+}
+
+/// `$CODEX_HOME/sessions` or `~/.codex/sessions`, when it exists.
+pub fn default_codex_dir() -> Option<PathBuf> {
+    let base = match std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
+        Some(h) => PathBuf::from(h),
+        None => directories::BaseDirs::new()?.home_dir().join(".codex"),
+    };
+    let dir = base.join("sessions");
+    dir.is_dir().then_some(dir)
+}
+
+/// The Codex directory for `--codex-dir` / `--no-codex`.
+pub fn resolve_codex_dir(codex_dir: Option<PathBuf>, no_codex: bool) -> Option<PathBuf> {
+    if no_codex {
+        None
+    } else {
+        codex_dir.or_else(default_codex_dir)
+    }
+}
+
+/// Every `rollout-*.jsonl` under `dir`, sorted.
+pub fn codex_files(dir: &Path) -> Vec<PathBuf> {
+    transcript_files(dir)
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("rollout-"))
+        })
+        .collect()
 }
 
 /// Every `*.jsonl` under `dir`, sorted.
@@ -129,12 +172,31 @@ struct Pending {
 /// A human prompt: time and text, held in memory only.
 type Prompt = (i64, String);
 
+/// A `web__run` call waiting for its output.
+struct CodexPending {
+    call: Value,
+    ctx: CodexCtx,
+    offset: u64,
+}
+
+/// What the first line (`session_meta`) of a rollout says.
+struct CodexMeta {
+    session_id: String,
+    parent: Option<String>,
+    cwd: String,
+}
+
+/// Hook and rollout copies of one search are the same when they are this close (ms).
+const HOOK_DUP_WINDOW_MS: i64 = 120_000;
+
 struct Run<'a> {
     opts: &'a ImportOpts,
     conn: Connection,
     summary: ImportSummary,
     purged_before: Option<i64>,
     prompts: Vec<Prompt>,
+    /// `tool_use_id`s of `web__run` pair records in the current batch.
+    web_run_ids: HashSet<String>,
 }
 
 /// Imports every transcript under `opts.projects_dir` into `{data_dir}/awm.db`
@@ -156,18 +218,16 @@ pub fn import_all(opts: &ImportOpts) -> anyhow::Result<ImportSummary> {
         summary: ImportSummary::default(),
         purged_before,
         prompts: Vec::new(),
+        web_run_ids: HashSet::new(),
     };
     for path in transcript_files(&opts.projects_dir) {
         run.summary.files_total += 1;
-        match run.import_file(&path) {
-            Ok(status) => match status.as_str() {
-                "partial" => run.summary.files_partial += 1,
-                _ => run.summary.files_ok += 1,
-            },
-            Err(e) => {
-                run.summary.files_error += 1;
-                run.record_error(&path, &format!("{e:#}"));
-            }
+        run.import_one(&path, false);
+    }
+    if let Some(dir) = &opts.codex_dir {
+        for path in codex_files(dir) {
+            run.summary.codex_files += 1;
+            run.import_one(&path, true);
         }
     }
     run.finish_prompts()?;
@@ -236,8 +296,22 @@ impl Run<'_> {
         );
     }
 
+    /// Imports one file and counts its outcome.
+    fn import_one(&mut self, path: &Path, codex: bool) {
+        match self.import_file(path, codex) {
+            Ok(status) => match status.as_str() {
+                "partial" => self.summary.files_partial += 1,
+                _ => self.summary.files_ok += 1,
+            },
+            Err(e) => {
+                self.summary.files_error += 1;
+                self.record_error(path, &format!("{e:#}"));
+            }
+        }
+    }
+
     /// Imports one file and returns its stored status (`ok` or `partial`).
-    fn import_file(&mut self, path: &Path) -> anyhow::Result<String> {
+    fn import_file(&mut self, path: &Path, codex: bool) -> anyhow::Result<String> {
         let key = path.to_string_lossy().to_string();
         let (size, mtime) = file_times(path)?;
         let head = head_hash(path, u64::try_from(size).unwrap_or(0))?;
@@ -275,7 +349,11 @@ impl Run<'_> {
             |r| r.get(0),
         )?;
 
-        let outcome = self.scan(path, start, source_id)?;
+        let outcome = if codex {
+            self.scan_codex(path, start, source_id)?
+        } else {
+            self.scan(path, start, source_id)?
+        };
         let status = if outcome.pending > 0 { "partial" } else { "ok" };
         self.conn.execute(
             "UPDATE import_source SET last_offset = ?1, events_found = ?2, events_inserted = ?3, \
@@ -347,6 +425,164 @@ impl Run<'_> {
                 &mut batch,
                 &mut found,
             )?;
+            if batch.len() >= BATCH {
+                inserted += self.flush(&mut batch, source_id)?;
+            }
+        }
+        inserted += self.flush(&mut batch, source_id)?;
+        let last_offset = pending
+            .values()
+            .map(|p| p.offset)
+            .min()
+            .map_or(consumed, |earliest| earliest.min(consumed));
+        Ok(ScanOutcome {
+            last_offset,
+            found,
+            inserted,
+            pending: pending.len(),
+        })
+    }
+
+    /// Streams a Codex rollout from `start`. Only complete lines are consumed; a
+    /// `web__run` call without its output holds the offset back.
+    fn scan_codex(
+        &mut self,
+        path: &Path,
+        start: u64,
+        source_id: i64,
+    ) -> anyhow::Result<ScanOutcome> {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        let meta = codex_meta(path, &stem)?;
+        let is_sub = meta.parent.is_some();
+        let mut line_no = if start == 0 {
+            0
+        } else {
+            count_newlines(path, start)?
+        };
+
+        let mut file = std::fs::File::open(path)?;
+        file.seek(SeekFrom::Start(start))?;
+        let mut reader = BufReader::new(file);
+        let mut pending: HashMap<String, CodexPending> = HashMap::new();
+        let mut batch: Vec<Record> = Vec::new();
+        let (mut found, mut inserted) = (0usize, 0usize);
+        let mut turn: Option<String> = None;
+        let mut offset = start;
+        let mut consumed = start;
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let n = reader.read_until(b'\n', &mut line)?;
+            if n == 0 {
+                break;
+            }
+            let line_start = offset;
+            offset += n as u64;
+            if line.last() != Some(&b'\n') {
+                // A line still being written.
+                break;
+            }
+            consumed = offset;
+            line_no += 1;
+            let Ok(r) = serde_json::from_slice::<Value>(&line) else {
+                continue;
+            };
+            let created = r
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(|t| OffsetDateTime::parse(t, &Rfc3339).ok())
+                .map_or(self.opts.now_ms, |t| {
+                    i64::try_from(t.unix_timestamp_nanos() / 1_000_000).unwrap_or(self.opts.now_ms)
+                });
+            let ty = r.get("type").and_then(Value::as_str).unwrap_or("");
+            let payload = r.get("payload");
+            let pty = payload
+                .and_then(|p| p.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let ctx = || CodexCtx {
+                session_id: meta.session_id.clone(),
+                parent_thread_id: meta.parent.clone(),
+                cwd: meta.cwd.clone(),
+                created_at_ms: created,
+                turn_id: turn.clone(),
+                file_stem: stem.clone(),
+                line: line_no,
+            };
+            let terms = &self.opts.config.capture.redact_terms;
+            let mut rec = None;
+            match (ty, pty) {
+                ("turn_context", _) | ("event_msg", "task_started") => {
+                    if let Some(id) = payload
+                        .and_then(|p| p.get("turn_id"))
+                        .and_then(Value::as_str)
+                    {
+                        turn = Some(id.to_string());
+                    }
+                }
+                ("event_msg", "user_message") if !is_sub => {
+                    if let Some(text) = payload
+                        .and_then(|p| p.get("message"))
+                        .and_then(Value::as_str)
+                        .and_then(|m| human_text(&Value::String(m.to_string())))
+                    {
+                        self.keep_prompt(created, text);
+                    }
+                }
+                ("response_item", "web_search_call") => {
+                    rec = record::from_codex_rollout_with(&r, &ctx(), terms);
+                }
+                ("response_item", "custom_tool_call") => {
+                    let call_id = payload
+                        .and_then(|p| p.get("call_id"))
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty());
+                    let is_web_run = payload
+                        .and_then(|p| p.get("input"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|i| i.contains("web__run"));
+                    if let (Some(id), true) = (call_id, is_web_run) {
+                        pending.insert(
+                            id.to_string(),
+                            CodexPending {
+                                call: r.clone(),
+                                ctx: ctx(),
+                                offset: line_start,
+                            },
+                        );
+                    }
+                }
+                ("response_item", "custom_tool_call_output") => {
+                    let pending_call = payload
+                        .and_then(|p| p.get("call_id"))
+                        .and_then(Value::as_str)
+                        .and_then(|id| pending.remove(id));
+                    if let Some(p) = pending_call {
+                        rec = record::from_codex_rollout_pair(&p.call, &r, &p.ctx, terms);
+                        if let Some(rec) = &rec {
+                            self.web_run_ids.insert(rec.tool_use_id.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if let Some(rec) = rec {
+                if self
+                    .opts
+                    .only_ids
+                    .as_ref()
+                    .is_some_and(|s| !s.contains(&rec.tool_use_id))
+                {
+                    continue;
+                }
+                found += 1;
+                self.summary.records_found += 1;
+                batch.push(rec);
+            }
             if batch.len() >= BATCH {
                 inserted += self.flush(&mut batch, source_id)?;
             }
@@ -541,6 +777,10 @@ impl Run<'_> {
                 }
                 None => {}
             }
+            if self.web_run_ids.contains(&rec.tool_use_id) && hook_copy_exists(&tx, &rec)? {
+                self.summary.skipped_duplicate += 1;
+                continue;
+            }
             quarantine(&mut rec);
             if !insert(&tx, &rec, source_id)? {
                 self.summary.skipped_duplicate += 1;
@@ -555,11 +795,75 @@ impl Run<'_> {
             if rec.agent_id.is_some() {
                 self.summary.subagent_records += 1;
             }
+            if rec.agent == Agent::Codex {
+                self.summary.codex_records += 1;
+            }
             self.summary.redactions += redaction_markers(&rec);
         }
         tx.commit()?;
+        self.web_run_ids.clear();
         Ok(inserted)
     }
+}
+
+/// First line of a rollout: `session_meta`. A file without one falls back to the file stem.
+fn codex_meta(path: &Path, stem: &str) -> anyhow::Result<CodexMeta> {
+    let mut first = String::new();
+    BufReader::new(std::fs::File::open(path)?).read_line(&mut first)?;
+    let v: Value = serde_json::from_str(first.trim_end()).unwrap_or(Value::Null);
+    let p = v
+        .get("payload")
+        .filter(|_| v.get("type").and_then(Value::as_str) == Some("session_meta"));
+    let text = |key: &str| {
+        p.and_then(|p| p.get(key))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    Ok(CodexMeta {
+        session_id: text("id")
+            .or_else(|| text("session_id"))
+            .unwrap_or_else(|| stem.to_string()),
+        parent: text("parent_thread_id"),
+        cwd: text("cwd").unwrap_or_default(),
+    })
+}
+
+/// Number of `\n` in the first `len` bytes of the file.
+fn count_newlines(path: &Path, len: u64) -> anyhow::Result<usize> {
+    let mut reader = BufReader::new(std::fs::File::open(path)?.take(len));
+    let mut n = 0;
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            return Ok(n);
+        }
+        n += buf.iter().filter(|b| **b == b'\n').count();
+        let l = buf.len();
+        reader.consume(l);
+    }
+}
+
+/// A Codex hook already stored this search: same session, query and agent, within two minutes.
+fn hook_copy_exists(tx: &Connection, rec: &Record) -> anyhow::Result<bool> {
+    let Some(query) = &rec.query else {
+        return Ok(false);
+    };
+    Ok(tx
+        .query_row(
+            "SELECT 1 FROM event WHERE session_id = ?1 AND query = ?2 AND agent = 'codex' \
+             AND tool_use_id != ?3 AND ABS(created_at - ?4) < ?5 LIMIT 1",
+            params![
+                rec.session_id,
+                query,
+                rec.tool_use_id,
+                rec.created_at,
+                HOOK_DUP_WINDOW_MS
+            ],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 struct ScanOutcome {
@@ -730,14 +1034,22 @@ pub fn summary_line(s: &ImportSummary, new: bool) -> String {
     } else {
         100.0 * s.subagent_records as f64 / s.records_inserted as f64
     };
+    let from = if s.codex_files > 0 {
+        format!(
+            "{} Claude Code files and {} Codex rollouts",
+            s.files_total, s.codex_files
+        )
+    } else {
+        format!("{} files", s.files_total)
+    };
     format!(
-        "Imported {}{} records ({} searches, {} fetches; {:.1}% from subagents) from {} files in {:.1} s.",
+        "Imported {}{} records ({} searches, {} fetches; {:.1}% from subagents) from {} in {:.1} s.",
         s.records_inserted,
         if new { " new" } else { "" },
         s.searches,
         s.fetches,
         p,
-        s.files_total,
+        from,
         s.secs
     )
 }
@@ -757,6 +1069,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             Some(p) => p,
             None => default_projects_dir()?,
         },
+        codex_dir: resolve_codex_dir(args.codex_dir, args.no_codex),
         data_dir,
         config,
         only_ids: args.only_ids.as_deref().map(read_only_ids).transpose()?,
