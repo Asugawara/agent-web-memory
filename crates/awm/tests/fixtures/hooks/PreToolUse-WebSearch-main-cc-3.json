@@ -1,0 +1,16 @@
+{
+  "session_id": "00000000-0000-4000-a000-000000000005",
+  "transcript_path": "/home/user/.claude/projects/-home-user-dev-agent-web-memory-spikes-query-deny-cc-variant/00000000-0000-4000-a000-000000000005.jsonl",
+  "cwd": "/home/user/dev/agent-web-memory/spikes/query-deny/cc-variant",
+  "prompt_id": "00000000-0000-4000-a000-000000000016",
+  "permission_mode": "dontAsk",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "WebSearch",
+  "tool_input": {
+    "query": "SQLite current latest version release date",
+    "allowed_domains": [
+      "sqlite.org"
+    ]
+  },
+  "tool_use_id": "toolu_fixture000000000004"
+}

@@ -58,6 +58,10 @@ pub struct ShortCircuit {
     #[serde(deserialize_with = "de_u32")]
     pub window_minutes: u32,
     pub subagents: bool,
+    /// The PreToolUse deny on repeated web searches (QD1 §5.3); separate from `mode` (URLs).
+    pub query: ShortCircuitMode,
+    #[serde(deserialize_with = "de_u32")]
+    pub query_window_minutes: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,6 +159,8 @@ impl Default for ShortCircuit {
             mode: ShortCircuitMode::Shadow,
             window_minutes: 30,
             subagents: false,
+            query: ShortCircuitMode::Shadow,
+            query_window_minutes: 1440,
         }
     }
 }
@@ -220,6 +226,7 @@ fn de_price<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
 fn range(key: &str) -> Option<(u32, u32)> {
     Some(match key {
         "short_circuit.window_minutes" => (1, 1440),
+        "short_circuit.query_window_minutes" => (1, 10080),
         "inject.max_notes" => (1, 3),
         "inject.max_per_agent" => (0, 100),
         "hooks.deadline_ms" => (100, 2000),
@@ -246,6 +253,11 @@ impl Config {
         clamp(
             "short_circuit.window_minutes",
             &mut self.short_circuit.window_minutes,
+            &mut w,
+        );
+        clamp(
+            "short_circuit.query_window_minutes",
+            &mut self.short_circuit.query_window_minutes,
             &mut w,
         );
         clamp("inject.max_notes", &mut self.inject.max_notes, &mut w);
@@ -280,6 +292,10 @@ impl Config {
             "short_circuit.mode" => self.short_circuit.mode.as_str().to_string(),
             "short_circuit.window_minutes" => self.short_circuit.window_minutes.to_string(),
             "short_circuit.subagents" => self.short_circuit.subagents.to_string(),
+            "short_circuit.query" => self.short_circuit.query.as_str().to_string(),
+            "short_circuit.query_window_minutes" => {
+                self.short_circuit.query_window_minutes.to_string()
+            }
             "inject.max_notes" => self.inject.max_notes.to_string(),
             "inject.max_per_agent" => self.inject.max_per_agent.to_string(),
             "hooks.deadline_ms" => self.hooks.deadline_ms.to_string(),
@@ -362,6 +378,17 @@ impl Config {
                 self.short_circuit.window_minutes = number(key, value)?
             }
             "short_circuit.subagents" => self.short_circuit.subagents = flag(key, value)?,
+            "short_circuit.query" => {
+                self.short_circuit.query = pick(
+                    key,
+                    value,
+                    ShortCircuitMode::parse(value),
+                    "off, shadow, on",
+                )?
+            }
+            "short_circuit.query_window_minutes" => {
+                self.short_circuit.query_window_minutes = number(key, value)?
+            }
             "inject.max_notes" => self.inject.max_notes = number(key, value)?,
             "inject.max_per_agent" => self.inject.max_per_agent = number(key, value)?,
             "hooks.deadline_ms" => self.hooks.deadline_ms = number(key, value)?,

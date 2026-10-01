@@ -25,3 +25,28 @@ injections:
   would_have_shown: 1
   would_have_shown_by_channel:
     query: 1
+query_deny:
+  by_age:
+    within_24_h: 0
+    within_30_min: 0
+  by_agent_kind:
+    main: 0
+    subagent: 0
+  by_relation:
+    other_coding_agent: 0
+    other_project: 0
+    other_session_project_unknown: 0
+    other_session_same_project: 0
+    sibling: 0
+  denied: 0
+  labels:
+    0: 0
+    1: 0
+    2: 0
+    h: 0
+  per_100_searches: 0.00
+  research_after_deny:
+    denies: 0
+    researched: 0
+    share: -
+  shadow: 0

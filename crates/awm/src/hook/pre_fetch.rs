@@ -1,10 +1,11 @@
-//! PreToolUse WebFetch: optional short-circuit (plan-v2 §4.6).
+//! PreToolUse entry point (`awm hook pre-fetch`), dispatching on `tool_name`.
 //!
-//! `short_circuit.mode = "shadow"` logs a `shadow_deny` row; `"on"` denies. A deny
-//! needs a sibling fetch: another agent of the same session, same `url_norm`,
-//! status ok, code 200, within `window_minutes`. The caller's own fetch never counts.
+//! `WebFetch`: optional short-circuit (plan-v2 §4.6). `short_circuit.mode = "shadow"` logs a
+//! `shadow_deny` row; `"on"` denies. A deny needs a sibling fetch: another agent of the same
+//! session, same `url_norm`, status ok, code 200, within `window_minutes`. The caller's own
+//! fetch never counts.
 //!
-//! Codex `webrun` has no URL (a search only), so it returns silently here.
+//! `WebSearch` (Claude Code) and `webrun` (Codex) go to [`super::pre_search`].
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -31,10 +32,18 @@ fn effective_mode(env: &Env) -> ShortCircuitMode {
 }
 
 fn handle(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
+    match env.input.tool_name.as_str() {
+        "WebFetch" => handle_fetch(env, conn),
+        "WebSearch" | "webrun" => super::pre_search::handle(env, conn),
+        _ => Ok(Verdict::quiet("no_match")),
+    }
+}
+
+fn handle_fetch(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
     let input = &env.input;
     let forced = std::env::var("AWM_CANARY_DENY").is_ok_and(|v| v == "1");
     let mode = effective_mode(env);
-    if input.tool_name != "WebFetch" || (mode == ShortCircuitMode::Off && !forced) {
+    if mode == ShortCircuitMode::Off && !forced {
         return Ok(Verdict::quiet("no_match"));
     }
     // The stored `url_norm` comes from the redacted URL; look up the same form.

@@ -1,0 +1,19 @@
+{
+  "session_id": "01a00000-0000-7000-a000-000000000003",
+  "turn_id": "01a00000-0000-7000-a000-000000000004",
+  "transcript_path": "/home/user/.codex/sessions/2026/10/02/rollout-2026-10-02T07-37-11-01a00000-0000-7000-a000-000000000003.jsonl",
+  "cwd": "/home/user/dev/agent-web-memory/spikes/query-deny/codex-project",
+  "hook_event_name": "PreToolUse",
+  "model": "gpt-5.6-sol",
+  "permission_mode": "default",
+  "tool_name": "webrun",
+  "tool_input": {
+    "search_query": [
+      {
+        "q": "SQLite FTS5 bm25 column weights"
+      }
+    ],
+    "response_length": "short"
+  },
+  "tool_use_id": "exec-00000000-0000-4000-a000-000000000032"
+}

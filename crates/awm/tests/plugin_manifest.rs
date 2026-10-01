@@ -62,8 +62,8 @@ fn test_plugin_manifest() {
 
     let pre_tool_use = &hooks["PreToolUse"][0];
     assert_eq!(
-        pre_tool_use["matcher"], "WebFetch",
-        "PreToolUse matcher should be 'WebFetch'"
+        pre_tool_use["matcher"], "WebFetch|WebSearch",
+        "PreToolUse matcher should be 'WebFetch|WebSearch'"
     );
 
     let post_tool_use = &hooks["PostToolUse"][0];

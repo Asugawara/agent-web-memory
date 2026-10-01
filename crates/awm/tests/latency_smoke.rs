@@ -93,3 +93,86 @@ fn query_channel_p95_is_within_50_ms_at_3000_records() {
     );
     assert!(p95 <= 50.0, "p95 {p95:.2} ms exceeds 50 ms");
 }
+
+#[test]
+#[ignore]
+fn search_repeat_lookup_p95_is_within_50_ms_at_3000_searches_in_24_h() {
+    use awm::config::Config;
+    use awm::hook::{pre_search, Env, HookInput};
+    use awm::normalize::token_set;
+
+    const SEARCHES: usize = 3_000;
+    const DAY_MS: i64 = 86_400_000;
+    let dir = tempfile::tempdir().unwrap();
+    let mut conn = db::open(&dir.path().join("awm.db"), Role::Cli).unwrap();
+    db::migrate(&mut conn).unwrap();
+    let now = 1_790_000_000_000_i64;
+    let mut rng = Lcg(7);
+    let mut queries = Vec::new();
+    let tx = conn.transaction().unwrap();
+    {
+        let mut st = tx
+            .prepare(
+                "INSERT INTO event (tool_use_id, tool, session_id, cwd_hash, created_at, query, \
+                 status, summary, match_text, source) \
+                 VALUES (?1, 'WebSearch', ?2, 'cwd', ?3, ?4, 'ok', ?5, ?6, 'hook')",
+            )
+            .unwrap();
+        for i in 0..SEARCHES {
+            let query = rng.words(6).join(" ");
+            let summary = rng.words(60).join(" ");
+            st.execute(rusqlite::params![
+                format!("syn{i}"),
+                format!("s{}", i % 40),
+                // All inside one 24 h window, spread evenly.
+                now - 1_000 - (i as i64) * (DAY_MS - 2_000) / SEARCHES as i64,
+                query,
+                summary,
+                query
+            ])
+            .unwrap();
+            queries.push(query);
+        }
+    }
+    tx.commit().unwrap();
+
+    let env = Env {
+        hook: "pre-fetch",
+        input: HookInput {
+            session_id: "s-caller".to_string(),
+            tool_name: "WebSearch".to_string(),
+            ..HookInput::default()
+        },
+        config: Config::default(),
+        started: Instant::now(),
+        started_at_ms: now,
+        utc_offset_min: 0,
+    };
+    // Mostly misses (the 2,000 newest rows are scanned), some hits among those rows.
+    let mut keys: Vec<Vec<String>> = (0..QUERIES)
+        .map(|_| token_set(&rng.words(6).join(" ")))
+        .collect();
+    for k in keys.iter_mut().step_by(5) {
+        *k = token_set(&queries[(rng.next() as usize) % 2_000]);
+    }
+    pre_search::find_repeat(&env, &conn, &keys[0], DAY_MS).unwrap();
+    let mut ms: Vec<f64> = Vec::new();
+    let mut found = 0;
+    for key in &keys {
+        let t = Instant::now();
+        found += usize::from(
+            pre_search::find_repeat(&env, &conn, key, DAY_MS)
+                .unwrap()
+                .is_some(),
+        );
+        ms.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    ms.sort_by(f64::total_cmp);
+    let p50 = ms[QUERIES / 2];
+    let p95 = ms[QUERIES * 95 / 100];
+    println!(
+        "find_repeat over {SEARCHES} searches in 24 h, {QUERIES} lookups ({found} hits): p50 {p50:.2} ms, p95 {p95:.2} ms"
+    );
+    assert!(found >= QUERIES / 5 - 1, "hits {found}");
+    assert!(p95 <= 50.0, "p95 {p95:.2} ms exceeds 50 ms");
+}

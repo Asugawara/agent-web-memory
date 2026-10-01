@@ -88,3 +88,12 @@ pub fn words(s: &str) -> Vec<String> {
 pub fn norm_query(s: &str) -> String {
     words(s).join(" ")
 }
+
+/// The [`words`] of `s`, de-duplicated and sorted: case, order, punctuation and repetition do not matter.
+/// Two queries with the same token set ask for the same search (QD1 §1.1, key N2).
+pub fn token_set(s: &str) -> Vec<String> {
+    let mut w = words(s);
+    w.sort();
+    w.dedup();
+    w
+}

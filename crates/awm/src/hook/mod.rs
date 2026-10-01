@@ -4,6 +4,7 @@
 pub mod capture;
 pub mod post_tool;
 pub mod pre_fetch;
+pub mod pre_search;
 pub mod prompt;
 pub mod session_start;
 
