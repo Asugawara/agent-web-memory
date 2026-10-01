@@ -1,0 +1,3 @@
+status:
+  dead_end: 1
+  ok: 3

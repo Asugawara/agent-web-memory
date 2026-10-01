@@ -1,0 +1,7 @@
+import:
+  files:
+    ok: 1
+    partial: 1
+  records_found: 7
+  records_inserted: 4
+  records_not_inserted: 3
