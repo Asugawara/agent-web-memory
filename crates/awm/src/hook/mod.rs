@@ -57,6 +57,11 @@ pub struct HookInput {
     pub tool_use_id: Option<String>,
     pub transcript_path: Option<String>,
     pub prompt: Option<String>,
+    /// Codex keys (ignored by the handlers; listed so the payload shape is documented).
+    pub turn_id: Option<String>,
+    pub model: Option<String>,
+    pub permission_mode: Option<String>,
+    pub stop_hook_active: Option<bool>,
 }
 
 impl HookInput {

@@ -2,15 +2,19 @@
 
 Contract test fixtures derived from cc-hooks hook event recordings. Each fixture captures a real hook payload from the Claude Code plugin/settings logging system.
 
-| File | Hook Event | Tool | Path | Run # | Subagent |
-|------|-----------|------|------|-------|----------|
-| `PostToolUse-WebSearch-plugin-2.json` | PostToolUse | WebSearch | plugin | 2 | — |
-| `PostToolUse-WebSearch-settings-6.json` | PostToolUse | WebSearch | settings | 6 | — |
-| `PostToolUse-WebSearch-plugin-8.json` | PostToolUse | WebSearch | plugin | 8 | ✓ |
-| `PostToolUse-WebFetch-plugin-3.json` | PostToolUse | WebFetch | plugin | 3 | — |
-| `PreToolUse-WebFetch-plugin-4.json` | PreToolUse | WebFetch | plugin | 4 | — |
-| `UserPromptSubmit-none-plugin-1.json` | UserPromptSubmit | N/A | plugin | 1 | — |
-| `UserPromptSubmit-none-plugin-8.json` | UserPromptSubmit | N/A | plugin | 8 | no (main session, `<task-notification>` turn after a subagent finished) |
+| File | Agent | Hook Event | Tool | Path | Run # | Subagent |
+|------|-------|-----------|------|------|-------|----------|
+| `PostToolUse-WebSearch-plugin-2.json` | claude-code | PostToolUse | WebSearch | plugin | 2 | — |
+| `PostToolUse-WebSearch-settings-6.json` | claude-code | PostToolUse | WebSearch | settings | 6 | — |
+| `PostToolUse-WebSearch-plugin-8.json` | claude-code | PostToolUse | WebSearch | plugin | 8 | ✓ |
+| `PostToolUse-WebFetch-plugin-3.json` | claude-code | PostToolUse | WebFetch | plugin | 3 | — |
+| `PreToolUse-WebFetch-plugin-4.json` | claude-code | PreToolUse | WebFetch | plugin | 4 | — |
+| `UserPromptSubmit-none-plugin-1.json` | claude-code | UserPromptSubmit | N/A | plugin | 1 | — |
+| `UserPromptSubmit-none-plugin-8.json` | claude-code | UserPromptSubmit | N/A | plugin | 8 | no (main session, `<task-notification>` turn after a subagent finished) |
+| `codex-PreToolUse-webrun-search-1.json` | codex | PreToolUse | webrun | hook | 1 | — |
+| `codex-PostToolUse-webrun-search-1.json` | codex | PostToolUse | webrun | hook | 1 | — |
+| `codex-Stop-none-search-1.json` | codex | Stop | N/A | hook | 1 | — |
+| `codex-SessionStart-none-search-1.json` | codex | SessionStart | N/A | hook | 1 | — |
 
 ## Notes
 
@@ -18,3 +22,4 @@ Contract test fixtures derived from cc-hooks hook event recordings. Each fixture
 - **Run #**: number from the source cc-hooks run ID (file suffix).
 - **Subagent**: ✓ indicates fixture contains subagent metadata (agent_id, agent_type for PostToolUse; task-notification turn marker for UserPromptSubmit).
 - **Data Anonymization**: All absolute paths have been normalized to `/home/user/` prefix; non-ASCII text has been replaced with `(redacted)` for test stability.
+- **Codex**: `codex-*` fixtures come from the CX1 spike (Codex CLI 0.159.3). Result URLs in `tool_response` are replaced by `https://example.com/rN` / `https://example.org/rN` (text structure kept); Codex payloads carry no subagent field.

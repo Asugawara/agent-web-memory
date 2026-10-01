@@ -3,6 +3,8 @@
 //! `short_circuit.mode = "shadow"` logs a `shadow_deny` row; `"on"` denies. A deny
 //! needs a sibling fetch: another agent of the same session, same `url_norm`,
 //! status ok, code 200, within `window_minutes`. The caller's own fetch never counts.
+//!
+//! Codex `webrun` has no URL (a search only), so it returns silently here.
 
 use rusqlite::{params, Connection, OptionalExtension};
 
