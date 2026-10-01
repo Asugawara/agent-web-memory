@@ -646,7 +646,20 @@ fn minutes(ms: f64) -> String {
 }
 
 fn kilo(tokens: f64) -> String {
-    format!("{:.1}k", tokens / 1000.0)
+    if tokens >= 1_000_000.0 {
+        format!("{:.1}M", tokens / 1_000_000.0)
+    } else {
+        format!("{:.1}k", tokens / 1000.0)
+    }
+}
+
+/// The summariser column: an upper bound, `0k` when nothing was read.
+fn upper_bound(tokens: f64) -> String {
+    if tokens == 0.0 {
+        "<= 0k".into()
+    } else {
+        format!("<= {}", kilo(tokens))
+    }
 }
 
 /// Decimal KB or MB with one decimal.
@@ -658,68 +671,155 @@ fn size(bytes: f64) -> String {
     }
 }
 
+/// `text` wrapped at `width` columns, every line indented by two spaces.
+fn wrap(text: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut line = String::from("  ");
+    for word in text.split_whitespace() {
+        if line.len() > 2 && line.len() + 1 + word.len() > width {
+            out.push_str(&line);
+            out.push('\n');
+            line = String::from("  ");
+        }
+        if line.len() > 2 {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    out.push_str(&line);
+    out.push('\n');
+    out
+}
+
 fn savings_text(v: &Value) -> String {
-    let since = v["since"].as_str().map(|d| format!(" since {d}"));
-    let mut o = String::from("savings (an estimate of what did not happen, not a measurement):\n");
-    o.push_str(&format!(
-        "  shown: injections with mode inject or deny{}\n",
-        since.unwrap_or_default()
-    ));
-    o.push_str(
-        "  avoided: shown, and no item was called again by the same session and agent afterwards\n",
+    let int = |k: &str| v[k].as_i64().unwrap_or(0);
+    let row = |label: &str, items: f64, base: &[&str], bytes: Option<(f64, f64)>| {
+        let mut r = vec![label.to_string(), (items as i64).to_string()];
+        r.extend(base.iter().map(|s| s.to_string()));
+        match bytes {
+            Some((b, t)) => {
+                r.push(size(b));
+                r.push(upper_bound(t));
+            }
+            None => r.extend(["-".to_string(), "-".to_string()]),
+        }
+        r
+    };
+    let fetches = ["ceiling", "repeat_fetches"];
+    let searches = ["ceiling", "repeat_searches"];
+    let cells = |path: &[&str], key_bytes: &str, key_tokens: &str, time: &str, tokens: &str| {
+        let at = |k: &str| {
+            let mut p = path.to_vec();
+            p.push(k);
+            num(v, &p)
+        };
+        (
+            minutes(at(time)),
+            kilo(at(tokens)),
+            at(key_bytes),
+            at(key_tokens),
+        )
+    };
+    let avoided = cells(
+        &[],
+        "est_bytes_not_fetched",
+        "est_summariser_tokens",
+        "time_saved_ms",
+        "tokens_saved",
     );
-    o.push_str("  followed up: shown, and the agent called an item anyway\n");
-    o.push_str("  time saved: per avoided item, median duration of past ok calls of the same url or normalised query (fallback: all ok calls of that tool)\n");
-    o.push_str("  tokens saved: the same median of summary length, chars / 4; overhead: rendered chars / 4 of all shown\n");
-    o.push_str("  page bytes not fetched: per avoided fetch, median bytes of past ok fetches of the same url (fallback: all ok fetches); summariser tokens = bytes / 4, an upper bound (HTML, read by the fetch summariser, not by the main model)\n");
-    o.push_str("  confirmed: avoided items you labelled 2 in awm review\n");
-    if v["shown"].as_i64() == Some(0) {
-        o.push_str("No notes shown yet.\n");
+    let confirmed = cells(
+        &["confirmed"],
+        "est_bytes_not_fetched",
+        "est_summariser_tokens",
+        "time_saved_ms",
+        "tokens_saved",
+    );
+    let rf = cells(
+        &fetches,
+        "bytes",
+        "summariser_tokens",
+        "duration_ms",
+        "tokens",
+    );
+    let rs = cells(
+        &searches,
+        "bytes",
+        "summariser_tokens",
+        "duration_ms",
+        "tokens",
+    );
+    let rows = vec![
+        row(
+            "avoided (est.)",
+            int("avoided") as f64,
+            &[&avoided.0, &avoided.1],
+            Some((avoided.2, avoided.3)),
+        ),
+        row(
+            "confirmed (label 2)",
+            num(v, &["confirmed", "items"]),
+            &[&confirmed.0, &confirmed.1],
+            Some((confirmed.2, confirmed.3)),
+        ),
+        row(
+            "ceiling: repeat fetches",
+            num(v, &["ceiling", "repeat_fetches", "count"]),
+            &[&rf.0, &rf.1],
+            Some((rf.2, rf.3)),
+        ),
+        row(
+            "ceiling: repeat searches",
+            num(v, &["ceiling", "repeat_searches", "count"]),
+            &[&rs.0, &rs.1],
+            None,
+        ),
+    ];
+    let head = ["", "items", "time", "tokens", "page bytes", "summariser"];
+    let widths: Vec<usize> = (0..head.len())
+        .map(|c| {
+            rows.iter()
+                .map(|r| r[c].len())
+                .chain([head[c].len()])
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let line = |r: &[String]| {
+        let mut o = format!("  {:<w$}", r[0], w = widths[0]);
+        for c in 1..r.len() {
+            o.push_str(&format!("  {:>w$}", r[c], w = widths[c]));
+        }
+        o.push('\n');
+        o
+    };
+    let mut o = String::from("savings: an estimate of what did not happen, not a measurement\n\n");
+    o.push_str(&line(&head.map(String::from)));
+    for r in &rows {
+        o.push_str(&line(r));
+    }
+    o.push('\n');
+    if int("shown") == 0 {
+        o.push_str("  No notes shown yet.\n");
     } else {
-        let int = |k: &str| v[k].as_i64().unwrap_or(0);
-        o.push_str(&format!("  shown:            {}\n", int("shown")));
-        o.push_str(&format!("  avoided:          {}\n", int("avoided")));
-        o.push_str(&format!("  followed up:      {}\n", int("followed_up")));
         o.push_str(&format!(
-            "  est. time saved:  {}\n",
-            minutes(num(v, &["time_saved_ms"]))
-        ));
-        o.push_str(&format!(
-            "  est. tokens saved: {}\n",
-            kilo(num(v, &["tokens_saved"]))
-        ));
-        o.push_str(&format!(
-            "  overhead tokens:  {}\n",
-            kilo(num(v, &["overhead_tokens"]))
-        ));
-        o.push_str(&format!(
-            "  net tokens:       {}\n",
+            "  shown {} = avoided {} + followed up {}; note overhead {} tokens, net {}\n",
+            int("shown"),
+            int("avoided"),
+            int("followed_up"),
+            kilo(num(v, &["overhead_tokens"])),
             kilo(num(v, &["net_tokens"]))
         ));
-        o.push_str(&format!(
-            "  est. page bytes not fetched: {} (summariser tokens <= {})\n",
-            size(num(v, &["est_bytes_not_fetched"])),
-            kilo(num(v, &["est_summariser_tokens"]))
-        ));
-        o.push_str(&format!(
-            "  confirmed:        {} items, {}, {} tokens, {} page bytes\n",
-            num(v, &["confirmed", "items"]) as i64,
-            minutes(num(v, &["confirmed", "time_saved_ms"])),
-            kilo(num(v, &["confirmed", "tokens_saved"])),
-            size(num(v, &["confirmed", "est_bytes_not_fetched"]))
-        ));
     }
-    for (label, k) in [
-        ("repeat fetches", "repeat_fetches"),
-        ("repeat searches", "repeat_searches"),
-    ] {
-        o.push_str(&format!(
-            "  ceiling, {label}: {} ({}, {} tokens, {} page bytes; whole record, ignores --since)\n",
-            num(v, &["ceiling", k, "count"]) as i64,
-            minutes(num(v, &["ceiling", k, "duration_ms"])),
-            kilo(num(v, &["ceiling", k, "tokens"])),
-            size(num(v, &["ceiling", k, "bytes"]))
-        ));
+    if let Some(d) = v["since"].as_str() {
+        o.push_str(&format!("  since {d} (ceilings use the whole record)\n"));
     }
+    o.push('\n');
+    o.push_str(&wrap(
+        "tokens: main-model context, summary chars / 4. page bytes: what the fetch summariser read; \
+         summariser tokens <= bytes / 4 (upper bound). per avoided item: median of past ok calls of \
+         the same url or normalised query (fallback: all ok calls of that tool). confirmed: avoided \
+         items you labelled 2 in awm review.",
+        100,
+    ));
     o
 }

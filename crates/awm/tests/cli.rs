@@ -981,22 +981,29 @@ fn stats_savings_matches_hand_computed_numbers() {
     // bytes and is ignored), so 8.0 KB and 8000 / 4 = 2000 summariser tokens; the same for the
     // confirmed item. Repeat fetches: 8000 + 20000 + 0 (event 4) = 28000 bytes, 7000 tokens.
     let text = env.awm(&["stats", "--savings"]).ok().to_string();
-    for want in [
-        "  shown:            2\n",
-        "  avoided:          1\n",
-        "  followed up:      1\n",
-        "  est. time saved:  0.1 min\n",
-        "  est. tokens saved: 0.2k\n",
-        "  overhead tokens:  0.3k\n",
-        "  net tokens:       -0.1k\n",
-        "  est. page bytes not fetched: 8.0 KB (summariser tokens <= 2.0k)\n",
-        "  confirmed:        1 items, 0.1 min, 0.2k tokens, 8.0 KB page bytes\n",
-        "  ceiling, repeat fetches: 3 (0.5 min, 0.5k tokens, 28.0 KB page bytes;",
-        "  ceiling, repeat searches: 0 (0.0 min, 0.0k tokens, 0.0 KB page bytes;",
-        "  page bytes not fetched: per avoided fetch, median bytes of past ok fetches",
-    ] {
-        assert!(text.contains(want), "missing {want:?} in:\n{text}");
-    }
+    let want = "\
+savings: an estimate of what did not happen, not a measurement
+
+                            items     time  tokens  page bytes  summariser
+  avoided (est.)                1  0.1 min    0.2k      8.0 KB     <= 2.0k
+  confirmed (label 2)           1  0.1 min    0.2k      8.0 KB     <= 2.0k
+  ceiling: repeat fetches       3  0.5 min    0.5k     28.0 KB     <= 7.0k
+  ceiling: repeat searches      0  0.0 min    0.0k           -           -
+
+  shown 2 = avoided 1 + followed up 1; note overhead 0.3k tokens, net -0.1k
+
+";
+    assert!(text.starts_with(want), "got:\n{text}");
+    let note = text.strip_prefix(want).unwrap();
+    assert!(
+        note.starts_with("  tokens: main-model context, summary chars / 4. page bytes:"),
+        "{note}"
+    );
+    assert!(
+        note.lines().all(|l| l.len() <= 100 && l.starts_with("  ")),
+        "{note}"
+    );
+    assert!(!text.contains("since"), "{text}");
     let v: Value = serde_json::from_str(env.awm(&["stats", "--savings", "--json"]).ok()).unwrap();
     let s = &v["savings"];
     assert_eq!(s["shown"], 2);
@@ -1071,8 +1078,17 @@ fn stats_savings_since_limits_the_injections_but_not_the_ceiling() {
         .awm(&["stats", "--savings", "--since", &late])
         .ok()
         .to_string();
-    assert!(text.contains("No notes shown yet."), "{text}");
-    assert!(text.contains("ceiling, repeat fetches: 3"), "{text}");
+    assert!(text.contains("  No notes shown yet.\n"), "{text}");
+    assert!(
+        text.contains(&format!("  since {late} (ceilings use the whole record)\n")),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "  ceiling: repeat fetches       3  0.5 min    0.5k     28.0 KB     <= 7.0k\n"
+        ),
+        "{text}"
+    );
     let early = day(BASE);
     let v: Value = serde_json::from_str(
         env.awm(&["stats", "--savings", "--since", &early, "--json"])
@@ -1091,6 +1107,40 @@ fn stats_savings_on_an_empty_database() {
     let env = Env::new();
     let text = env.awm(&["stats", "--savings"]).ok().to_string();
     assert!(text.contains("No notes shown yet."), "{text}");
-    assert!(text.contains("ceiling, repeat fetches: 0"), "{text}");
-    assert!(text.contains("ceiling, repeat searches: 0"), "{text}");
+    assert!(
+        text.contains(
+            "  ceiling: repeat fetches       0  0.0 min    0.0k      0.0 KB       <= 0k\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "  ceiling: repeat searches      0  0.0 min    0.0k           -           -\n"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("since"), "{text}");
+}
+
+#[test]
+fn stats_savings_text_uses_m_for_a_million_tokens_or_more() {
+    let env = Env::new();
+    let conn = env.conn();
+    for (id, bytes) in [(1, 4_000), (2, 8_000_000)] {
+        let mut e = ev(id, "WebFetch", "s0", BASE + id * 1_000);
+        e.url = Some("https://example.org/big");
+        insert(&conn, &e);
+        conn.execute(
+            "UPDATE event SET bytes = ?1 WHERE id = ?2",
+            params![bytes, id],
+        )
+        .unwrap();
+    }
+    let text = env.awm(&["stats", "--savings"]).ok().to_string();
+    assert!(
+        text.contains(
+            "  ceiling: repeat fetches       1  0.0 min    0.0k      8.0 MB     <= 2.0M\n"
+        ),
+        "{text}"
+    );
 }
