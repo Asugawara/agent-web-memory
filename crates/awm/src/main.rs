@@ -96,7 +96,7 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Config(a) => cli::config_cmd::run(a),
         Command::Export(a) => cli::export::run(a),
         Command::Reindex(a) => cli::reindex::run(a),
-        Command::Calibrate(a) => matching::calibrate::run(a),
+        Command::Calibrate(a) => matching::calibrate::run_cli(a),
         Command::Setup(a) => cli::setup::run(a),
         Command::Uninstall(a) => cli::uninstall::run(a),
         Command::Hook(h) => match h {
