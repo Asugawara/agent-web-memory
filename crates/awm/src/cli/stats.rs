@@ -1,6 +1,6 @@
 //! `awm stats`: the §8.2 metrics.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rusqlite::Connection;
 use serde_json::{json, Map, Value};
@@ -24,6 +24,12 @@ pub struct Args {
     /// Injections followed by a web call to the same URL
     #[arg(long)]
     pub followups: bool,
+    /// Estimated time and tokens saved by the notes shown (a counterfactual estimate)
+    #[arg(long)]
+    pub savings: bool,
+    /// With --savings: only injections created on or after this date (YYYY-MM-DD, UTC)
+    #[arg(long, value_name = "DATE")]
+    pub since: Option<String>,
     /// Print JSON
     #[arg(long)]
     pub json: bool,
@@ -36,7 +42,17 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         println!("{v}");
     } else {
         let mut out = String::new();
-        super::render_value(&v, 0, &mut out);
+        if let Value::Object(map) = &v {
+            for (k, val) in map {
+                if k == "savings" {
+                    out.push_str(&savings_text(val));
+                } else {
+                    let mut one = Map::new();
+                    one.insert(k.clone(), val.clone());
+                    super::render_value(&Value::Object(one), 0, &mut out);
+                }
+            }
+        }
         print!("{out}");
     }
     Ok(())
@@ -44,7 +60,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
 /// The selected sections as one object; the default section when no flag is given.
 pub fn collect(conn: &Connection, args: &Args) -> anyhow::Result<Value> {
-    let any = args.latency || args.import || args.status || args.value || args.followups;
+    let any =
+        args.latency || args.import || args.status || args.value || args.followups || args.savings;
     let mut out = Map::new();
     if !any {
         out.insert("injections".into(), injections(conn)?);
@@ -63,6 +80,9 @@ pub fn collect(conn: &Connection, args: &Args) -> anyhow::Result<Value> {
     }
     if args.followups {
         out.insert("followups".into(), followups(conn)?);
+    }
+    if args.savings {
+        out.insert("savings".into(), savings(conn, args.since.as_deref())?);
     }
     Ok(Value::Object(out))
 }
@@ -331,4 +351,288 @@ fn followups(conn: &Connection) -> anyhow::Result<Value> {
         );
     }
     Ok(Value::Object(out))
+}
+
+/// id, created_at, session, agent, triggering tool_use_id, rendered_chars.
+type ShownInjection = (i64, i64, String, Option<String>, Option<String>, i64);
+
+/// One web call with the fields the savings estimate needs.
+struct Call {
+    id: i64,
+    tool_use_id: String,
+    at: i64,
+    session: String,
+    agent: Option<String>,
+    /// `u:` + url_norm for a fetch, `q:` + normalised query for a search.
+    key: Option<String>,
+    is_fetch: bool,
+    ok: bool,
+    duration_ms: Option<i64>,
+    summary_chars: i64,
+}
+
+fn load_calls(conn: &Connection) -> anyhow::Result<Vec<Call>> {
+    let mut st = conn.prepare(
+        "SELECT id, tool_use_id, created_at, session_id, agent_id, tool, url_norm, query, status, \
+                duration_ms, COALESCE(length(summary), 0) \
+         FROM event ORDER BY created_at, id",
+    )?;
+    let rows = st.query_map([], |r| {
+        let tool: String = r.get(5)?;
+        let url_norm: Option<String> = r.get(6)?;
+        let query: Option<String> = r.get(7)?;
+        let is_fetch = tool == "WebFetch";
+        let key = if is_fetch {
+            url_norm.map(|u| format!("u:{u}"))
+        } else {
+            query.map(|q| format!("q:{}", crate::normalize::norm_query(&q)))
+        };
+        Ok(Call {
+            id: r.get(0)?,
+            tool_use_id: r.get(1)?,
+            at: r.get(2)?,
+            session: r.get(3)?,
+            agent: r.get(4)?,
+            key,
+            is_fetch,
+            ok: r.get::<_, String>(8)? == "ok",
+            duration_ms: r.get(9)?,
+            summary_chars: r.get(10)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Median duration (ms) and median summary length (chars) of the ok calls in `calls`.
+fn medians<'a>(calls: impl Iterator<Item = &'a Call>) -> (Option<i64>, Option<i64>) {
+    let mut durations = Vec::new();
+    let mut chars = Vec::new();
+    for c in calls {
+        if let Some(d) = c.duration_ms {
+            durations.push(d);
+        }
+        chars.push(c.summary_chars);
+    }
+    (
+        super::percentile(&mut durations, 50.0),
+        super::percentile(&mut chars, 50.0),
+    )
+}
+
+/// Time and tokens of repeated ok calls: (count, duration ms, summary chars).
+fn repeats(calls: &[Call], fetch: bool) -> (i64, i64, i64) {
+    let mut seen = HashSet::new();
+    let (mut n, mut ms, mut chars) = (0, 0, 0);
+    for c in calls.iter().filter(|c| c.ok && c.is_fetch == fetch) {
+        let Some(key) = &c.key else { continue };
+        if !seen.insert(key.clone()) {
+            n += 1;
+            ms += c.duration_ms.unwrap_or(0);
+            chars += c.summary_chars;
+        }
+    }
+    (n, ms, chars)
+}
+
+/// Estimated savings. Counterfactual: an avoided item is a shown note whose call was not repeated
+/// by the same session and agent afterwards; its cost is the median of the same call's history.
+fn savings(conn: &Connection, since: Option<&str>) -> anyhow::Result<Value> {
+    let since_ms = since.map(super::parse_date).transpose()?;
+    let calls = load_calls(conn)?;
+    let by_id: HashMap<i64, &Call> = calls.iter().map(|c| (c.id, c)).collect();
+    let mut by_key: HashMap<&str, Vec<&Call>> = HashMap::new();
+    for c in calls.iter().filter(|c| c.ok) {
+        if let Some(k) = &c.key {
+            by_key.entry(k).or_default().push(c);
+        }
+    }
+    let mut all_calls: HashMap<&str, Vec<&Call>> = HashMap::new();
+    for c in &calls {
+        if let Some(k) = &c.key {
+            all_calls.entry(k).or_default().push(c);
+        }
+    }
+    let labelled2: HashSet<(i64, i64)> = conn
+        .prepare("SELECT injection_id, position FROM outcome WHERE label = '2'")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut st = conn.prepare(
+        "SELECT id, created_at, session_id, agent_id, tool_use_id, rendered_chars FROM injection \
+         WHERE mode IN ('inject','deny') AND created_at >= ?1 ORDER BY created_at, id",
+    )?;
+    let injections: Vec<ShownInjection> = st
+        .query_map([since_ms.unwrap_or(i64::MIN)], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut items = conn.prepare(
+        "SELECT position, event_id FROM injection_item WHERE injection_id = ?1 ORDER BY position",
+    )?;
+
+    // Per tool: median over all ok events, used when an item has no history of its own.
+    let fallback = |fetch: bool| medians(calls.iter().filter(|c| c.ok && c.is_fetch == fetch));
+    let (fb_fetch, fb_search) = (fallback(true), fallback(false));
+
+    let (mut avoided, mut followed) = (0_i64, 0_i64);
+    let (mut ms, mut chars) = (0.0_f64, 0.0_f64);
+    let (mut conf_n, mut conf_ms, mut conf_chars) = (0_i64, 0.0_f64, 0.0_f64);
+    let mut overhead = 0.0_f64;
+    for (id, at, session, agent, tool_use_id, rendered) in &injections {
+        overhead += *rendered as f64 / 4.0;
+        let rows: Vec<(i64, i64)> = items
+            .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut costs = Vec::new();
+        let mut recalled = false;
+        for (position, event_id) in rows {
+            let Some(src) = by_id.get(&event_id) else {
+                continue;
+            };
+            let Some(key) = &src.key else { continue };
+            recalled |= all_calls.get(key.as_str()).is_some_and(|v| {
+                v.iter().any(|e| {
+                    e.session == *session
+                        && e.agent == *agent
+                        && e.at > *at
+                        && tool_use_id.as_deref() != Some(e.tool_use_id.as_str())
+                })
+            });
+            let past = by_key
+                .get(key.as_str())
+                .map(|v| v.iter().copied().filter(|e| e.at <= *at))
+                .into_iter()
+                .flatten();
+            let (d, c) = match medians(past) {
+                (None, None) => {
+                    if src.is_fetch {
+                        fb_fetch
+                    } else {
+                        fb_search
+                    }
+                }
+                (d, c) => {
+                    let fb = if src.is_fetch { fb_fetch } else { fb_search };
+                    (d.or(fb.0), c.or(fb.1))
+                }
+            };
+            costs.push((
+                labelled2.contains(&(*id, position)),
+                d.unwrap_or(0) as f64,
+                c.unwrap_or(0) as f64 / 4.0,
+            ));
+        }
+        if recalled {
+            followed += 1;
+            continue;
+        }
+        avoided += 1;
+        for (two, d, t) in costs {
+            ms += d;
+            chars += t;
+            if two {
+                conf_n += 1;
+                conf_ms += d;
+                conf_chars += t;
+            }
+        }
+    }
+    let (rf_n, rf_ms, rf_chars) = repeats(&calls, true);
+    let (rs_n, rs_ms, rs_chars) = repeats(&calls, false);
+    let ceiling = |n: i64, ms: i64, chars: i64| json!({"count": n, "duration_ms": ms, "tokens": chars as f64 / 4.0});
+    Ok(json!({
+        "since": since,
+        "shown": injections.len(),
+        "avoided": avoided,
+        "followed_up": followed,
+        "time_saved_ms": ms,
+        "tokens_saved": chars,
+        "overhead_tokens": overhead,
+        "net_tokens": chars - overhead,
+        "confirmed": {"items": conf_n, "time_saved_ms": conf_ms, "tokens_saved": conf_chars},
+        "ceiling": {
+            "repeat_fetches": ceiling(rf_n, rf_ms, rf_chars),
+            "repeat_searches": ceiling(rs_n, rs_ms, rs_chars),
+        },
+    }))
+}
+
+fn num(v: &Value, path: &[&str]) -> f64 {
+    path.iter()
+        .try_fold(v, |v, k| v.get(*k))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
+}
+
+fn minutes(ms: f64) -> String {
+    format!("{:.1} min", ms / 60_000.0)
+}
+
+fn kilo(tokens: f64) -> String {
+    format!("{:.1}k", tokens / 1000.0)
+}
+
+fn savings_text(v: &Value) -> String {
+    let since = v["since"].as_str().map(|d| format!(" since {d}"));
+    let mut o = String::from("savings (an estimate of what did not happen, not a measurement):\n");
+    o.push_str(&format!(
+        "  shown: injections with mode inject or deny{}\n",
+        since.unwrap_or_default()
+    ));
+    o.push_str(
+        "  avoided: shown, and no item was called again by the same session and agent afterwards\n",
+    );
+    o.push_str("  followed up: shown, and the agent called an item anyway\n");
+    o.push_str("  time saved: per avoided item, median duration of past ok calls of the same url or normalised query (fallback: all ok calls of that tool)\n");
+    o.push_str("  tokens saved: the same median of summary length, chars / 4; overhead: rendered chars / 4 of all shown\n");
+    o.push_str("  confirmed: avoided items you labelled 2 in awm review\n");
+    if v["shown"].as_i64() == Some(0) {
+        o.push_str("No notes shown yet.\n");
+    } else {
+        let int = |k: &str| v[k].as_i64().unwrap_or(0);
+        o.push_str(&format!("  shown:            {}\n", int("shown")));
+        o.push_str(&format!("  avoided:          {}\n", int("avoided")));
+        o.push_str(&format!("  followed up:      {}\n", int("followed_up")));
+        o.push_str(&format!(
+            "  est. time saved:  {}\n",
+            minutes(num(v, &["time_saved_ms"]))
+        ));
+        o.push_str(&format!(
+            "  est. tokens saved: {}\n",
+            kilo(num(v, &["tokens_saved"]))
+        ));
+        o.push_str(&format!(
+            "  overhead tokens:  {}\n",
+            kilo(num(v, &["overhead_tokens"]))
+        ));
+        o.push_str(&format!(
+            "  net tokens:       {}\n",
+            kilo(num(v, &["net_tokens"]))
+        ));
+        o.push_str(&format!(
+            "  confirmed:        {} items, {}, {} tokens\n",
+            num(v, &["confirmed", "items"]) as i64,
+            minutes(num(v, &["confirmed", "time_saved_ms"])),
+            kilo(num(v, &["confirmed", "tokens_saved"]))
+        ));
+    }
+    for (label, k) in [
+        ("repeat fetches", "repeat_fetches"),
+        ("repeat searches", "repeat_searches"),
+    ] {
+        o.push_str(&format!(
+            "  ceiling, {label}: {} ({}, {} tokens; whole record, ignores --since)\n",
+            num(v, &["ceiling", k, "count"]) as i64,
+            minutes(num(v, &["ceiling", k, "duration_ms"])),
+            kilo(num(v, &["ceiling", k, "tokens"]))
+        ));
+    }
+    o
 }
