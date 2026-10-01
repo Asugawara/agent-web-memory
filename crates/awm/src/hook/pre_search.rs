@@ -101,7 +101,7 @@ pub fn handle(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
             && (!env.is_subagent() || env.config.short_circuit.subagents));
     let log_mode = if denies { "deny" } else { "shadow_deny" };
     let trigger = env.trigger_text(&text);
-    if already_denied(env, conn, log_mode, &trigger)?
+    if already_denied(env, conn, log_mode, &key)?
         || denies_for_agent(env, conn, log_mode)? >= MAX_PER_AGENT
     {
         return Ok(Verdict::quiet("skipped"));
@@ -207,17 +207,22 @@ pub fn find_repeat(
     Ok(None)
 }
 
-/// The same (session, agent) already has a query row of this log mode with the same token set.
+/// The same (session, agent) already has a query row of this log mode whose token set is `key`
+/// (the full redacted query, not the 200-character trigger text). The token set of a row is
+/// that of the earlier search it denied (`event.query` of its item); a row without an item
+/// (a canary deny) falls back to its trigger text.
 pub fn already_denied(
     env: &Env,
     conn: &Connection,
     mode: &str,
-    trigger: &str,
+    key: &[String],
 ) -> anyhow::Result<bool> {
-    let key = token_set(trigger);
     let mut st = conn.prepare_cached(
-        "SELECT trigger_text FROM injection WHERE hook = 'PreToolUse' AND channel = 'query' \
-         AND mode = ?1 AND session_id = ?2 AND agent_id IS ?3",
+        "SELECT COALESCE(e.query, i.trigger_text) FROM injection i \
+         LEFT JOIN injection_item ii ON ii.injection_id = i.id AND ii.position = 1 \
+         LEFT JOIN event e ON e.id = ii.event_id \
+         WHERE i.hook = 'PreToolUse' AND i.channel = 'query' \
+         AND i.mode = ?1 AND i.session_id = ?2 AND i.agent_id IS ?3",
     )?;
     let rows = st.query_map(
         params![mode, env.input.session_id, env.input.agent_id],

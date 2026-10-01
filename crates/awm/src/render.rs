@@ -227,7 +227,13 @@ pub fn deny_reason(note: &Note, ctx: &RenderCtx, who: &str) -> String {
 
 /// Reason text of a PreToolUse deny on a repeated search (QD1 §5.2), at most 800 characters.
 /// `where_` is built by the caller from fixed phrases and [`plain_label`] (`hook::pre_search::where_text`).
+/// The caller passes only a note with status ok (`hook::pre_search::find_repeat` requires it); any other
+/// note is a bug (`debug_assert!`) and gets no `found:` line instead of a dead-end or refusal text.
 pub fn deny_reason_search(note: &Note, ctx: &RenderCtx, where_: &str) -> String {
+    debug_assert!(
+        note.status == Status::Ok,
+        "deny_reason_search needs an ok note"
+    );
     let where_: String = where_
         .chars()
         .filter(|c| !c.is_control() && !matches!(c, '<' | '>'))
@@ -249,7 +255,7 @@ pub fn deny_reason_search(note: &Note, ctx: &RenderCtx, where_: &str) -> String 
     if let Some(u) = shown_url(note) {
         out.push_str(&format!("top result: {u}\n"));
     }
-    if let Some(found) = found_text(note) {
+    if let Some(found) = found_text(note).filter(|_| note.status == Status::Ok) {
         out.push_str(&format!("found: {found}\n"));
     }
     out.push_str(

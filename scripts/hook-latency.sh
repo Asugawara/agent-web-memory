@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Hook latency: replays each PostToolUse fixture 200 times through
-# `target/release/awm hook post-tool` against a seeded temporary database and
+# `target/release/awm hook post-tool`, and the PreToolUse WebSearch fixture through
+# `awm hook pre-fetch`, against a seeded temporary database and
 # prints p50 and p95 wall milliseconds. Fails when a p95 is above 100 ms.
 #
 # Seeding: `awm init --record --import --projects <dir>` when the T6 fixtures
@@ -31,7 +32,7 @@ fi
 AWM_SEED_HOME="$home" cargo test --release --locked -p agent-web-memory \
   --test hooks_e2e seed_latency_db -- --ignored --exact >/dev/null
 
-python3 - "$bin" "$runs" "$limit_ms" "$fixtures_dir"/PostToolUse-*.json <<'PY'
+python3 - "$bin" "$runs" "$limit_ms" "$fixtures_dir"/PostToolUse-*.json "$fixtures_dir"/PreToolUse-WebSearch-main-cc-1.json <<'PY'
 import json
 import os
 import subprocess
@@ -46,10 +47,10 @@ def pct(sorted_values, p):
     return sorted_values[min(len(sorted_values) - 1, int(round(p * (len(sorted_values) - 1))))]
 
 
-def call(payload):
+def call(hook, payload):
     t = time.perf_counter()
     out = subprocess.run(
-        [bin_path, "hook", "post-tool"],
+        [bin_path, "hook", hook],
         input=json.dumps(payload).encode(),
         capture_output=True,
         env=os.environ,
@@ -62,18 +63,19 @@ failed = False
 for path in files:
     with open(path) as f:
         base = json.load(f)
-    call(base)  # warm-up: page cache and the first start of a new binary
+    hook = "pre-fetch" if os.path.basename(path).startswith("PreToolUse-") else "post-tool"
+    call(hook, base)  # warm-up: page cache and the first start of a new binary
     times, injected = [], 0
     for i in range(runs):
         payload = dict(base, session_id=f"latency-{i}", tool_use_id=f"toolu_latency_{os.path.basename(path)}_{i}")
         payload.pop("agent_id", None)
-        ms, stdout = call(payload)
+        ms, stdout = call(hook, payload)
         times.append(ms)
         injected += 1 if stdout.strip() else 0
     times.sort()
     p50, p95 = pct(times, 0.50), pct(times, 0.95)
     verdict = "ok" if p95 <= limit else "TOO SLOW"
-    print(f"post-tool {os.path.basename(path)}: n={runs} injected={injected} p50={p50:.1f} ms p95={p95:.1f} ms [{verdict}]")
+    print(f"{hook} {os.path.basename(path)}: n={runs} injected={injected} p50={p50:.1f} ms p95={p95:.1f} ms [{verdict}]")
     failed = failed or p95 > limit
 
 if failed:

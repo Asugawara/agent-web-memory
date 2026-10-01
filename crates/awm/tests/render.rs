@@ -258,3 +258,24 @@ fn deny_reason_search_drops_an_unsafe_url() {
         assert!(text.contains("found: "));
     }
 }
+
+/// A non-ok note never reaches the deny reason (`find_repeat` requires status ok): a bug in
+/// debug builds, and in release builds a reason without a `found:` line.
+#[test]
+fn deny_reason_search_never_prints_found_for_a_non_ok_note() {
+    for status in [Status::DeadEnd, Status::Refusal, Status::Placeholder] {
+        let mut n = search_note();
+        n.status = status;
+        n.http_code = Some(404);
+        let ctx = ctx(Channel::Query, 3);
+        if cfg!(debug_assertions) {
+            let r = std::panic::catch_unwind(|| {
+                render::deny_reason_search(&n, &ctx, "in another project")
+            });
+            assert!(r.is_err(), "{status:?}");
+        } else {
+            let text = render::deny_reason_search(&n, &ctx, "in another project");
+            assert!(!text.contains("found:"), "{text}");
+        }
+    }
+}

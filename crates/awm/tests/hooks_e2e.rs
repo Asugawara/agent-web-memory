@@ -1072,7 +1072,8 @@ fn a_codex_webrun_matches_an_earlier_search_through_the_query_channel() {
         home.text("SELECT mode || '/' || channel || '/' || hook FROM injection"),
         "inject/query/PostToolUse"
     );
-    // Pre-fetch has no URL to look at on Codex.
+    // The earlier search is a PostToolUse record only; with `query` at its default (shadow)
+    // the pre-fetch hook prints nothing.
     let pre = home.hook(
         "pre-fetch",
         &fixture("codex-PreToolUse-webrun-search-1.json"),
@@ -1289,6 +1290,29 @@ fn with_query_on_a_repeat_is_denied_once_and_a_reordered_retry_passes() {
 }
 
 #[test]
+fn a_reordered_retry_of_a_long_query_passes() {
+    let home = Home::new();
+    on(&home);
+    let words: Vec<String> = (0..60).map(|i| format!("topic{i:02}x")).collect();
+    let long = words.join(" ");
+    assert!(long.chars().count() > 300);
+    home.seed(
+        &search_record("sess-old", None, "toolu_old", &long, "/work/other"),
+        3_600_000,
+    );
+    deny_reason(&home.hook("pre-fetch", &with_query(main_search("toolu_1"), &long)));
+    let reversed: Vec<&str> = words.iter().rev().map(String::as_str).collect();
+    let retry = with_query(main_search("toolu_2"), &reversed.join(" "));
+    assert_silent(&home.hook("pre-fetch", &retry));
+    assert_eq!(run_outcome(&home), "skipped");
+    assert_eq!(
+        home.count("SELECT COUNT(*) FROM injection WHERE mode = 'deny'"),
+        1
+    );
+    assert_eq!(query_rows(&home), 1);
+}
+
+#[test]
 fn the_callers_own_earlier_search_never_denies() {
     let home = Home::new();
     on(&home);
@@ -1315,28 +1339,64 @@ fn an_added_word_does_not_deny() {
     assert_eq!(home.count("SELECT COUNT(*) FROM injection"), 0);
 }
 
+/// The earlier record is made unusable by `sql`; the repeat must not deny.
+fn assert_unusable_earlier_record_does_not_deny(sql: &str) {
+    let home = Home::new();
+    on(&home);
+    seed_repeat(&home);
+    home.conn().execute(sql, []).unwrap();
+    assert_silent(&home.hook("pre-fetch", &main_search("toolu_1")));
+    assert_eq!(home.count("SELECT COUNT(*) FROM injection"), 0);
+    assert_eq!(run_outcome(&home), "no_match");
+}
+
 #[test]
-fn unusable_earlier_records_do_not_deny() {
-    let cases: [(&str, &str); 5] = [
-        ("placeholder", "UPDATE event SET status = 'placeholder'"),
-        ("dead end", "UPDATE event SET status = 'dead_end'"),
-        ("quarantined", "UPDATE event SET quarantined = 1"),
-        (
-            "tombstoned",
-            "INSERT INTO tombstone (kind, value, created_at) VALUES ('tool_use_id', 'toolu_old', 1)",
-        ),
-        ("empty finding", "UPDATE event SET summary = '  '"),
-    ];
-    for (name, sql) in cases {
-        let home = Home::new();
-        on(&home);
-        seed_repeat(&home);
-        home.conn().execute(sql, []).unwrap();
-        let out = home.hook("pre-fetch", &main_search("toolu_1"));
-        assert_silent(&out);
-        assert_eq!(home.count("SELECT COUNT(*) FROM injection"), 0, "{name}");
-        assert_eq!(run_outcome(&home), "no_match", "{name}");
-    }
+fn a_quarantined_earlier_record_does_not_deny() {
+    assert_unusable_earlier_record_does_not_deny("UPDATE event SET quarantined = 1");
+}
+
+#[test]
+fn a_tombstoned_earlier_record_does_not_deny() {
+    assert_unusable_earlier_record_does_not_deny(
+        "INSERT INTO tombstone (kind, value, created_at) VALUES ('tool_use_id', 'toolu_old', 1)",
+    );
+}
+
+#[test]
+fn a_dead_end_earlier_record_does_not_deny() {
+    assert_unusable_earlier_record_does_not_deny("UPDATE event SET status = 'dead_end'");
+}
+
+#[test]
+fn a_placeholder_earlier_record_does_not_deny() {
+    assert_unusable_earlier_record_does_not_deny("UPDATE event SET status = 'placeholder'");
+}
+
+#[test]
+fn an_earlier_record_with_an_empty_finding_does_not_deny() {
+    assert_unusable_earlier_record_does_not_deny("UPDATE event SET summary = '  '");
+}
+
+#[test]
+fn the_main_agent_counts_as_another_agent_for_a_subagent() {
+    let home = Home::new();
+    on(&home);
+    let sub = fixture("PreToolUse-WebSearch-sub-cc-2.json");
+    let session = sub["session_id"].as_str().unwrap().to_string();
+    home.seed(
+        &search_record(&session, None, "toolu_main", QD_QUERY, "/home/user/dev"),
+        120_000,
+    );
+    assert_silent(&home.hook("pre-fetch", &sub));
+    assert_eq!(
+        home.text("SELECT mode || '/' || agent_id FROM injection"),
+        "shadow_deny/a0000000000000002"
+    );
+    assert_eq!(
+        home.text("SELECT e.tool_use_id FROM injection_item ii JOIN event e ON e.id = ii.event_id"),
+        "toolu_main"
+    );
+    assert_eq!(run_outcome(&home), "shadow");
 }
 
 #[test]

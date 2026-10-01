@@ -1309,7 +1309,7 @@ fn seed_query_denies(env: &Env) {
         [],
     )
     .unwrap();
-    // R: the retry of denial 2, a minute later, words reordered.
+    // R: the retry of denial 2, 60 s after it (BASE + 11 min), words reordered.
     qd_search(
         &conn,
         5,
