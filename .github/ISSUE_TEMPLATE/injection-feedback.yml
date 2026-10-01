@@ -1,0 +1,59 @@
+name: Feedback on a note
+description: Report how useful a note was that agent-web-memory showed you
+labels: ["feedback"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Help us improve matching by telling us whether a note saved time, was relevant, irrelevant, or misleading.
+
+        You can also run `awm review` to label notes without creating an issue.
+  - type: input
+    id: context
+    attributes:
+      label: What was the agent doing?
+      description: One sentence describing the task when the note was shown
+      placeholder: "Researching the Claude API pricing model"
+    validations:
+      required: true
+  - type: textarea
+    id: note
+    attributes:
+      label: The note (from `awm log --ref {ref}`)
+      description: Copy and paste the note text (remove any personal details like URLs with credentials)
+      placeholder: |
+        Earlier web research from this machine...
+        [1] 3 days ago | fetch | other session, same project
+            url: https://example.com
+            asked: What is the pricing?
+            found: Pricing is $20/month...
+      render: text
+    validations:
+      required: true
+  - type: dropdown
+    id: verdict
+    attributes:
+      label: Was this note...
+      options:
+        - Saved me time (I reused it instead of fetching again)
+        - Relevant (useful context, but I still needed to fetch or search)
+        - Irrelevant (the research was too old or unrelated)
+        - Misleading (the note was wrong or contradicted the new result)
+    validations:
+      required: true
+  - type: dropdown
+    id: keep_enabled
+    attributes:
+      label: Should notes like this keep being shown?
+      options:
+        - "Yes, keep showing these"
+        - "No, turn this matching off"
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Output of `awm report` (optional)
+      description: This helps us understand your usage (contains no personal data)
+      placeholder: "Agent-web-memory statistics and metrics..."
+      render: text
