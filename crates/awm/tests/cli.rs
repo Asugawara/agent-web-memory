@@ -56,6 +56,7 @@ impl Env {
             .args(args)
             .env("AWM_HOME", self.awm_home())
             .env("HOME", self.home())
+            .env_remove("CODEX_HOME")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -706,6 +707,138 @@ fn setup_leaves_an_invalid_settings_file_alone() {
         Some(0)
     );
     assert_eq!(std::fs::read_to_string(&settings).unwrap(), "{ not json");
+}
+
+fn codex_hooks_file(env: &Env) -> PathBuf {
+    env.home().join(".codex/hooks.json")
+}
+
+fn read_json(path: &Path) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+fn foreign_session_start() -> Value {
+    json!({"hooks": {"SessionStart": [{"hooks": [
+        {"command": "bash '/x/herdr.sh' session", "timeout": 10, "type": "command"}
+    ]}]}})
+}
+
+#[test]
+fn codex_setup_refuses_without_yes_and_leaves_the_file_alone() {
+    let env = Env::new();
+    let file = codex_hooks_file(&env);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "{\"hooks\":{}}  \n").unwrap();
+    let out = env.awm(&["setup", "--codex-hooks"]);
+    assert_eq!(out.code, Some(2), "{}", out.stderr);
+    assert!(out.stderr.contains("--yes"), "{}", out.stderr);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "{\"hooks\":{}}  \n"
+    );
+    assert!(!file.with_extension("json.awm-backup").exists());
+}
+
+#[test]
+fn codex_setup_creates_the_file_with_the_absolute_binary_path() {
+    let env = Env::new();
+    let file = codex_hooks_file(&env);
+    let text = env
+        .awm(&["setup", "--codex-hooks", "--yes"])
+        .ok()
+        .to_string();
+    assert!(text.contains("/hooks"), "{text}");
+    let v = read_json(&file);
+    let exe = env!("CARGO_BIN_EXE_awm");
+    let cmd = |name: &str| format!("{exe} hook {name}");
+    assert_eq!(
+        v["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+        cmd("prompt")
+    );
+    assert_eq!(
+        v["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+        cmd("session-start")
+    );
+    assert_eq!(v["hooks"]["PreToolUse"][0]["matcher"], "webrun");
+    assert_eq!(
+        v["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+        cmd("pre-fetch")
+    );
+    let post = &v["hooks"]["PostToolUse"][0];
+    assert_eq!(post["matcher"], "webrun");
+    assert_eq!(post["hooks"][0]["command"], cmd("post-tool"));
+    assert_eq!(post["hooks"][0]["timeout"], 5);
+    assert_eq!(post["hooks"][1]["command"], cmd("capture"));
+    assert_eq!(post["hooks"][1]["timeout"], 30);
+    assert!(post["hooks"][1].get("async").is_none());
+}
+
+#[test]
+fn codex_setup_keeps_a_foreign_session_start_hook_and_is_idempotent() {
+    let env = Env::new();
+    let file = codex_hooks_file(&env);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &file,
+        serde_json::to_string_pretty(&foreign_session_start()).unwrap(),
+    )
+    .unwrap();
+    env.awm(&["setup", "--codex-hooks", "--yes"]).ok();
+    let v = read_json(&file);
+    let groups = v["hooks"]["SessionStart"].as_array().unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(
+        groups[0]["hooks"][0]["command"],
+        "bash '/x/herdr.sh' session"
+    );
+    assert!(groups[1]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .ends_with(" hook session-start"));
+    assert!(file.with_extension("json.awm-backup").is_file());
+    assert!(env
+        .awm(&["setup", "--codex-hooks", "--yes"])
+        .ok()
+        .contains("nothing to add"));
+    assert_eq!(read_json(&file), v);
+}
+
+#[test]
+fn codex_setup_remove_restores_the_foreign_only_file() {
+    let env = Env::new();
+    let file = codex_hooks_file(&env);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &file,
+        serde_json::to_string_pretty(&foreign_session_start()).unwrap(),
+    )
+    .unwrap();
+    env.awm(&["setup", "--codex-hooks", "--yes"]).ok();
+    assert_eq!(env.awm(&["setup", "--remove-codex-hooks"]).code, Some(2));
+    env.awm(&["setup", "--remove-codex-hooks", "--yes"]).ok();
+    assert_eq!(read_json(&file), foreign_session_start());
+    // Nothing but awm entries: the empty hooks key goes too.
+    let env = Env::new();
+    env.awm(&["setup", "--codex-hooks", "--yes"]).ok();
+    env.awm(&["setup", "--remove-codex-hooks", "--yes"]).ok();
+    assert_eq!(read_json(&codex_hooks_file(&env)), json!({}));
+}
+
+#[test]
+fn codex_setup_leaves_an_invalid_file_alone() {
+    let env = Env::new();
+    let file = codex_hooks_file(&env);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "{ not json").unwrap();
+    for args in [
+        ["setup", "--codex-hooks", "--yes"],
+        ["setup", "--remove-codex-hooks", "--yes"],
+    ] {
+        let out = env.awm(&args);
+        assert_ne!(out.code, Some(0));
+        assert!(out.stderr.contains("not valid JSON"), "{}", out.stderr);
+    }
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "{ not json");
 }
 
 #[test]

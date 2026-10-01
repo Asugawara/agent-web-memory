@@ -1,7 +1,8 @@
-//! `awm setup`: writes or removes the hook entries in `~/.claude/settings.json` (plan-v2 §5.6).
+//! `awm setup`: writes or removes the hook entries in `~/.claude/settings.json` (plan-v2 §5.6)
+//! or, for Codex, in `$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`).
 //!
 //! Only runs when the user asks. Shows what it adds, keeps a backup, and never
-//! touches entries it did not write (a command starting with `awm hook `).
+//! touches entries it did not write (a command that runs `awm hook <name>`).
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -19,64 +20,111 @@ pub struct Args {
     /// Remove the awm hooks from ~/.claude/settings.json
     #[arg(long)]
     pub remove_hooks: bool,
+    /// Add the awm hooks to $CODEX_HOME/hooks.json (default ~/.codex/hooks.json)
+    #[arg(long, conflicts_with_all = ["hooks_in_settings", "remove_hooks", "remove_codex_hooks"])]
+    pub codex_hooks: bool,
+    /// Remove the awm hooks from $CODEX_HOME/hooks.json
+    #[arg(long, conflicts_with_all = ["hooks_in_settings", "remove_hooks"])]
+    pub remove_codex_hooks: bool,
     /// Do not ask for confirmation
     #[arg(long)]
     pub yes: bool,
 }
 
-/// (event, matcher, hook) entries, as in `plugin/hooks/hooks.json`.
-fn entries() -> Vec<(&'static str, Option<&'static str>, Value)> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Claude,
+    Codex,
+}
+
+type Entry = (&'static str, Option<&'static str>, Value);
+
+/// The command line for one hook. Codex may not inherit PATH, so it gets the absolute
+/// path of this binary (quoted when it holds a space).
+fn command_for(target: Target, name: &str) -> String {
+    match target {
+        Target::Claude => format!("{COMMAND_PREFIX}{name}"),
+        Target::Codex => {
+            let exe = std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "awm".to_string());
+            let exe = if exe.contains(' ') {
+                format!("'{exe}'")
+            } else {
+                exe
+            };
+            format!("{exe} hook {name}")
+        }
+    }
+}
+
+/// (event, matcher, hook) entries, as in `plugin/hooks/hooks.json` for Claude Code.
+/// Codex names its web tool `webrun` (spike `docs/reports/codex-hooks.md`) and no `async`
+/// flag is known there, so its capture hook runs inline with the 30 s timeout.
+fn entries(target: Target) -> Vec<Entry> {
+    let claude = target == Target::Claude;
     let cmd = |name: &str, timeout: u32, is_async: bool| {
-        let mut h = json!({"type": "command", "command": format!("{COMMAND_PREFIX}{name}"), "timeout": timeout});
-        if is_async {
+        let mut h =
+            json!({"type": "command", "command": command_for(target, name), "timeout": timeout});
+        if is_async && claude {
             h["async"] = json!(true);
         }
         h
     };
+    let (tools, fetch_tools) = if claude {
+        (Some("WebSearch|WebFetch"), Some("WebFetch"))
+    } else {
+        (Some("webrun"), Some("webrun"))
+    };
     vec![
         (
             "SessionStart",
-            Some("startup"),
+            claude.then_some("startup"),
             cmd("session-start", 5, false),
         ),
         ("UserPromptSubmit", None, cmd("prompt", 5, false)),
-        ("PreToolUse", Some("WebFetch"), cmd("pre-fetch", 5, false)),
-        (
-            "PostToolUse",
-            Some("WebSearch|WebFetch"),
-            cmd("post-tool", 5, false),
-        ),
-        (
-            "PostToolUse",
-            Some("WebSearch|WebFetch"),
-            cmd("capture", 30, true),
-        ),
+        ("PreToolUse", fetch_tools, cmd("pre-fetch", 5, false)),
+        ("PostToolUse", tools, cmd("post-tool", 5, false)),
+        ("PostToolUse", tools, cmd("capture", 30, true)),
     ]
 }
 
+/// A command written by this module: `awm hook <name>`, or `<path>/awm hook <name>`.
 fn is_ours(hook: &Value) -> bool {
-    hook["command"]
-        .as_str()
-        .is_some_and(|c| c.starts_with(COMMAND_PREFIX))
+    let Some(c) = hook["command"].as_str() else {
+        return false;
+    };
+    if c.starts_with(COMMAND_PREFIX) {
+        return true;
+    }
+    let Some((exe, name)) = c.rsplit_once(" hook ") else {
+        return false;
+    };
+    let exe = exe.trim_matches('\'');
+    std::path::Path::new(exe)
+        .file_name()
+        .is_some_and(|f| f == "awm")
+        && !name.is_empty()
+        && name.chars().all(|ch| ch.is_ascii_lowercase() || ch == '-')
 }
 
 /// Adds the entries that are not there yet. Returns how many were added.
-pub fn add_hooks(settings: &mut Value) -> anyhow::Result<usize> {
+fn add_hooks(settings: &mut Value, entries: Vec<Entry>) -> anyhow::Result<usize> {
     let root = settings
         .as_object_mut()
-        .ok_or_else(|| anyhow!("settings.json is not a JSON object"))?;
+        .ok_or_else(|| anyhow!("the hooks file is not a JSON object"))?;
     let hooks = root
         .entry("hooks")
         .or_insert_with(|| Value::Object(Map::new()))
         .as_object_mut()
-        .ok_or_else(|| anyhow!("\"hooks\" in settings.json is not an object"))?;
+        .ok_or_else(|| anyhow!("\"hooks\" in the hooks file is not an object"))?;
     let mut added = 0;
-    for (event, matcher, hook) in entries() {
+    for (event, matcher, hook) in entries {
         let groups = hooks
             .entry(event)
             .or_insert_with(|| Value::Array(Vec::new()))
             .as_array_mut()
-            .ok_or_else(|| anyhow!("hooks.{event} in settings.json is not an array"))?;
+            .ok_or_else(|| anyhow!("hooks.{event} in the hooks file is not an array"))?;
         let present = groups.iter().any(|g| {
             g["hooks"]
                 .as_array()
@@ -107,7 +155,7 @@ pub fn add_hooks(settings: &mut Value) -> anyhow::Result<usize> {
 }
 
 /// Removes every entry written by [`add_hooks`], and empty groups, events and `hooks`.
-pub fn remove_hooks(settings: &mut Value) -> usize {
+fn remove_hooks(settings: &mut Value) -> usize {
     let Some(root) = settings.as_object_mut() else {
         return 0;
     };
@@ -145,15 +193,52 @@ pub fn settings_path() -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(home).join(".claude").join("settings.json"))
 }
 
+/// The Codex hooks file: `$CODEX_HOME/hooks.json`, else `~/.codex/hooks.json`.
+pub fn codex_hooks_path() -> anyhow::Result<PathBuf> {
+    match std::env::var_os("CODEX_HOME").filter(|h| !h.is_empty()) {
+        Some(dir) => Ok(PathBuf::from(dir).join("hooks.json")),
+        None => {
+            let home = std::env::var_os("HOME")
+                .filter(|h| !h.is_empty())
+                .ok_or_else(|| anyhow!("HOME is not set"))?;
+            Ok(PathBuf::from(home).join(".codex").join("hooks.json"))
+        }
+    }
+}
+
+/// Returned when a Codex change needs a confirmation and there is no terminal.
+#[derive(Debug)]
+struct Refused(String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
 pub fn run(args: Args) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
-    run_with(
+    let path = if args.codex_hooks || args.remove_codex_hooks {
+        codex_hooks_path()?
+    } else {
+        settings_path()?
+    };
+    let result = run_with(
         &args,
-        &settings_path()?,
+        &path,
         stdin.is_terminal(),
         &mut stdin.lock(),
         &mut std::io::stdout().lock(),
-    )
+    );
+    if let Err(e) = &result {
+        if e.downcast_ref::<Refused>().is_some() {
+            eprintln!("awm: {e}");
+            std::process::exit(2);
+        }
+    }
+    result
 }
 
 pub fn run_with(
@@ -163,9 +248,19 @@ pub fn run_with(
     input: &mut dyn BufRead,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
-    if !args.hooks_in_settings && !args.remove_hooks {
-        bail!("choose --hooks-in-settings or --remove-hooks");
+    let adding = args.hooks_in_settings || args.codex_hooks;
+    let removing = args.remove_hooks || args.remove_codex_hooks;
+    if !adding && !removing {
+        bail!("choose --hooks-in-settings, --remove-hooks, --codex-hooks or --remove-codex-hooks");
     }
+    let codex = args.codex_hooks || args.remove_codex_hooks;
+    let target = if codex { Target::Codex } else { Target::Claude };
+    let flag = match (args.hooks_in_settings, args.remove_hooks, args.codex_hooks) {
+        (true, _, _) => "--hooks-in-settings",
+        (_, true, _) => "--remove-hooks",
+        (_, _, true) => "--codex-hooks",
+        _ => "--remove-codex-hooks",
+    };
     let (mut settings, existed) = match std::fs::read_to_string(path) {
         Ok(text) => (
             serde_json::from_str::<Value>(&text).with_context(|| {
@@ -177,8 +272,8 @@ pub fn run_with(
         Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
     };
     let before = settings.clone();
-    let changed = if args.hooks_in_settings {
-        add_hooks(&mut settings)?
+    let changed = if adding {
+        add_hooks(&mut settings, entries(target))?
     } else {
         remove_hooks(&mut settings)
     };
@@ -187,26 +282,18 @@ pub fn run_with(
             out,
             "{}: nothing to {}.",
             path.display(),
-            if args.hooks_in_settings {
-                "add"
-            } else {
-                "remove"
-            }
+            if adding { "add" } else { "remove" }
         )?;
         return Ok(());
     }
     writeln!(
         out,
         "{} {changed} hook entries {} {}:",
-        if args.hooks_in_settings {
-            "Adding"
-        } else {
-            "Removing"
-        },
-        if args.hooks_in_settings { "to" } else { "from" },
+        if adding { "Adding" } else { "Removing" },
+        if adding { "to" } else { "from" },
         path.display()
     )?;
-    for (event, matcher, hook) in entries() {
+    for (event, matcher, hook) in entries(target) {
         writeln!(
             out,
             "  {event} {} -> {}",
@@ -214,12 +301,22 @@ pub fn run_with(
             hook["command"].as_str().unwrap_or("")
         )?;
     }
+    if codex {
+        writeln!(
+            out,
+            "Codex hooks use the absolute path of this binary because Codex may not inherit PATH. \
+             Codex has no known async flag, so `hook capture` runs inline (timeout 30)."
+        )?;
+    }
     if !args.yes {
         if !terminal {
-            bail!(
-                "no terminal for confirmation; nothing changed. Re-run with --yes: awm setup {} --yes",
-                if args.hooks_in_settings { "--hooks-in-settings" } else { "--remove-hooks" }
+            let msg = format!(
+                "no terminal for confirmation; nothing changed. Re-run with --yes: awm setup {flag} --yes"
             );
+            if codex {
+                return Err(Refused(msg).into());
+            }
+            bail!(msg);
         }
         write!(out, "Continue? [y/N] ")?;
         out.flush()?;
@@ -244,6 +341,16 @@ pub fn run_with(
     let mut text = serde_json::to_string_pretty(&settings)?;
     text.push('\n');
     std::fs::write(path, text).with_context(|| format!("cannot write {}", path.display()))?;
-    writeln!(out, "Done.")?;
+    if args.codex_hooks {
+        writeln!(
+            out,
+            "Codex hooks added to {}. Codex loads this file at start; hooks you did not add through /hooks must be trusted once: run codex, type /hooks, and trust the awm entries.",
+            path.display()
+        )?;
+    } else if args.remove_codex_hooks {
+        writeln!(out, "Codex hooks removed from {}.", path.display())?;
+    } else {
+        writeln!(out, "Done.")?;
+    }
     Ok(())
 }

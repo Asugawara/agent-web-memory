@@ -79,6 +79,30 @@ awm purge --all
 
 `awm stats --savings` counts a shown note as avoided when the same session and agent did not call its URL or query again afterwards, and prices it at the median duration and summary length (chars / 4) of earlier calls of the same URL or query. This is an estimate of something that did not happen, so it also prints the part you confirmed in `awm review` (label 2), the token overhead of the notes, and the repeat calls in your history as an upper bound.
 
+## Codex
+
+Codex support is experimental (started 2026-10-02; spike in `docs/reports/codex-hooks.md`, tested with Codex CLI 0.159.3).
+
+**What works**
+- Notes about earlier research are shown with your prompt (`UserPromptSubmit`).
+- Notes are shown after a web search through Codex's `webrun` tool, and searches are captured with their full results on current models.
+
+**What is missing**
+- Older hosted web searches leave only the query and URL in the rollout, with no result text, and may not trigger hooks at all (not verified).
+- Codex has no fetch tool, so there are no fetch notes.
+- Project-level `.codex/hooks.json` files are not loaded; hooks must live in `~/.codex/hooks.json`.
+
+**Enable**
+```bash
+awm setup --codex-hooks
+```
+This shows the entries, asks first (`--yes` skips the question), keeps a backup `hooks.json.awm-backup` and leaves your other hooks alone. It writes the absolute path of the `awm` binary, because Codex may not inherit your PATH. Then run `codex`, type `/hooks`, and trust the awm entries once. `$CODEX_HOME` is honoured if set.
+
+**Disable**
+```bash
+awm setup --remove-codex-hooks
+```
+
 ## Privacy
 
 - **Local only**: All research stays on your machine. No servers, no sync, no API calls.
