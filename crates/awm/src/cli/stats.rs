@@ -470,10 +470,25 @@ fn repeats(calls: &[Call], fetch: bool) -> (i64, i64, i64, i64) {
     (n, ms, chars, bytes)
 }
 
+/// Money for one avoided item. A fetch: the summariser reads `bytes / 4` tokens and writes the
+/// summary (`tokens`); a search: the search fee. The main model's read of the summary is priced
+/// only when `main_input_per_mtok` is set.
+fn item_cost(p: &crate::config::Pricing, fetch: bool, bytes: i64, tokens: f64) -> f64 {
+    let main = tokens * p.main_input_per_mtok / 1e6;
+    if fetch {
+        bytes as f64 / 4.0 * p.summariser_input_per_mtok / 1e6
+            + tokens * p.summariser_output_per_mtok / 1e6
+            + main
+    } else {
+        p.search_fee_per_call + main
+    }
+}
+
 /// Estimated savings. Counterfactual: an avoided item is a shown note whose call was not repeated
 /// by the same session and agent afterwards; its cost is the median of the same call's history.
 fn savings(conn: &Connection, since: Option<&str>) -> anyhow::Result<Value> {
     let since_ms = since.map(super::parse_date).transpose()?;
+    let pricing = crate::config::load(&crate::paths::config_path()?)?.pricing;
     let calls = load_calls(conn)?;
     let by_id: HashMap<i64, &Call> = calls.iter().map(|c| (c.id, c)).collect();
     let mut by_key: HashMap<&str, Vec<&Call>> = HashMap::new();
@@ -522,6 +537,7 @@ fn savings(conn: &Connection, since: Option<&str>) -> anyhow::Result<Value> {
     let (mut ms, mut chars) = (0.0_f64, 0.0_f64);
     let (mut conf_n, mut conf_ms, mut conf_chars) = (0_i64, 0.0_f64, 0.0_f64);
     let (mut bytes, mut conf_bytes) = (0_i64, 0_i64);
+    let (mut cost, mut conf_cost) = (0.0_f64, 0.0_f64);
     let mut overhead = 0.0_f64;
     for (id, at, session, agent, tool_use_id, rendered) in &injections {
         overhead += *rendered as f64 / 4.0;
@@ -579,6 +595,7 @@ fn savings(conn: &Connection, since: Option<&str>) -> anyhow::Result<Value> {
                 d.unwrap_or(0) as f64,
                 c.unwrap_or(0) as f64 / 4.0,
                 page,
+                item_cost(&pricing, src.is_fetch, page, c.unwrap_or(0) as f64 / 4.0),
             ));
         }
         if recalled {
@@ -586,12 +603,14 @@ fn savings(conn: &Connection, since: Option<&str>) -> anyhow::Result<Value> {
             continue;
         }
         avoided += 1;
-        for (two, d, t, page) in costs {
+        for (two, d, t, page, c) in costs {
+            cost += c;
             ms += d;
             chars += t;
             bytes += page;
             if two {
                 conf_bytes += page;
+                conf_cost += c;
                 conf_n += 1;
                 conf_ms += d;
                 conf_chars += t;
@@ -600,8 +619,16 @@ fn savings(conn: &Connection, since: Option<&str>) -> anyhow::Result<Value> {
     }
     let (rf_n, rf_ms, rf_chars, rf_bytes) = repeats(&calls, true);
     let (rs_n, rs_ms, rs_chars, rs_bytes) = repeats(&calls, false);
-    let ceiling = |n: i64, ms: i64, chars: i64, bytes: i64| {
+    let ceiling = |fetch: bool, n: i64, ms: i64, chars: i64, bytes: i64| {
+        let tokens = chars as f64 / 4.0;
+        let total = if fetch {
+            // Linear in bytes and tokens, so the totals price the same as the items.
+            item_cost(&pricing, true, bytes, tokens)
+        } else {
+            n as f64 * pricing.search_fee_per_call + tokens * pricing.main_input_per_mtok / 1e6
+        };
         json!({
+            "est_cost": total,
             "count": n,
             "duration_ms": ms,
             "tokens": chars as f64 / 4.0,
@@ -618,6 +645,17 @@ fn savings(conn: &Connection, since: Option<&str>) -> anyhow::Result<Value> {
         "tokens_saved": chars,
         "overhead_tokens": overhead,
         "net_tokens": chars - overhead,
+        "est_cost": cost,
+        "overhead_cost": overhead * pricing.main_input_per_mtok / 1e6,
+        "net_cost": (pricing.main_input_per_mtok > 0.0)
+            .then(|| cost - overhead * pricing.main_input_per_mtok / 1e6),
+        "pricing": {
+            "currency": pricing.currency,
+            "summariser_input_per_mtok": pricing.summariser_input_per_mtok,
+            "summariser_output_per_mtok": pricing.summariser_output_per_mtok,
+            "search_fee_per_call": pricing.search_fee_per_call,
+            "main_input_per_mtok": pricing.main_input_per_mtok,
+        },
         "est_bytes_not_fetched": bytes,
         "est_summariser_tokens": bytes / 4,
         "confirmed": {
@@ -626,10 +664,11 @@ fn savings(conn: &Connection, since: Option<&str>) -> anyhow::Result<Value> {
             "tokens_saved": conf_chars,
             "est_bytes_not_fetched": conf_bytes,
             "est_summariser_tokens": conf_bytes / 4,
+            "est_cost": conf_cost,
         },
         "ceiling": {
-            "repeat_fetches": ceiling(rf_n, rf_ms, rf_chars, rf_bytes),
-            "repeat_searches": ceiling(rs_n, rs_ms, rs_chars, rs_bytes),
+            "repeat_fetches": ceiling(true, rf_n, rf_ms, rf_chars, rf_bytes),
+            "repeat_searches": ceiling(false, rs_n, rs_ms, rs_chars, rs_bytes),
         },
     }))
 }
@@ -691,6 +730,21 @@ fn wrap(text: &str, width: usize) -> String {
     out
 }
 
+/// `$1.31` (USD) or `1.31 EUR`; `<$0.01` for a positive amount that rounds to nothing.
+fn money(amount: f64, currency: &str) -> String {
+    let usd = currency == "USD";
+    let (pre, post) = if usd {
+        ("$".to_string(), String::new())
+    } else {
+        (String::new(), format!(" {currency}"))
+    };
+    if amount > 0.0 && amount < 0.005 {
+        format!("<{pre}0.01{post}")
+    } else {
+        format!("{pre}{amount:.2}{post}")
+    }
+}
+
 fn savings_text(v: &Value) -> String {
     let int = |k: &str| v[k].as_i64().unwrap_or(0);
     let row = |label: &str, items: f64, base: &[&str], bytes: Option<(f64, f64)>| {
@@ -748,7 +802,8 @@ fn savings_text(v: &Value) -> String {
         "duration_ms",
         "tokens",
     );
-    let rows = vec![
+    let currency = v["pricing"]["currency"].as_str().unwrap_or("USD");
+    let mut rows = vec![
         row(
             "avoided (est.)",
             int("avoided") as f64,
@@ -774,7 +829,26 @@ fn savings_text(v: &Value) -> String {
             None,
         ),
     ];
-    let head = ["", "items", "time", "tokens", "page bytes", "summariser"];
+    let cost_paths: [&[&str]; 4] = [
+        &[],
+        &["confirmed"],
+        &["ceiling", "repeat_fetches"],
+        &["ceiling", "repeat_searches"],
+    ];
+    for (r, path) in rows.iter_mut().zip(cost_paths) {
+        let mut p = path.to_vec();
+        p.push("est_cost");
+        r.push(money(num(v, &p), currency));
+    }
+    let head = [
+        "",
+        "items",
+        "time",
+        "tokens",
+        "page bytes",
+        "summariser",
+        "cost",
+    ];
     let widths: Vec<usize> = (0..head.len())
         .map(|c| {
             rows.iter()
@@ -802,13 +876,21 @@ fn savings_text(v: &Value) -> String {
         o.push_str("  No notes shown yet.\n");
     } else {
         o.push_str(&format!(
-            "  shown {} = avoided {} + followed up {}; note overhead {} tokens, net {}\n",
+            "  shown {} = avoided {} + followed up {}; note overhead {} tokens, net {}; est. cost {}",
             int("shown"),
             int("avoided"),
             int("followed_up"),
             kilo(num(v, &["overhead_tokens"])),
-            kilo(num(v, &["net_tokens"]))
+            kilo(num(v, &["net_tokens"])),
+            money(num(v, &["est_cost"]), currency)
         ));
+        if !v["net_cost"].is_null() {
+            o.push_str(&format!(
+                ", net {} after pricing the note overhead",
+                money(num(v, &["net_cost"]), currency)
+            ));
+        }
+        o.push('\n');
     }
     if let Some(d) = v["since"].as_str() {
         o.push_str(&format!("  since {d} (ceilings use the whole record)\n"));
@@ -818,7 +900,10 @@ fn savings_text(v: &Value) -> String {
         "tokens: main-model context, summary chars / 4. page bytes: what the fetch summariser read; \
          summariser tokens <= bytes / 4 (upper bound). per avoided item: median of past ok calls of \
          the same url or normalised query (fallback: all ok calls of that tool). confirmed: avoided \
-         items you labelled 2 in awm review.",
+         items you labelled 2 in awm review. cost: fetch summariser tokens at [pricing] rates \
+         (default Claude Haiku 4.5: $1/M in, $5/M out) plus $0.01 per avoided search (Anthropic web \
+         search fee); main-model tokens priced only when main_input_per_mtok is set; a subscription \
+         pays none of this per call.",
         100,
     ));
     o

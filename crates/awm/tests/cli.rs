@@ -984,13 +984,13 @@ fn stats_savings_matches_hand_computed_numbers() {
     let want = "\
 savings: an estimate of what did not happen, not a measurement
 
-                            items     time  tokens  page bytes  summariser
-  avoided (est.)                1  0.1 min    0.2k      8.0 KB     <= 2.0k
-  confirmed (label 2)           1  0.1 min    0.2k      8.0 KB     <= 2.0k
-  ceiling: repeat fetches       3  0.5 min    0.5k     28.0 KB     <= 7.0k
-  ceiling: repeat searches      0  0.0 min    0.0k           -           -
+                            items     time  tokens  page bytes  summariser    cost
+  avoided (est.)                1  0.1 min    0.2k      8.0 KB     <= 2.0k  <$0.01
+  confirmed (label 2)           1  0.1 min    0.2k      8.0 KB     <= 2.0k  <$0.01
+  ceiling: repeat fetches       3  0.5 min    0.5k     28.0 KB     <= 7.0k   $0.01
+  ceiling: repeat searches      0  0.0 min    0.0k           -           -   $0.00
 
-  shown 2 = avoided 1 + followed up 1; note overhead 0.3k tokens, net -0.1k
+  shown 2 = avoided 1 + followed up 1; note overhead 0.3k tokens, net -0.1k; est. cost <$0.01
 
 ";
     assert!(text.starts_with(want), "got:\n{text}");
@@ -1027,6 +1027,74 @@ savings: an estimate of what did not happen, not a measurement
     assert_eq!(s["ceiling"]["repeat_fetches"]["bytes"], 28_000);
     assert_eq!(s["ceiling"]["repeat_fetches"]["summariser_tokens"], 7_000);
     assert_eq!(s["ceiling"]["repeat_searches"]["bytes"], 0);
+    // Default rates ($1/M in, $5/M out). Avoided and confirmed: 2000 summariser tokens * 1/1e6
+    // + 200 summary tokens * 5/1e6 = 0.002 + 0.001. Repeat fetches: 7000 * 1/1e6 + 511.5 * 5/1e6
+    // = 0.007 + 0.0025575. No search is repeated.
+    let near = |got: &Value, want: f64| {
+        assert!(
+            (got.as_f64().unwrap() - want).abs() < 1e-9,
+            "{got} != {want}"
+        )
+    };
+    near(&s["est_cost"], 0.003);
+    near(&s["confirmed"]["est_cost"], 0.003);
+    near(&s["ceiling"]["repeat_fetches"]["est_cost"], 0.0095575);
+    near(&s["ceiling"]["repeat_searches"]["est_cost"], 0.0);
+    assert!(s["net_cost"].is_null());
+    assert_eq!(s["pricing"]["currency"], "USD");
+    assert_eq!(s["pricing"]["search_fee_per_call"], 0.01);
+    assert_eq!(s["pricing"]["main_input_per_mtok"], 0.0);
+}
+
+fn write_pricing(env: &Env, toml: &str) {
+    std::fs::write(env.awm_home().join("config.toml"), toml).unwrap();
+}
+
+#[test]
+fn stats_savings_prices_main_tokens_when_the_rate_is_set() {
+    let env = Env::new();
+    seed_savings(&env);
+    write_pricing(
+        &env,
+        "[pricing]\nsummariser_input_per_mtok = 1000.0\nmain_input_per_mtok = 3.0\n",
+    );
+    // Avoided: 2000 * 1000/1e6 = 2.0, + 200 * 5/1e6 = 0.001, + main 200 * 3/1e6 = 0.0006 -> 2.0016.
+    // Overhead 300 * 3/1e6 = 0.0009, net 2.0007. Repeat fetches: 7.0 + 0.0025575 + 511.5 * 3/1e6.
+    let text = env.awm(&["stats", "--savings"]).ok().to_string();
+    assert!(
+        text.contains(
+            "  avoided (est.)                1  0.1 min    0.2k      8.0 KB     <= 2.0k  $2.00\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("; est. cost $2.00, net $2.00 after pricing the note overhead\n"),
+        "{text}"
+    );
+    assert!(text.contains("<= 7.0k  $7.00\n"), "{text}");
+    let v: Value = serde_json::from_str(env.awm(&["stats", "--savings", "--json"]).ok()).unwrap();
+    let s = &v["savings"];
+    assert!((s["est_cost"].as_f64().unwrap() - 2.0016).abs() < 1e-9);
+    assert!((s["net_cost"].as_f64().unwrap() - 2.0007).abs() < 1e-9);
+    assert_eq!(s["pricing"]["main_input_per_mtok"], 3.0);
+}
+
+#[test]
+fn stats_savings_search_fee_can_be_zero() {
+    let env = Env::new();
+    let conn = env.conn();
+    for id in 1..=2 {
+        let mut e = ev(id, "WebSearch", "s0", BASE + id * 1_000);
+        e.query = Some("bm25 column weights");
+        insert(&conn, &e);
+    }
+    // One repeated search: the default fee of 0.01 per call, then none.
+    let row = "  ceiling: repeat searches      1  0.0 min    0.0k           -           -  ";
+    let text = env.awm(&["stats", "--savings"]).ok().to_string();
+    assert!(text.contains(&format!("{row}$0.01\n")), "{text}");
+    write_pricing(&env, "[pricing]\nsearch_fee_per_call = 0\n");
+    let text = env.awm(&["stats", "--savings"]).ok().to_string();
+    assert!(text.contains(&format!("{row}$0.00\n")), "{text}");
 }
 
 #[test]
@@ -1085,7 +1153,7 @@ fn stats_savings_since_limits_the_injections_but_not_the_ceiling() {
     );
     assert!(
         text.contains(
-            "  ceiling: repeat fetches       3  0.5 min    0.5k     28.0 KB     <= 7.0k\n"
+            "  ceiling: repeat fetches       3  0.5 min    0.5k     28.0 KB     <= 7.0k  $0.01\n"
         ),
         "{text}"
     );
@@ -1109,13 +1177,13 @@ fn stats_savings_on_an_empty_database() {
     assert!(text.contains("No notes shown yet."), "{text}");
     assert!(
         text.contains(
-            "  ceiling: repeat fetches       0  0.0 min    0.0k      0.0 KB       <= 0k\n"
+            "  ceiling: repeat fetches       0  0.0 min    0.0k      0.0 KB       <= 0k  $0.00\n"
         ),
         "{text}"
     );
     assert!(
         text.contains(
-            "  ceiling: repeat searches      0  0.0 min    0.0k           -           -\n"
+            "  ceiling: repeat searches      0  0.0 min    0.0k           -           -  $0.00\n"
         ),
         "{text}"
     );
@@ -1139,7 +1207,7 @@ fn stats_savings_text_uses_m_for_a_million_tokens_or_more() {
     let text = env.awm(&["stats", "--savings"]).ok().to_string();
     assert!(
         text.contains(
-            "  ceiling: repeat fetches       1  0.0 min    0.0k      8.0 MB     <= 2.0M\n"
+            "  ceiling: repeat fetches       1  0.0 min    0.0k      8.0 MB     <= 2.0M  $2.00\n"
         ),
         "{text}"
     );

@@ -90,7 +90,38 @@ pub struct Review {
     pub daily_limit: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Prices for `awm stats --savings` (`[pricing]`); never used to bill anything.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Pricing {
+    pub currency: String,
+    /// Fetch summariser input, per million tokens (default: Claude Haiku 4.5).
+    #[serde(deserialize_with = "de_price")]
+    pub summariser_input_per_mtok: f64,
+    /// Fetch summariser output (the summary it returns), per million tokens.
+    #[serde(deserialize_with = "de_price")]
+    pub summariser_output_per_mtok: f64,
+    /// Anthropic web search fee per call.
+    #[serde(deserialize_with = "de_price")]
+    pub search_fee_per_call: f64,
+    /// Main model input per million tokens; 0 = not priced.
+    #[serde(deserialize_with = "de_price")]
+    pub main_input_per_mtok: f64,
+}
+
+impl Default for Pricing {
+    fn default() -> Self {
+        Pricing {
+            currency: "USD".into(),
+            summariser_input_per_mtok: 1.0,
+            summariser_output_per_mtok: 5.0,
+            search_fee_per_call: 0.01,
+            main_input_per_mtok: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub mode: Mode,
@@ -101,6 +132,7 @@ pub struct Config {
     pub hooks: Hooks,
     pub capture: CaptureConfig,
     pub review: Review,
+    pub pricing: Pricing,
     /// Out-of-range values that [`load`] clamped; never written by [`Config::save`].
     #[serde(skip)]
     pub warnings: Vec<String>,
@@ -159,6 +191,7 @@ impl Default for Config {
             hooks: Hooks::default(),
             capture: CaptureConfig::default(),
             review: Review::default(),
+            pricing: Pricing::default(),
             warnings: Vec::new(),
         }
     }
@@ -169,6 +202,18 @@ impl Default for Config {
 fn de_u32<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     let v = i64::deserialize(d)?;
     Ok(u32::try_from(v.clamp(0, i64::from(u32::MAX))).unwrap_or(u32::MAX))
+}
+
+/// A price: a finite number that is not negative (an error naming the field, unlike the clamped integers).
+fn de_price<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    let v = f64::deserialize(d)?;
+    if v.is_finite() && v >= 0.0 {
+        Ok(v)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "pricing value must be a number >= 0, got {v}"
+        )))
+    }
 }
 
 /// Allowed range of a numeric key (plan-v2 §5.7).
@@ -241,6 +286,15 @@ impl Config {
             "capture.exclude_hosts" => self.capture.exclude_hosts.join(","),
             "capture.redact_terms" => self.capture.redact_terms.join(","),
             "review.daily_limit" => self.review.daily_limit.to_string(),
+            "pricing.currency" => self.pricing.currency.clone(),
+            "pricing.summariser_input_per_mtok" => {
+                self.pricing.summariser_input_per_mtok.to_string()
+            }
+            "pricing.summariser_output_per_mtok" => {
+                self.pricing.summariser_output_per_mtok.to_string()
+            }
+            "pricing.search_fee_per_call" => self.pricing.search_fee_per_call.to_string(),
+            "pricing.main_input_per_mtok" => self.pricing.main_input_per_mtok.to_string(),
             _ => return None,
         })
     }
@@ -269,6 +323,12 @@ impl Config {
                 }
             }
             Ok(n)
+        }
+        fn price(key: &str, value: &str) -> anyhow::Result<f64> {
+            match value.trim().parse::<f64>() {
+                Ok(n) if n.is_finite() && n >= 0.0 => Ok(n),
+                _ => bail!("{key}: expected a number >= 0, got {value:?}"),
+            }
         }
         fn list(value: &str) -> Vec<String> {
             value
@@ -308,6 +368,21 @@ impl Config {
             "capture.exclude_hosts" => self.capture.exclude_hosts = list(value),
             "capture.redact_terms" => self.capture.redact_terms = list(value),
             "review.daily_limit" => self.review.daily_limit = number(key, value)?,
+            "pricing.currency" => {
+                let v = value.trim();
+                if v.is_empty() {
+                    bail!("{key}: expected a currency code, got {value:?}");
+                }
+                self.pricing.currency = v.to_string();
+            }
+            "pricing.summariser_input_per_mtok" => {
+                self.pricing.summariser_input_per_mtok = price(key, value)?
+            }
+            "pricing.summariser_output_per_mtok" => {
+                self.pricing.summariser_output_per_mtok = price(key, value)?
+            }
+            "pricing.search_fee_per_call" => self.pricing.search_fee_per_call = price(key, value)?,
+            "pricing.main_input_per_mtok" => self.pricing.main_input_per_mtok = price(key, value)?,
             _ => bail!("unknown configuration key: {key}"),
         }
         Ok(())
