@@ -1,0 +1,2 @@
+# Migration SQL is checksummed byte for byte; never let a checkout rewrite its line endings.
+crates/awm/migrations/*.sql text eol=lf
