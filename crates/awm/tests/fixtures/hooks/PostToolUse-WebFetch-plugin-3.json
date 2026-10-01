@@ -1,0 +1,23 @@
+{
+  "session_id": "00000000-0000-4000-a000-000000000004",
+  "transcript_path": "/home/user/me/.claude/projects/-Users-me-dev-agent-web-memory-spikes-cc-hooks-plugin-variant/00000000-0000-4000-a000-000000000004.jsonl",
+  "cwd": "/home/user/me/dev/agent-web-memory/spikes/cc-hooks/plugin-variant",
+  "prompt_id": "00000000-0000-4000-a000-000000000017",
+  "permission_mode": "dontAsk",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "WebFetch",
+  "tool_input": {
+    "url": "https://example.com",
+    "prompt": "Summarize the content of this page in one sentence"
+  },
+  "tool_response": {
+    "bytes": 713,
+    "code": 200,
+    "codeText": "OK",
+    "result": "This page explains that the domain is reserved for documentation examples and advises against using it for actual testing or monitoring purposes.",
+    "durationMs": 1258,
+    "url": "https://example.com"
+  },
+  "tool_use_id": "toolu_fixture000000000002",
+  "duration_ms": 1260
+}

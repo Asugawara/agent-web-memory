@@ -1,0 +1,14 @@
+{
+  "session_id": "00000000-0000-4000-a000-000000000003",
+  "transcript_path": "/home/user/me/.claude/projects/-Users-me-dev-agent-web-memory-spikes-cc-hooks-plugin-variant/00000000-0000-4000-a000-000000000003.jsonl",
+  "cwd": "/home/user/me/dev/agent-web-memory/spikes/cc-hooks/plugin-variant",
+  "prompt_id": "00000000-0000-4000-a000-000000000013",
+  "permission_mode": "dontAsk",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "WebFetch",
+  "tool_input": {
+    "url": "https://example.com",
+    "prompt": "Fetch the page content"
+  },
+  "tool_use_id": "toolu_fixture000000000003"
+}
