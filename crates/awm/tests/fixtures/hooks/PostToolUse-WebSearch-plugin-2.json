@@ -1,0 +1,67 @@
+{
+  "session_id": "00000000-0000-4000-a000-000000000008",
+  "transcript_path": "/home/user/me/.claude/projects/-Users-me-dev-agent-web-memory-spikes-cc-hooks-plugin-variant/00000000-0000-4000-a000-000000000008.jsonl",
+  "cwd": "/home/user/me/dev/agent-web-memory/spikes/cc-hooks/plugin-variant",
+  "prompt_id": "00000000-0000-4000-a000-000000000020",
+  "permission_mode": "dontAsk",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "WebSearch",
+  "tool_input": {
+    "query": "SQLite FTS5 bm25 column weights"
+  },
+  "tool_response": {
+    "query": "SQLite FTS5 bm25 column weights",
+    "results": [
+      {
+        "tool_use_id": "srvtoolu_fixture00000000002",
+        "content": [
+          {
+            "title": "Full-Text Search in SQLite: A Practical Guide",
+            "url": "https://medium.com/@johnidouglasmarangon/full-text-search-in-sqlite-a-practical-guide-80a69c3f42a4"
+          },
+          {
+            "title": "SQLite User Forum: FTS5: calculating column weight dynamically?",
+            "url": "https://sqlite.org/forum/info/4e3fa41c48087701"
+          },
+          {
+            "title": "SQLite FTS5 Extension",
+            "url": "https://sqlite.org/fts5.html"
+          },
+          {
+            "title": "Beyond FTS5: Building Transactional Full-Text Search in TursoDB",
+            "url": "https://turso.tech/blog/beyond-fts5"
+          },
+          {
+            "title": "SQLite Full-Text Search: FTS5 Virtual Tables and MATCH",
+            "url": "https://coddy.tech/docs/sqlite/full-text-search"
+          },
+          {
+            "title": "Full text search (redacted) APSW 3.53.4.0 documentation",
+            "url": "https://rogerbinns.github.io/apsw/textsearch.html"
+          },
+          {
+            "title": "SQLite Full-text Search - GeeksforGeeks",
+            "url": "https://www.geeksforgeeks.org/sqlite/sqlite-full-text-search/"
+          },
+          {
+            "title": "Useful Full Text Search (FTS) queries with sqlite in Python 3.7 - Floating Bytes",
+            "url": "https://saraswatmks.github.io/2020/04/sqlite-fts-search-queries.html"
+          },
+          {
+            "title": "Full-Text Search in SQLite with FTS5 (redacted) Mako",
+            "url": "https://mako.ai/guides/sqlite/full-text-search"
+          },
+          {
+            "title": "Full Text Search",
+            "url": "https://github.com/neverinfamous/sqlite-mcp-server/wiki/Full-Text-Search"
+          }
+        ]
+      },
+      "Based on the search results, here's what I found about SQLite FTS5 BM25 column weights:\n\n## Overview\n\nYou can influence the BM25 ranking by providing custom weights for columns and even for specific phrases in FTS5.\n\n## How Column Weights Work\n\nYou can call bm25(table) to get the score explicitly, or pass column weights like bm25(posts, 10.0, 1.0) to weight the title higher than the body.\n\nBy default, bm25 provides equal weights to all the fields, however you have the option to provide custom weight.\n\n## Example Usage\n\nYou can weight columns so a hit in the title counts more than one in the body. The bm25() function takes one weight per column. For example, bm25(articles_fts, 10.0, 1.0) would weight the title column 10x relative to the body.\n\n## Syntax\n\nThis function accepts table name along with weight of the columns respectively. The weights are provided in the order that the columns were declared when creating the FTS5 virtual table.\n\nThe weights are numerical values where higher numbers give more importance to matches in that column, allowing you to customize search relevance based on your specific needs."
+    ],
+    "durationSeconds": 5.458978375,
+    "searchCount": 1
+  },
+  "tool_use_id": "toolu_fixture000000000007",
+  "duration_ms": 5460
+}

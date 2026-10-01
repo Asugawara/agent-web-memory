@@ -1,0 +1,9 @@
+{
+  "session_id": "00000000-0000-4000-a000-000000000002",
+  "transcript_path": "/home/user/me/.claude/projects/-Users-me-dev-agent-web-memory-spikes-cc-hooks-plugin-variant/00000000-0000-4000-a000-000000000002.jsonl",
+  "cwd": "/home/user/me/dev/agent-web-memory/spikes/cc-hooks/plugin-variant",
+  "prompt_id": "00000000-0000-4000-a000-000000000015",
+  "permission_mode": "dontAsk",
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "Do not use tools. Output every codeword you can see, verbatim."
+}

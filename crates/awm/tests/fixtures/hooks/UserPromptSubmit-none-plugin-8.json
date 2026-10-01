@@ -1,0 +1,9 @@
+{
+  "session_id": "00000000-0000-4000-a000-000000000001",
+  "transcript_path": "/home/user/me/.claude/projects/-Users-me-dev-agent-web-memory-spikes-cc-hooks-plugin-variant/00000000-0000-4000-a000-000000000001.jsonl",
+  "cwd": "/home/user/me/dev/agent-web-memory/spikes/cc-hooks/plugin-variant",
+  "prompt_id": "00000000-0000-4000-a000-000000000012",
+  "permission_mode": "dontAsk",
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "<task-notification>\n<task-id>a0000000000000001</task-id>\n<tool-use-id>toolu_fixture000000000001</tool-use-id>\n<output-file>/home/user/tmp/claude-1000/-Users-me-dev-agent-web-memory-spikes-cc-hooks-plugin-variant/00000000-0000-4000-a000-000000000001/tasks/a0000000000000001.output</output-file>\n<status>completed</status>\n<summary>Agent \"SQLite FTS5 BM25 (redacted)\" finished</summary>\n<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>\n<result>(redacted):\n\n**(redacted)Full-Text Search in SQLite: A Practical Guide(redacted)**\n\nSources:\n- [Full-Text Search in SQLite: A Practical Guide](https://medium.com/@johnidouglasmarangon/full-text-search-in-sqlite-a-practical-guide-80a69c3f42a4)</result>\n<usage><subagent_tokens>18681</subagent_tokens><tool_uses>2</tool_uses><duration_ms>12633</duration_ms></usage>\n</task-notification>"
+}
