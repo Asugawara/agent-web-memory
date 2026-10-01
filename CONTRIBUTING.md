@@ -104,5 +104,5 @@ File an issue on GitHub with:
 - Steps to reproduce
 - Expected and actual behavior
 - Output of `awm --version`, `claude --version`, and `awm doctor`
-- Your OS and installation method (brew / cargo / install.sh)
+- Your OS and installation method (scripts/install-local.sh, cargo install --path crates/awm, or other)
 - Output of `awm report` (contains no personal data)

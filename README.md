@@ -61,10 +61,14 @@ awm purge --all
 | `awm log` | Show recent notes injected into your agents |
 | `awm stats` | Show statistics (records by tool and agent, quarantined count) |
 | `awm review` | Review and label notes you were shown |
-| `awm forget {query}` | Mark records matching a query for deletion |
-| `awm purge` | Permanently delete marked records |
+| `awm forget` | Delete records: `awm forget last`, `awm forget <url>`, `awm forget --id N`, `awm forget --ref REF` (asks first; `--yes` skips the question) |
+| `awm purge` | `awm purge --before YYYY-MM-DD` deletes everything older than the date; `awm purge --all` deletes the whole data directory |
 | `awm quarantine` | Mark records as unreliable |
 | `awm unquarantine` | Lift quarantine |
+| `awm calibrate` | Calibrate matching thresholds |
+| `awm setup` | Set up the plugin integration |
+| `awm export` | Export records |
+| `awm reindex` | Rebuild the search index |
 | `awm config` | Show or change settings (mode, channels, cutoffs) |
 | `awm doctor` | Check the installation |
 | `awm where` | Print data directory and database path |
@@ -100,9 +104,8 @@ To delete everything:
 
 3. **Remove the binary:**
    ```bash
-   rm ~/.local/bin/awm
+   bash scripts/uninstall-local.sh
    ```
-   (or `brew uninstall awm` if installed via Homebrew)
 
 ## FAQ
 
