@@ -13,6 +13,7 @@ use url::Url;
 /// Verbs that open an instruction; a sentence starting with one is dropped.
 pub const IMPERATIVE_VERBS: &[&str] = &[
     "ignore",
+    "do",
     "disregard",
     "forget",
     "run",
