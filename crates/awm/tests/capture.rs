@@ -507,3 +507,34 @@ fn a_marker_phrase_in_a_fetch_prompt_or_query_still_quarantines() {
     assert_eq!(quarantined(&opts, "toolu_q3"), 1);
     assert_eq!(quarantined(&opts, "toolu_q4"), 1);
 }
+
+#[test]
+fn codex_webrun_fixture_stores_a_codex_hook_search() {
+    let (_d, opts) = setup();
+    let out = capture::run(&fixture("codex-PostToolUse-webrun-search-1.json"), &opts).unwrap();
+    assert_eq!(out, CaptureOutcome::Captured);
+    let c = conn(&opts);
+    assert_eq!(
+        count(&c, "SELECT COUNT(*) FROM event WHERE tool = 'WebSearch'"),
+        1
+    );
+    assert!(count(&c, "SELECT COUNT(*) FROM result") >= 3);
+    assert!(count(&c, "SELECT COUNT(*) FROM result WHERE title IS NOT NULL") >= 3);
+    let (query, status, source): (String, String, String) = c
+        .query_row("SELECT query, status, source FROM event", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(query, "SQLite FTS5 bm25 column weights");
+    assert_eq!(status, "ok");
+    // The schema only allows 'hook'/'import': `Record::source` is `codex-hook`, stored as `hook`.
+    assert_eq!(source, "hook");
+    let rec = awm::record::Record::from_hook(
+        &fixture("codex-PostToolUse-webrun-search-1.json"),
+        NOW,
+        &[],
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(rec.source, "codex-hook");
+}

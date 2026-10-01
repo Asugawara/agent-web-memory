@@ -703,7 +703,7 @@ fn insert(tx: &Connection, rec: &Record, source_id: i64) -> anyhow::Result<bool>
             rec.status.as_db_str(),
             rec.summary,
             rec.match_text,
-            rec.source,
+            rec.db_source(),
             source_id,
             i64::from(rec.quarantine_reason.is_some()),
             rec.quarantine_reason,

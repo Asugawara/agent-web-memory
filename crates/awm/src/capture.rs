@@ -286,7 +286,7 @@ fn insert(conn: &mut Connection, rec: &Record) -> anyhow::Result<bool> {
             rec.status.as_db_str(),
             rec.summary,
             rec.match_text,
-            rec.source,
+            rec.db_source(),
             i64::from(rec.quarantine_reason.is_some()),
             rec.quarantine_reason,
         ],

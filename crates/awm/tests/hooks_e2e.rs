@@ -1012,3 +1012,45 @@ fn seed_latency_db() {
     }
     awm::matching::calibrate::run(&conn).unwrap();
 }
+
+#[test]
+fn a_codex_webrun_matches_an_earlier_search_through_the_query_channel() {
+    let home = Home::new();
+    let seed = patch(
+        fixture("codex-PostToolUse-webrun-search-1.json"),
+        &[
+            ("session_id", json!("sess-old")),
+            ("tool_use_id", json!("exec-old")),
+        ],
+    );
+    home.seed(&seed, DAY_MS);
+    let out = home.hook(
+        "post-tool",
+        &fixture("codex-PostToolUse-webrun-search-1.json"),
+    );
+    assert_eq!(out.code, Some(0));
+    assert!(out.context().starts_with("<awm-notes"), "{}", out.context());
+    assert_eq!(
+        home.text("SELECT mode || '/' || channel || '/' || hook FROM injection"),
+        "inject/query/PostToolUse"
+    );
+    // Pre-fetch has no URL to look at on Codex.
+    let pre = home.hook(
+        "pre-fetch",
+        &fixture("codex-PreToolUse-webrun-search-1.json"),
+    );
+    assert_silent(&pre);
+}
+
+#[test]
+fn codex_stop_and_session_start_record_nothing_and_print_nothing() {
+    let home = Home::new();
+    let stop = home.hook("capture", &fixture("codex-Stop-none-search-1.json"));
+    assert_silent(&stop);
+    let start = home.hook(
+        "session-start",
+        &fixture("codex-SessionStart-none-search-1.json"),
+    );
+    assert_silent(&start);
+    assert_eq!(home.count("SELECT COUNT(*) FROM event"), 0);
+}

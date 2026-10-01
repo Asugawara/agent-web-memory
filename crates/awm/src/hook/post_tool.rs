@@ -7,6 +7,7 @@ use crate::config::Mode;
 use crate::matching::{self, calibrate};
 use crate::normalize::norm_url;
 use crate::note::Channel;
+use crate::record::codex_query;
 
 const EVENT: &str = "PostToolUse";
 
@@ -51,6 +52,16 @@ fn handle(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
             let cutoff = calibrate::cutoff_query(conn)?;
             let hits = matching::query_channel(conn, query, cutoff, &opts)?;
             (Channel::Query, hits, query.to_string(), Some(cutoff))
+        }
+        // Codex web search: the query channel on the joined `q` values.
+        "webrun" => {
+            let query = codex_query(&input.tool_input).unwrap_or_default();
+            if !channels.query || query.is_empty() {
+                return Ok(Verdict::quiet("no_match"));
+            }
+            let cutoff = calibrate::cutoff_query(conn)?;
+            let hits = matching::query_channel(conn, &query, cutoff, &opts)?;
+            (Channel::Query, hits, query, Some(cutoff))
         }
         _ => return Ok(Verdict::quiet("no_match")),
     };
