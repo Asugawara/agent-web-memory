@@ -1,0 +1,14 @@
+{
+  "name": "agent-web-memory",
+  "owner": {
+    "name": "Asugawara"
+  },
+  "plugins": [
+    {
+      "name": "agent-web-memory",
+      "source": "./plugin",
+      "description": "Remembers your agents' web research and shows earlier findings before they repeat it. Local only.",
+      "version": "0.1.0"
+    }
+  ]
+}
