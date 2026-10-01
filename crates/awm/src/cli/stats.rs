@@ -395,12 +395,14 @@ struct Call {
     ok: bool,
     duration_ms: Option<i64>,
     summary_chars: i64,
+    /// `event.bytes`: size of the fetched page, which the fetch summariser read.
+    bytes: Option<i64>,
 }
 
 fn load_calls(conn: &Connection) -> anyhow::Result<Vec<Call>> {
     let mut st = conn.prepare(
         "SELECT id, tool_use_id, created_at, session_id, agent_id, tool, url_norm, query, status, \
-                duration_ms, COALESCE(length(summary), 0) \
+                duration_ms, COALESCE(length(summary), 0), bytes \
          FROM event ORDER BY created_at, id",
     )?;
     let rows = st.query_map([], |r| {
@@ -424,6 +426,7 @@ fn load_calls(conn: &Connection) -> anyhow::Result<Vec<Call>> {
             ok: r.get::<_, String>(8)? == "ok",
             duration_ms: r.get(9)?,
             summary_chars: r.get(10)?,
+            bytes: r.get(11)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -445,19 +448,26 @@ fn medians<'a>(calls: impl Iterator<Item = &'a Call>) -> (Option<i64>, Option<i6
     )
 }
 
-/// Time and tokens of repeated ok calls: (count, duration ms, summary chars).
-fn repeats(calls: &[Call], fetch: bool) -> (i64, i64, i64) {
+/// Median page size of the ok calls in `calls` that recorded more than 0 bytes.
+fn median_bytes<'a>(calls: impl Iterator<Item = &'a Call>) -> Option<i64> {
+    let mut bytes: Vec<i64> = calls.filter_map(|c| c.bytes).filter(|b| *b > 0).collect();
+    super::percentile(&mut bytes, 50.0)
+}
+
+/// Time, tokens and page bytes of repeated ok calls: (count, duration ms, summary chars, bytes).
+fn repeats(calls: &[Call], fetch: bool) -> (i64, i64, i64, i64) {
     let mut seen = HashSet::new();
-    let (mut n, mut ms, mut chars) = (0, 0, 0);
+    let (mut n, mut ms, mut chars, mut bytes) = (0, 0, 0, 0);
     for c in calls.iter().filter(|c| c.ok && c.is_fetch == fetch) {
         let Some(key) = &c.key else { continue };
         if !seen.insert(key.clone()) {
             n += 1;
             ms += c.duration_ms.unwrap_or(0);
             chars += c.summary_chars;
+            bytes += c.bytes.unwrap_or(0).max(0);
         }
     }
-    (n, ms, chars)
+    (n, ms, chars, bytes)
 }
 
 /// Estimated savings. Counterfactual: an avoided item is a shown note whose call was not repeated
@@ -506,10 +516,12 @@ fn savings(conn: &Connection, since: Option<&str>) -> anyhow::Result<Value> {
     // Per tool: median over all ok events, used when an item has no history of its own.
     let fallback = |fetch: bool| medians(calls.iter().filter(|c| c.ok && c.is_fetch == fetch));
     let (fb_fetch, fb_search) = (fallback(true), fallback(false));
+    let fb_bytes = median_bytes(calls.iter().filter(|c| c.ok && c.is_fetch));
 
     let (mut avoided, mut followed) = (0_i64, 0_i64);
     let (mut ms, mut chars) = (0.0_f64, 0.0_f64);
     let (mut conf_n, mut conf_ms, mut conf_chars) = (0_i64, 0.0_f64, 0.0_f64);
+    let (mut bytes, mut conf_bytes) = (0_i64, 0_i64);
     let mut overhead = 0.0_f64;
     for (id, at, session, agent, tool_use_id, rendered) in &injections {
         overhead += *rendered as f64 / 4.0;
@@ -536,6 +548,19 @@ fn savings(conn: &Connection, since: Option<&str>) -> anyhow::Result<Value> {
                 .map(|v| v.iter().copied().filter(|e| e.at <= *at))
                 .into_iter()
                 .flatten();
+            // Only a fetch has a page the summariser would have read; a search adds 0.
+            let page = if src.is_fetch {
+                let own = median_bytes(
+                    by_key
+                        .get(key.as_str())
+                        .map(|v| v.iter().copied().filter(|e| e.at <= *at))
+                        .into_iter()
+                        .flatten(),
+                );
+                own.or(fb_bytes).unwrap_or(0)
+            } else {
+                0
+            };
             let (d, c) = match medians(past) {
                 (None, None) => {
                     if src.is_fetch {
@@ -553,6 +578,7 @@ fn savings(conn: &Connection, since: Option<&str>) -> anyhow::Result<Value> {
                 labelled2.contains(&(*id, position)),
                 d.unwrap_or(0) as f64,
                 c.unwrap_or(0) as f64 / 4.0,
+                page,
             ));
         }
         if recalled {
@@ -560,19 +586,29 @@ fn savings(conn: &Connection, since: Option<&str>) -> anyhow::Result<Value> {
             continue;
         }
         avoided += 1;
-        for (two, d, t) in costs {
+        for (two, d, t, page) in costs {
             ms += d;
             chars += t;
+            bytes += page;
             if two {
+                conf_bytes += page;
                 conf_n += 1;
                 conf_ms += d;
                 conf_chars += t;
             }
         }
     }
-    let (rf_n, rf_ms, rf_chars) = repeats(&calls, true);
-    let (rs_n, rs_ms, rs_chars) = repeats(&calls, false);
-    let ceiling = |n: i64, ms: i64, chars: i64| json!({"count": n, "duration_ms": ms, "tokens": chars as f64 / 4.0});
+    let (rf_n, rf_ms, rf_chars, rf_bytes) = repeats(&calls, true);
+    let (rs_n, rs_ms, rs_chars, rs_bytes) = repeats(&calls, false);
+    let ceiling = |n: i64, ms: i64, chars: i64, bytes: i64| {
+        json!({
+            "count": n,
+            "duration_ms": ms,
+            "tokens": chars as f64 / 4.0,
+            "bytes": bytes,
+            "summariser_tokens": bytes / 4,
+        })
+    };
     Ok(json!({
         "since": since,
         "shown": injections.len(),
@@ -582,10 +618,18 @@ fn savings(conn: &Connection, since: Option<&str>) -> anyhow::Result<Value> {
         "tokens_saved": chars,
         "overhead_tokens": overhead,
         "net_tokens": chars - overhead,
-        "confirmed": {"items": conf_n, "time_saved_ms": conf_ms, "tokens_saved": conf_chars},
+        "est_bytes_not_fetched": bytes,
+        "est_summariser_tokens": bytes / 4,
+        "confirmed": {
+            "items": conf_n,
+            "time_saved_ms": conf_ms,
+            "tokens_saved": conf_chars,
+            "est_bytes_not_fetched": conf_bytes,
+            "est_summariser_tokens": conf_bytes / 4,
+        },
         "ceiling": {
-            "repeat_fetches": ceiling(rf_n, rf_ms, rf_chars),
-            "repeat_searches": ceiling(rs_n, rs_ms, rs_chars),
+            "repeat_fetches": ceiling(rf_n, rf_ms, rf_chars, rf_bytes),
+            "repeat_searches": ceiling(rs_n, rs_ms, rs_chars, rs_bytes),
         },
     }))
 }
@@ -605,6 +649,15 @@ fn kilo(tokens: f64) -> String {
     format!("{:.1}k", tokens / 1000.0)
 }
 
+/// Decimal KB or MB with one decimal.
+fn size(bytes: f64) -> String {
+    if bytes >= 1_000_000.0 {
+        format!("{:.1} MB", bytes / 1_000_000.0)
+    } else {
+        format!("{:.1} KB", bytes / 1000.0)
+    }
+}
+
 fn savings_text(v: &Value) -> String {
     let since = v["since"].as_str().map(|d| format!(" since {d}"));
     let mut o = String::from("savings (an estimate of what did not happen, not a measurement):\n");
@@ -618,6 +671,7 @@ fn savings_text(v: &Value) -> String {
     o.push_str("  followed up: shown, and the agent called an item anyway\n");
     o.push_str("  time saved: per avoided item, median duration of past ok calls of the same url or normalised query (fallback: all ok calls of that tool)\n");
     o.push_str("  tokens saved: the same median of summary length, chars / 4; overhead: rendered chars / 4 of all shown\n");
+    o.push_str("  page bytes not fetched: per avoided fetch, median bytes of past ok fetches of the same url (fallback: all ok fetches); summariser tokens = bytes / 4, an upper bound (HTML, read by the fetch summariser, not by the main model)\n");
     o.push_str("  confirmed: avoided items you labelled 2 in awm review\n");
     if v["shown"].as_i64() == Some(0) {
         o.push_str("No notes shown yet.\n");
@@ -643,10 +697,16 @@ fn savings_text(v: &Value) -> String {
             kilo(num(v, &["net_tokens"]))
         ));
         o.push_str(&format!(
-            "  confirmed:        {} items, {}, {} tokens\n",
+            "  est. page bytes not fetched: {} (summariser tokens <= {})\n",
+            size(num(v, &["est_bytes_not_fetched"])),
+            kilo(num(v, &["est_summariser_tokens"]))
+        ));
+        o.push_str(&format!(
+            "  confirmed:        {} items, {}, {} tokens, {} page bytes\n",
             num(v, &["confirmed", "items"]) as i64,
             minutes(num(v, &["confirmed", "time_saved_ms"])),
-            kilo(num(v, &["confirmed", "tokens_saved"]))
+            kilo(num(v, &["confirmed", "tokens_saved"])),
+            size(num(v, &["confirmed", "est_bytes_not_fetched"]))
         ));
     }
     for (label, k) in [
@@ -654,10 +714,11 @@ fn savings_text(v: &Value) -> String {
         ("repeat searches", "repeat_searches"),
     ] {
         o.push_str(&format!(
-            "  ceiling, {label}: {} ({}, {} tokens; whole record, ignores --since)\n",
+            "  ceiling, {label}: {} ({}, {} tokens, {} page bytes; whole record, ignores --since)\n",
             num(v, &["ceiling", k, "count"]) as i64,
             minutes(num(v, &["ceiling", k, "duration_ms"])),
-            kilo(num(v, &["ceiling", k, "tokens"]))
+            kilo(num(v, &["ceiling", k, "tokens"])),
+            size(num(v, &["ceiling", k, "bytes"]))
         ));
     }
     o
