@@ -14,6 +14,46 @@ fn defaults_match_the_plan() {
     assert_eq!(c.hooks.deadline_ms, 500);
     assert!(c.capture.exclude_hosts.is_empty() && c.capture.redact_terms.is_empty());
     assert_eq!(c.review.daily_limit, 10);
+    assert_eq!(c.pricing.currency, "USD");
+    assert_eq!(c.pricing.summariser_input_per_mtok, 1.0);
+    assert_eq!(c.pricing.summariser_output_per_mtok, 5.0);
+    assert_eq!(c.pricing.search_fee_per_call, 0.01);
+    assert_eq!(c.pricing.main_input_per_mtok, 0.0);
+    assert_eq!(c.get("pricing.search_fee_per_call").unwrap(), "0.01");
+}
+
+#[test]
+fn pricing_file_overrides_two_rates_and_keeps_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "[pricing]\nsummariser_input_per_mtok = 0.8\nmain_input_per_mtok = 3\n",
+    )
+    .unwrap();
+    let c = config::load(&path).unwrap();
+    assert_eq!(c.pricing.summariser_input_per_mtok, 0.8);
+    assert_eq!(c.pricing.main_input_per_mtok, 3.0);
+    assert_eq!(c.pricing.summariser_output_per_mtok, 5.0);
+    assert_eq!(c.pricing.currency, "USD");
+    c.save(&path).unwrap();
+    assert_eq!(config::load(&path).unwrap(), c);
+}
+
+#[test]
+fn negative_pricing_is_a_config_error_naming_the_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "[pricing]\nsearch_fee_per_call = -0.01\n").unwrap();
+    let err = format!("{:#}", config::load(&path).unwrap_err());
+    assert!(err.contains("search_fee_per_call"), "{err}");
+    let mut c = Config::default();
+    let err = c.set("pricing.main_input_per_mtok", "-1").unwrap_err();
+    assert!(
+        err.to_string().contains("pricing.main_input_per_mtok"),
+        "{err}"
+    );
+    assert_eq!(c, Config::default());
 }
 
 #[test]

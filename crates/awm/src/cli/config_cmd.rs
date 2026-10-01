@@ -41,6 +41,11 @@ const KEYS: &[&str] = &[
     "capture.exclude_hosts",
     "capture.redact_terms",
     "review.daily_limit",
+    "pricing.currency",
+    "pricing.summariser_input_per_mtok",
+    "pricing.summariser_output_per_mtok",
+    "pricing.search_fee_per_call",
+    "pricing.main_input_per_mtok",
 ];
 
 pub fn run(args: Args) -> anyhow::Result<()> {
