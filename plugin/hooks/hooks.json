@@ -1,0 +1,11 @@
+{"hooks": {
+  "SessionStart": [{"matcher": "startup", "hooks": [
+    {"type": "command", "command": "sh ${CLAUDE_PLUGIN_ROOT}/hooks/awm-hook session-start", "timeout": 5}]}],
+  "UserPromptSubmit": [{"hooks": [
+    {"type": "command", "command": "sh ${CLAUDE_PLUGIN_ROOT}/hooks/awm-hook prompt", "timeout": 5}]}],
+  "PreToolUse": [{"matcher": "WebFetch", "hooks": [
+    {"type": "command", "command": "sh ${CLAUDE_PLUGIN_ROOT}/hooks/awm-hook pre-fetch", "timeout": 5}]}],
+  "PostToolUse": [{"matcher": "WebSearch|WebFetch", "hooks": [
+    {"type": "command", "command": "sh ${CLAUDE_PLUGIN_ROOT}/hooks/awm-hook post-tool", "timeout": 5},
+    {"type": "command", "command": "sh ${CLAUDE_PLUGIN_ROOT}/hooks/awm-hook capture", "async": true, "timeout": 30}]}]
+}}

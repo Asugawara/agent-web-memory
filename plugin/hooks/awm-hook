@@ -1,0 +1,15 @@
+#!/bin/sh
+# agent-web-memory hook shim: run awm if installed, otherwise stay silent.
+ev="$1"
+for c in "$AWM_BIN" "$(command -v awm 2>/dev/null)" "$HOME/.local/bin/awm" "$HOME/.cargo/bin/awm" \
+         /opt/homebrew/bin/awm /usr/local/bin/awm /home/linuxbrew/.linuxbrew/bin/awm; do
+  if [ -n "$c" ] && [ -x "$c" ]; then exec "$c" hook "$ev" --plugin-version 0.1.0; fi
+done
+if [ "$ev" = "session-start" ]; then
+  case "$(uname -s)" in
+    Darwin) line='brew install Asugawara/tap/awm' ;;
+    *) line='curl -fsSL https://github.com/Asugawara/agent-web-memory/releases/latest/download/install.sh | sh' ;;
+  esac
+  printf '{"systemMessage":"agent-web-memory: the awm binary is not installed. Install it with: %s   then run: awm init"}\n' "$line"
+fi
+exit 0
