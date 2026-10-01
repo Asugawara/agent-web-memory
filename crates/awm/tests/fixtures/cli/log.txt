@@ -1,0 +1,4 @@
+2026-09-21 14:13:24  WebSearch  main      ok           rust clap derive subcommand example
+2026-09-21 14:13:23  WebFetch   subagent  dead_end     https://docs.rs/rusqlite/latest/
+2026-09-21 14:13:22  WebFetch   main      ok           https://sqlite.org/fts5.html
+2026-09-21 14:13:21  WebSearch  main      ok           sqlite fts5 bm25 column weights

@@ -1,0 +1,15 @@
+latency:
+  capture/main:
+    deadline_share: 0.0%
+    runs: 1
+    search_ms_p50: -
+    search_ms_p95: -
+    total_ms_p50: 30
+    total_ms_p95: 30
+  post-tool/main:
+    deadline_share: 33.3%
+    runs: 3
+    search_ms_p50: 3
+    search_ms_p95: 5
+    total_ms_p50: 20
+    total_ms_p95: 90

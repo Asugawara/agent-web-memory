@@ -1,0 +1,26 @@
+injections:
+  accepted: 1
+  changed_next_step: 1
+  harmful: 0
+  per_note_precision:
+    url:
+      labelled: 1
+      loose: 100.0%
+      strict: 100.0%
+  refetch_after_deny:
+    denies: 0
+    refetched: 0
+    share: -
+  rendered_chars:
+    p50: 300
+    p95: 300
+  shown: 1
+  shown_by_agent_kind:
+    main: 1
+  shown_by_channel:
+    url: 1
+  shown_by_day:
+    2026-09-21: 1
+  would_have_shown: 1
+  would_have_shown_by_channel:
+    query: 1
