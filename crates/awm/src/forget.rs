@@ -28,7 +28,7 @@ use crate::db::{self, Role, VersionCheck};
 use crate::normalize::norm_url;
 use crate::note::{Status, Tool};
 use crate::paths;
-use crate::record::{sha256_hex, Record};
+use crate::record::{sha256_hex, Agent, Record};
 
 /// Replaces a forgotten URL inside text that is kept (summaries, queries, titles).
 const SCRUBBED: &str = "[forgotten url]";
@@ -794,6 +794,7 @@ fn rewrite_event(conn: &Connection, id: i64, u: &UrlTarget) -> anyhow::Result<()
         summary: summary.clone(),
         match_text: String::new(),
         source: String::new(),
+        agent: Agent::Claude,
         results,
         quarantine_reason: None,
     };

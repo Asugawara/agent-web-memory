@@ -56,7 +56,7 @@ pub fn write_all(conn: &Connection, w: &mut dyn Write) -> anyhow::Result<usize> 
     let mut st = conn.prepare(
         "SELECT id, tool_use_id, tool, session_id, agent_id, agent_type, cwd_hash, created_at, \
                 query, url, url_norm, fetch_prompt, http_code, bytes, duration_ms, status, \
-                summary, source, quarantined, quarantine_reason \
+                summary, source, quarantined, quarantine_reason, agent \
          FROM event ORDER BY id",
     )?;
     let mut rows = st.query([])?;
@@ -92,6 +92,7 @@ pub fn write_all(conn: &Connection, w: &mut dyn Write) -> anyhow::Result<usize> 
             "status": r.get::<_, String>(15)?,
             "summary": r.get::<_, Option<String>>(16)?,
             "source": r.get::<_, String>(17)?,
+            "agent": r.get::<_, String>(20)?,
             "quarantined": r.get::<_, i64>(18)? != 0,
             "quarantine_reason": r.get::<_, Option<String>>(19)?,
             "results": res,

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Database migration
+- **Schema version 2** (`0002_event_agent`): adds `event.agent` (`claude` or `codex`); existing records become `claude`. Run `awm doctor` once after upgrading: it writes a backup `awm.db.bak-v1` next to the database and migrates. Until then hooks record and show nothing, and other commands ask you to run `awm doctor`. Rollback: install the previous `awm`, close every agent session, delete `awm.db-wal` and `awm.db-shm` if present, and copy `awm.db.bak-v1` over `awm.db`.
+
 ### Added
 - **Record web research**: Every WebSearch and WebFetch call in Claude Code (main agent and subagents) is recorded to a local SQLite database.
 - **Exact URL matching**: When an agent fetches a URL it or a sibling subagent fetched before, the earlier result is shown (precision 1.00).

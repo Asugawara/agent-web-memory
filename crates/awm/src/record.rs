@@ -35,6 +35,24 @@ pub struct ResultRow {
     pub title: Option<String>,
 }
 
+/// `event.agent`: the coding agent that made the call (migration 0002).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Agent {
+    #[default]
+    Claude,
+    Codex,
+}
+
+impl Agent {
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Agent::Claude => "claude",
+            Agent::Codex => "codex",
+        }
+    }
+}
+
 /// Mirrors the `event` columns plus its `result` rows.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Record {
@@ -58,6 +76,9 @@ pub struct Record {
     /// `hook`, `import`, `codex-hook` or `codex-rollout`. The database stores
     /// [`Record::db_source`].
     pub source: String,
+    /// Spool files written before migration 0002 have no `agent`; they are Claude's.
+    #[serde(default)]
+    pub agent: Agent,
     pub results: Vec<ResultRow>,
     /// Set by capture; not read from the payload.
     pub quarantine_reason: Option<String>,
@@ -139,6 +160,7 @@ struct Parts<'a> {
     cwd: &'a str,
     created_at: i64,
     source: &'a str,
+    agent: Agent,
     input: &'a Value,
     response: &'a Value,
     duration_ms: Option<i64>,
@@ -180,6 +202,11 @@ impl Record {
                 cwd: text_of(payload.get("cwd")).unwrap_or(""),
                 created_at: now_ms,
                 source: "hook",
+                agent: if is_codex_payload(payload) {
+                    Agent::Codex
+                } else {
+                    Agent::Claude
+                },
                 input: payload.get("tool_input").unwrap_or(&null),
                 response,
                 duration_ms,
@@ -221,6 +248,7 @@ impl Record {
                 cwd: &ctx.cwd,
                 created_at: ctx.created_at_ms,
                 source: "import",
+                agent: Agent::Claude,
                 input: tool_use.get("input").unwrap_or(&null),
                 response,
                 duration_ms: duration_of(response),
@@ -297,6 +325,11 @@ impl Record {
     }
 }
 
+/// A hook payload from Codex: tool `webrun`, or a key Claude Code never sends (`turn_id`).
+fn is_codex_payload(payload: &Value) -> bool {
+    text_of(payload.get("tool_name")) == Some("webrun") || payload.get("turn_id").is_some()
+}
+
 fn is_refusal(summary: &str) -> bool {
     let head = first_chars(summary.trim_start(), REFUSAL_WINDOW)
         .to_lowercase()
@@ -363,6 +396,7 @@ fn build(p: Parts, terms: &[String]) -> Option<Record> {
         summary: None,
         match_text: String::new(),
         source: p.source.to_string(),
+        agent: p.agent,
         results: Vec::new(),
         quarantine_reason: None,
     };
@@ -465,6 +499,7 @@ fn codex_base(
         summary: None,
         match_text: String::new(),
         source: source.to_string(),
+        agent: Agent::Codex,
         results: Vec::new(),
         quarantine_reason: None,
     }
