@@ -1,0 +1,16 @@
+# Pass lines of `awm bench-check` (plan-v2 §3.6), bench-equivalent mode.
+# Product-default numbers are printed, not gated.
+
+[url]
+strict_min = 0.95      # awm-url strict precision
+
+[query]
+strict_min = 0.45      # awm-query strict precision at the calibrated cutoff
+loose_min = 0.60       # awm-query loose precision
+nothing_max = 0.60     # share of awm-query groups that return nothing
+
+[unlabelled]
+max = 0.20             # above this share of unlabelled returned rows: "needs labels", exit 2
+
+[latency]
+search_p95_ms_max = 50 # printed with --latency, not gated
