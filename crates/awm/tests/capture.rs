@@ -4,6 +4,7 @@ use std::time::Duration;
 use awm::capture::{self, CaptureOpts, CaptureOutcome};
 use awm::config::{Config, Mode};
 use awm::db::{self, Role};
+use awm::record::{Agent, Record};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
@@ -77,6 +78,10 @@ fn websearch_fixture_stores_ten_results_and_string_summary() {
     assert_eq!(status, "ok");
     assert_eq!(dur, 5460);
     assert_eq!(hooks, 1);
+    assert_eq!(
+        count(&c, "SELECT COUNT(*) FROM event WHERE agent = 'claude'"),
+        1
+    );
 }
 
 #[test]
@@ -426,7 +431,7 @@ fn drain_spool_stops_at_the_first_locked_file() {
     let (_d, opts) = setup();
     let dir = opts.data_dir.join("spool");
     std::fs::create_dir_all(&dir).unwrap();
-    let rec = awm::record::Record::from_hook(
+    let rec = Record::from_hook(
         &fetch_payload("toolu_a", "https://example.com/a", 200, "ok"),
         NOW,
         &[],
@@ -520,21 +525,69 @@ fn codex_webrun_fixture_stores_a_codex_hook_search() {
     );
     assert!(count(&c, "SELECT COUNT(*) FROM result") >= 3);
     assert!(count(&c, "SELECT COUNT(*) FROM result WHERE title IS NOT NULL") >= 3);
-    let (query, status, source): (String, String, String) = c
-        .query_row("SELECT query, status, source FROM event", [], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    let (query, status, source, agent): (String, String, String, String) = c
+        .query_row("SELECT query, status, source, agent FROM event", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
         })
         .unwrap();
     assert_eq!(query, "SQLite FTS5 bm25 column weights");
     assert_eq!(status, "ok");
     // The schema only allows 'hook'/'import': `Record::source` is `codex-hook`, stored as `hook`.
+    // `event.agent` tells the Codex row apart.
     assert_eq!(source, "hook");
-    let rec = awm::record::Record::from_hook(
-        &fixture("codex-PostToolUse-webrun-search-1.json"),
-        NOW,
-        &[],
-    )
-    .unwrap()
-    .unwrap();
+    assert_eq!(agent, "codex");
+    let rec = Record::from_hook(&fixture("codex-PostToolUse-webrun-search-1.json"), NOW, &[])
+        .unwrap()
+        .unwrap();
     assert_eq!(rec.source, "codex-hook");
+    assert_eq!(rec.agent, Agent::Codex);
+}
+
+#[test]
+fn hook_payload_agent_follows_the_payload() {
+    let claude = fixture("PostToolUse-WebSearch-plugin-2.json");
+    let rec = Record::from_hook(&claude, NOW, &[]).unwrap().unwrap();
+    assert_eq!(rec.agent, Agent::Claude);
+    // A Codex-only key marks a Codex payload even for a Claude tool name.
+    let mut with_turn = claude.clone();
+    with_turn["turn_id"] = json!("turn-1");
+    let rec = Record::from_hook(&with_turn, NOW, &[]).unwrap().unwrap();
+    assert_eq!(rec.agent, Agent::Codex);
+}
+
+/// Writes `rec` as a spool file, with `edit` applied to its JSON.
+fn write_spool(opts: &CaptureOpts, name: &str, rec: &Record, edit: impl FnOnce(&mut Value)) {
+    let dir = opts.data_dir.join("spool");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut v = serde_json::to_value(rec).unwrap();
+    edit(&mut v);
+    std::fs::write(dir.join(name), v.to_string()).unwrap();
+}
+
+#[test]
+fn spooled_records_keep_their_agent_and_old_spool_files_are_claude() {
+    let (_d, opts) = setup();
+    let codex = Record::from_hook(&fixture("codex-PostToolUse-webrun-search-1.json"), NOW, &[])
+        .unwrap()
+        .unwrap();
+    write_spool(&opts, &format!("{NOW}-codex.json"), &codex, |_| {});
+    // A spool file written before migration 0002 has no `agent` key.
+    let claude = Record::from_hook(&fixture("PostToolUse-WebSearch-plugin-2.json"), NOW, &[])
+        .unwrap()
+        .unwrap();
+    write_spool(&opts, &format!("{}-old.json", NOW + 1), &claude, |v| {
+        v.as_object_mut().unwrap().remove("agent");
+    });
+    assert_eq!(capture::drain_spool(&opts).unwrap(), 2);
+    let c = conn(&opts);
+    let agent_of = |id: &str| -> String {
+        c.query_row(
+            "SELECT agent FROM event WHERE tool_use_id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(agent_of(&codex.tool_use_id), "codex");
+    assert_eq!(agent_of(&claude.tool_use_id), "claude");
 }

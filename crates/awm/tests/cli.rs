@@ -608,6 +608,91 @@ fn export_has_a_header_and_one_line_per_record() {
 }
 
 #[test]
+fn codex_rows_are_tagged_in_log_stats_and_export() {
+    let env = Env::new();
+    seed_basic(&env);
+    env.conn()
+        .execute("UPDATE event SET agent = 'codex' WHERE id = 4", [])
+        .unwrap();
+    let log = env.awm(&["log"]).ok().to_string();
+    let lines: Vec<&str> = log.lines().collect();
+    assert!(
+        lines[0].ends_with("  [codex] rust clap derive subcommand example"),
+        "{log}"
+    );
+    assert!(lines[1..].iter().all(|l| !l.contains('[')), "{log}");
+    let json: Value =
+        serde_json::from_str(env.awm(&["log", "--json", "--limit", "1"]).ok().trim()).unwrap();
+    assert_eq!(json["coding_agent"], "codex");
+    assert_eq!(json["agent"], "main");
+
+    assert!(env
+        .awm(&["stats"])
+        .ok()
+        .starts_with("by agent: claude 3, codex 1\n"));
+    let v: Value = serde_json::from_str(env.awm(&["stats", "--json"]).ok()).unwrap();
+    assert_eq!(v["by_agent"], json!({"claude": 3, "codex": 1}));
+
+    let export = env.awm(&["export"]).ok().to_string();
+    let agents: Vec<String> = export
+        .lines()
+        .skip(1)
+        .map(|l| serde_json::from_str::<Value>(l).unwrap()["agent"].to_string())
+        .collect();
+    assert_eq!(
+        agents,
+        ["\"claude\"", "\"claude\"", "\"claude\"", "\"codex\""]
+    );
+}
+
+#[test]
+fn doctor_upgrades_a_v1_database_and_other_commands_wait_for_it() {
+    let env = Env::new();
+    std::fs::remove_file(env.db_path()).unwrap();
+    {
+        let mut conn = db::open(&env.db_path(), Role::Cli).unwrap();
+        db::migrate_with(&mut conn, &db::MIGRATIONS[..1]).unwrap();
+        conn.execute(
+            "INSERT INTO event (tool_use_id, tool, session_id, cwd_hash, created_at, query, \
+             status, match_text, source) VALUES ('tu1', 'WebSearch', 's1', 'h', 1, 'q', 'ok', \
+             'q', 'hook')",
+            [],
+        )
+        .unwrap();
+    }
+    let log = env.awm(&["log"]);
+    assert_ne!(log.code, Some(0));
+    assert!(
+        log.stderr
+            .contains("database needs an upgrade. Run: awm doctor"),
+        "{}",
+        log.stderr
+    );
+
+    let doctor = env.awm(&["doctor"]);
+    let bak = env.awm_home().join("awm.db.bak-v1");
+    assert!(bak.is_file());
+    assert!(
+        doctor
+            .stdout
+            .contains("database upgraded from schema version 1 to 2 (backup: ")
+            && doctor.stdout.contains("/awm.db.bak-v1)"),
+        "{}",
+        doctor.stdout
+    );
+    let again = env.awm(&["doctor"]);
+    assert!(
+        again
+            .stdout
+            .contains("database schema version 2 is current"),
+        "{}",
+        again.stdout
+    );
+    let json: Value = serde_json::from_str(env.awm(&["log", "--json"]).ok().trim()).unwrap();
+    assert_eq!(json["coding_agent"], "claude");
+}
+
+#[test]
 fn reindex_rebuilds_the_search_index() {
     let env = Env::new();
     seed_basic(&env);

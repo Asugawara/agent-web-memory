@@ -15,8 +15,14 @@ use sha2::{Digest, Sha256};
 
 /// Embedded migrations: (version, name, SQL). Versions start at 1 and increase
 /// by one. There are no down migrations.
-pub const MIGRATIONS: &[(u32, &str, &str)] =
-    &[(1, "0001_init", include_str!("../migrations/0001_init.sql"))];
+pub const MIGRATIONS: &[(u32, &str, &str)] = &[
+    (1, "0001_init", include_str!("../migrations/0001_init.sql")),
+    (
+        2,
+        "0002_event_agent",
+        include_str!("../migrations/0002_event_agent.sql"),
+    ),
+];
 
 /// Who opens the database; decides creation and `busy_timeout`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +108,14 @@ pub fn open(path: &Path, role: Role) -> anyhow::Result<Connection> {
 /// Creates an empty file with mode 0600 if `path` does not exist yet.
 /// SQLite treats an empty file as an empty database.
 fn create_private_file(path: &Path) -> anyhow::Result<()> {
+    match create_new_private_file(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        r => r.with_context(|| format!("cannot create {}", path.display())),
+    }
+}
+
+/// Creates an empty file with mode 0600; fails if `path` already exists.
+fn create_new_private_file(path: &Path) -> std::io::Result<()> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -109,17 +123,12 @@ fn create_private_file(path: &Path) -> anyhow::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    match opts.open(path) {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("cannot create {}", path.display())),
-    }
+    opts.open(path)?;
     // The umask can only remove bits; set the mode explicitly so it is exactly 0600.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("cannot set mode 0600 on {}", path.display()))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
 }
@@ -225,7 +234,7 @@ pub fn migrate_with(
     }
     tx.commit()?;
 
-    quick_check(conn)?;
+    quick_check(conn, backup.as_deref())?;
     Ok(MigrateOutcome {
         from,
         to: binary_version(migrations),
@@ -291,47 +300,65 @@ fn holds_data(conn: &Connection, from: u32) -> anyhow::Result<bool> {
         .is_some())
 }
 
-/// Writes `{db}.bak-v{from}` with `VACUUM INTO`. The copy goes to a 0600
-/// temporary file first, is synced, then renamed over any older backup.
+/// Writes `{db}.bak-v{from}` with `VACUUM INTO`. The copy goes to a new 0600
+/// temporary file whose name is unique to this process and call
+/// (`{db}.bak-v{from}.tmp-{pid}-{nanos}`, created with `create_new`), is synced,
+/// then renamed over any older backup; on unix the directory is synced after the
+/// rename so the new name survives a power cut.
 fn backup(conn: &Connection, from: u32) -> anyhow::Result<PathBuf> {
     let db = conn
         .path()
         .filter(|p| !p.is_empty())
         .ok_or_else(|| anyhow!("cannot back up a database that has no file"))?;
     let target = PathBuf::from(format!("{db}.bak-v{from}"));
-    let tmp = PathBuf::from(format!("{db}.bak-v{from}.tmp"));
-    match std::fs::remove_file(&tmp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("cannot remove {}", tmp.display())),
-    }
-    create_private_file(&tmp)?;
-    let tmp_str = tmp
-        .to_str()
-        .ok_or_else(|| anyhow!("backup path is not valid UTF-8: {}", tmp.display()))?;
-    let written = conn
-        .execute("VACUUM INTO ?1", [tmp_str])
-        .with_context(|| format!("backup to {} failed", tmp.display()));
-    if let Err(e) = written {
+    let nanos = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
+    let tmp = PathBuf::from(format!(
+        "{db}.bak-v{from}.tmp-{}-{nanos}",
+        std::process::id()
+    ));
+    create_new_private_file(&tmp).with_context(|| format!("cannot create {}", tmp.display()))?;
+    let result = write_backup(conn, &tmp, &target);
+    if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
-        return Err(e);
     }
-    std::fs::File::open(&tmp)
-        .and_then(|f| f.sync_all())
-        .with_context(|| format!("cannot sync {}", tmp.display()))?;
-    std::fs::rename(&tmp, &target)
-        .with_context(|| format!("cannot move backup to {}", target.display()))?;
+    result?;
     Ok(target)
 }
 
-fn quick_check(conn: &Connection) -> anyhow::Result<()> {
+fn write_backup(conn: &Connection, tmp: &Path, target: &Path) -> anyhow::Result<()> {
+    let tmp_str = tmp
+        .to_str()
+        .ok_or_else(|| anyhow!("backup path is not valid UTF-8: {}", tmp.display()))?;
+    conn.execute("VACUUM INTO ?1", [tmp_str])
+        .with_context(|| format!("backup to {} failed", tmp.display()))?;
+    std::fs::File::open(tmp)
+        .and_then(|f| f.sync_all())
+        .with_context(|| format!("cannot sync {}", tmp.display()))?;
+    std::fs::rename(tmp, target)
+        .with_context(|| format!("cannot move backup to {}", target.display()))?;
+    #[cfg(unix)]
+    if let Some(dir) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::File::open(dir)
+            .and_then(|f| f.sync_all())
+            .with_context(|| format!("cannot sync directory {}", dir.display()))?;
+    }
+    Ok(())
+}
+
+/// Runs after `COMMIT`: a failure means the migration is already applied.
+fn quick_check(conn: &Connection, backup: Option<&Path>) -> anyhow::Result<()> {
     let mut st = conn.prepare("PRAGMA quick_check")?;
     let rows: Vec<String> = st
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<Result<_, _>>()?;
     if rows != ["ok"] {
+        let restore = match backup {
+            Some(b) => format!("the backup taken before migrating is {}", b.display()),
+            None => "no backup was taken (the database held no data)".to_string(),
+        };
         bail!(
-            "PRAGMA quick_check failed after migration: {}",
+            "PRAGMA quick_check failed after migration (the migration is already committed; \
+             {restore}): {}",
             rows.join("; ")
         );
     }

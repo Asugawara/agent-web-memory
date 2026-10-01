@@ -46,6 +46,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             for (k, val) in map {
                 if k == "savings" {
                     out.push_str(&savings_text(val));
+                } else if k == "by_agent" {
+                    out.push_str(&by_agent_text(val));
                 } else {
                     let mut one = Map::new();
                     one.insert(k.clone(), val.clone());
@@ -64,6 +66,7 @@ pub fn collect(conn: &Connection, args: &Args) -> anyhow::Result<Value> {
         args.latency || args.import || args.status || args.value || args.followups || args.savings;
     let mut out = Map::new();
     if !any {
+        out.insert("by_agent".into(), by_agent(conn)?);
         out.insert("injections".into(), injections(conn)?);
     }
     if args.latency {
@@ -101,6 +104,29 @@ fn grouped(conn: &Connection, sql: &str) -> anyhow::Result<Value> {
         m.insert(k, json!(n));
     }
     Ok(Value::Object(m))
+}
+
+/// Events per coding agent (`event.agent`); both agents are always listed.
+fn by_agent(conn: &Connection) -> anyhow::Result<Value> {
+    let mut v = json!({"claude": 0, "codex": 0});
+    if let (Value::Object(m), Value::Object(found)) = (
+        &mut v,
+        grouped(conn, "SELECT agent, COUNT(*) FROM event GROUP BY agent")?,
+    ) {
+        m.extend(found);
+    }
+    Ok(v)
+}
+
+/// `by agent: claude N, codex M`.
+fn by_agent_text(v: &Value) -> String {
+    let parts: Vec<String> = v
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(k, n)| format!("{k} {n}"))
+        .collect();
+    format!("by agent: {}\n", parts.join(", "))
 }
 
 fn injections(conn: &Connection) -> anyhow::Result<Value> {

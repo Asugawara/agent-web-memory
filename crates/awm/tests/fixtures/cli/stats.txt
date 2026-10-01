@@ -1,3 +1,4 @@
+by agent: claude 4, codex 0
 injections:
   accepted: 1
   changed_next_step: 1

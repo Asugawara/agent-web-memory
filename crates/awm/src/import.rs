@@ -682,9 +682,9 @@ fn insert(tx: &Connection, rec: &Record, source_id: i64) -> anyhow::Result<bool>
     let inserted = tx.execute(
         "INSERT INTO event (tool_use_id, tool, session_id, agent_id, agent_type, cwd_hash, \
          created_at, query, url, url_norm, fetch_prompt, http_code, bytes, duration_ms, status, \
-         summary, match_text, source, import_source_id, quarantined, quarantine_reason) \
+         summary, match_text, source, import_source_id, quarantined, quarantine_reason, agent) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-         ?18, ?19, ?20, ?21) ON CONFLICT(tool_use_id) DO NOTHING",
+         ?18, ?19, ?20, ?21, ?22) ON CONFLICT(tool_use_id) DO NOTHING",
         params![
             rec.tool_use_id,
             rec.tool.as_db_str(),
@@ -707,6 +707,7 @@ fn insert(tx: &Connection, rec: &Record, source_id: i64) -> anyhow::Result<bool>
             source_id,
             i64::from(rec.quarantine_reason.is_some()),
             rec.quarantine_reason,
+            rec.agent.as_db_str(),
         ],
     )?;
     if inserted == 0 {

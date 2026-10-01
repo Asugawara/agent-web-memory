@@ -1043,6 +1043,20 @@ fn a_codex_webrun_matches_an_earlier_search_through_the_query_channel() {
 }
 
 #[test]
+fn the_capture_hook_stores_the_agent_of_the_payload() {
+    let home = Home::new();
+    assert_silent(&home.hook(
+        "capture",
+        &fixture("codex-PostToolUse-webrun-search-1.json"),
+    ));
+    assert_silent(&home.hook("capture", &fixture("PostToolUse-WebSearch-plugin-2.json")));
+    assert_eq!(
+        home.text("SELECT group_concat(agent || '/' || source, ',') FROM (SELECT agent, source FROM event ORDER BY id)"),
+        "codex/hook,claude/hook"
+    );
+}
+
+#[test]
 fn codex_stop_and_session_start_record_nothing_and_print_nothing() {
     let home = Home::new();
     let stop = home.hook("capture", &fixture("codex-Stop-none-search-1.json"));

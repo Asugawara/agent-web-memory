@@ -22,7 +22,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         return show_ref(&conn, r);
     }
     let mut st = conn.prepare(
-        "SELECT created_at, tool, agent_id, query, url, status FROM event \
+        "SELECT created_at, tool, agent_id, query, url, status, agent FROM event \
          ORDER BY created_at DESC, id DESC LIMIT ?1",
     )?;
     let rows = st.query_map(params![args.limit], |r| {
@@ -33,20 +33,28 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             r.get::<_, Option<String>>(3)?,
             r.get::<_, Option<String>>(4)?,
             r.get::<_, String>(5)?,
+            r.get::<_, String>(6)?,
         ))
     })?;
     for row in rows {
-        let (ts, tool, agent, query, url, status) = row?;
+        let (ts, tool, agent, query, url, status, coding_agent) = row?;
         let agent_kind = if agent.is_some() { "subagent" } else { "main" };
         let target = url.or(query).unwrap_or_default();
         if args.json {
             println!(
                 "{}",
-                json!({"ts": ts, "tool": tool, "agent": agent_kind, "target": target, "status": status})
+                json!({"ts": ts, "tool": tool, "agent": agent_kind, "coding_agent": coding_agent,
+                       "target": target, "status": status})
             );
         } else {
+            // Claude rows are the default and carry no tag.
+            let tag = if coding_agent == "claude" {
+                String::new()
+            } else {
+                format!("[{coding_agent}] ")
+            };
             println!(
-                "{}  {tool:<9}  {agent_kind:<8}  {status:<11}  {}",
+                "{}  {tool:<9}  {agent_kind:<8}  {status:<11}  {tag}{}",
                 super::fmt_ts(ts),
                 target.replace('\n', " ")
             );
