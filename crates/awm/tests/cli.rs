@@ -718,3 +718,118 @@ fn commands_need_an_initialised_database() {
         assert!(out.stderr.contains("awm init"), "{cmd}: {}", out.stderr);
     }
 }
+
+/// Three past fetches of A (4, 8, 20 s; 400, 800, 1200 chars), two injections showing A.
+fn seed_savings(env: &Env) -> Connection {
+    let conn = env.conn();
+    for (id, ms, chars) in [(1, 4_000, 400), (2, 8_000, 800), (3, 20_000, 1_200)] {
+        let mut e = ev(id, "WebFetch", "s0", BASE + id * 1_000);
+        e.url = Some("https://example.org/a");
+        insert(&conn, &e);
+        conn.execute(
+            "UPDATE event SET duration_ms = ?1, summary = ?2 WHERE id = ?3",
+            params![ms, "x".repeat(chars), id],
+        )
+        .unwrap();
+    }
+    // Injection 1 (s1, 800 chars): never followed up. Injection 2 (s2, 400 chars): followed up 30 s later.
+    injection(&conn, 1, "inject", "url", "s1", BASE + 100_000, &[(1, 1.0)]);
+    injection(&conn, 2, "inject", "url", "s2", BASE + 200_000, &[(1, 1.0)]);
+    conn.execute("UPDATE injection SET rendered_chars = 800 WHERE id = 1", [])
+        .unwrap();
+    conn.execute("UPDATE injection SET rendered_chars = 400 WHERE id = 2", [])
+        .unwrap();
+    let mut e4 = ev(4, "WebFetch", "s2", BASE + 230_000);
+    e4.url = Some("https://example.org/a");
+    insert(&conn, &e4);
+    conn.execute("UPDATE event SET duration_ms = 1000 WHERE id = 4", [])
+        .unwrap();
+    label(&conn, 1, 1, "2");
+    conn
+}
+
+#[test]
+fn stats_savings_matches_hand_computed_numbers() {
+    let env = Env::new();
+    seed_savings(&env);
+    // Injection 1 avoided: median of 4, 8, 20 s is 8 s = 0.1 min; median 800 chars / 4 = 200 tokens.
+    // Overhead (800 + 400) / 4 = 300, net -100. Repeats of A: events 2, 3, 4 (8 + 20 + 1 s,
+    // 800 + 1200 + 46 chars).
+    let text = env.awm(&["stats", "--savings"]).ok().to_string();
+    for want in [
+        "  shown:            2\n",
+        "  avoided:          1\n",
+        "  followed up:      1\n",
+        "  est. time saved:  0.1 min\n",
+        "  est. tokens saved: 0.2k\n",
+        "  overhead tokens:  0.3k\n",
+        "  net tokens:       -0.1k\n",
+        "  confirmed:        1 items, 0.1 min, 0.2k tokens\n",
+        "  ceiling, repeat fetches: 3 (0.5 min, 0.5k tokens;",
+        "  ceiling, repeat searches: 0 (0.0 min, 0.0k tokens;",
+    ] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
+    let v: Value = serde_json::from_str(env.awm(&["stats", "--savings", "--json"]).ok()).unwrap();
+    let s = &v["savings"];
+    assert_eq!(s["shown"], 2);
+    assert_eq!(s["avoided"], 1);
+    assert_eq!(s["followed_up"], 1);
+    assert_eq!(s["time_saved_ms"], 8_000.0);
+    assert_eq!(s["tokens_saved"], 200.0);
+    assert_eq!(s["overhead_tokens"], 300.0);
+    assert_eq!(s["net_tokens"], -100.0);
+    assert_eq!(s["confirmed"]["items"], 1);
+    assert_eq!(s["confirmed"]["time_saved_ms"], 8_000.0);
+    assert_eq!(s["confirmed"]["tokens_saved"], 200.0);
+    assert_eq!(s["ceiling"]["repeat_fetches"]["count"], 3);
+    assert_eq!(s["ceiling"]["repeat_fetches"]["duration_ms"], 29_000);
+    assert_eq!(s["ceiling"]["repeat_fetches"]["tokens"], 511.5);
+    assert_eq!(s["ceiling"]["repeat_searches"]["count"], 0);
+}
+
+#[test]
+fn stats_savings_since_limits_the_injections_but_not_the_ceiling() {
+    let env = Env::new();
+    seed_savings(&env);
+    // No injection is on or after BASE + 30 days.
+    let day = |ms: i64| {
+        let t = time::OffsetDateTime::from_unix_timestamp(ms / 1000).unwrap();
+        format!("{:04}-{:02}-{:02}", t.year(), u8::from(t.month()), t.day())
+    };
+    let late = day(BASE + 86_400_000 * 30);
+    let v: Value = serde_json::from_str(
+        env.awm(&["stats", "--savings", "--since", &late, "--json"])
+            .ok(),
+    )
+    .unwrap();
+    assert_eq!(v["savings"]["shown"], 0);
+    assert_eq!(v["savings"]["avoided"], 0);
+    assert_eq!(v["savings"]["ceiling"]["repeat_fetches"]["count"], 3);
+    let text = env
+        .awm(&["stats", "--savings", "--since", &late])
+        .ok()
+        .to_string();
+    assert!(text.contains("No notes shown yet."), "{text}");
+    assert!(text.contains("ceiling, repeat fetches: 3"), "{text}");
+    let early = day(BASE);
+    let v: Value = serde_json::from_str(
+        env.awm(&["stats", "--savings", "--since", &early, "--json"])
+            .ok(),
+    )
+    .unwrap();
+    assert_eq!(v["savings"]["shown"], 2);
+    assert!(!env
+        .awm(&["stats", "--savings", "--since", "soon"])
+        .stderr
+        .is_empty());
+}
+
+#[test]
+fn stats_savings_on_an_empty_database() {
+    let env = Env::new();
+    let text = env.awm(&["stats", "--savings"]).ok().to_string();
+    assert!(text.contains("No notes shown yet."), "{text}");
+    assert!(text.contains("ceiling, repeat fetches: 0"), "{text}");
+    assert!(text.contains("ceiling, repeat searches: 0"), "{text}");
+}

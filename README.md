@@ -60,6 +60,7 @@ awm purge --all
 | `awm search {query}` | Search stored records |
 | `awm log` | Show recent notes injected into your agents |
 | `awm stats` | Show statistics (records by tool and agent, quarantined count) |
+| `awm stats --savings` | Estimate time and tokens the shown notes saved (`--since YYYY-MM-DD`, `--json`) |
 | `awm review` | Review and label notes you were shown |
 | `awm forget` | Delete records: `awm forget last`, `awm forget <url>`, `awm forget --id N`, `awm forget --ref REF` (asks first; `--yes` skips the question) |
 | `awm purge` | `awm purge --before YYYY-MM-DD` deletes everything older than the date; `awm purge --all` deletes the whole data directory |
@@ -73,6 +74,10 @@ awm purge --all
 | `awm doctor` | Check the installation |
 | `awm where` | Print data directory and database path |
 | `awm report` | Write a summary for bug reports (no personal data) |
+
+### How savings are estimated
+
+`awm stats --savings` counts a shown note as avoided when the same session and agent did not call its URL or query again afterwards, and prices it at the median duration and summary length (chars / 4) of earlier calls of the same URL or query. This is an estimate of something that did not happen, so it also prints the part you confirmed in `awm review` (label 2), the token overhead of the notes, and the repeat calls in your history as an upper bound.
 
 ## Privacy
 
