@@ -31,11 +31,11 @@ enum Command {
     /// Forget records
     Forget(forget::Args),
     /// Permanently delete records
-    Purge(forget::Args),
+    Purge(forget::PurgeArgs),
     /// Quarantine records
-    Quarantine(forget::Args),
+    Quarantine(forget::QuarantineArgs),
     /// Lift the quarantine on records
-    Unquarantine(forget::Args),
+    Unquarantine(forget::QuarantineArgs),
     /// Check the installation
     Doctor(cli::doctor::Args),
     /// Write a report

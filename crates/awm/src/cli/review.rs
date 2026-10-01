@@ -83,7 +83,7 @@ pub fn run_with(
     for (i, item) in items.iter().enumerate() {
         show(conn, item, i + 1, total, out)?;
         loop {
-            write!(out, "Label [2 changed next step, 1 relevant, 0 not relevant, h harmful, s skip, q quit]: ")?;
+            write!(out, "Label [2 changed next step, 1 relevant, 0 not relevant, h harmful, x quarantine, s skip, q quit]: ")?;
             out.flush()?;
             let Some(key) = keys.next() else {
                 writeln!(out)?;
@@ -104,6 +104,15 @@ pub fn run_with(
                         ],
                     )?;
                     labelled += 1;
+                    break;
+                }
+                'x' => {
+                    let n = crate::forget::quarantine_events(conn, &[item.event_id], "awm review")?;
+                    if n == 0 {
+                        writeln!(out, "Record #{} was already quarantined.", item.event_id)?;
+                    } else {
+                        writeln!(out, "Quarantined record #{}.", item.event_id)?;
+                    }
                     break;
                 }
                 's' => break,
