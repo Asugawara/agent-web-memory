@@ -500,7 +500,7 @@ fn forget_url_removes_every_trace_and_reimport_does_not_restore_it() {
         "{out}"
     );
     assert!(out.contains("Deleted 1 backup(s):"), "{out}");
-    assert!(out.contains("Deleted 1 spool file(s)."), "{out}");
+    assert!(out.contains("Deleted 1 spool file(s)"), "{out}");
     env.assert_leftovers_gone();
 
     assert_eq!(mentions(&env, TOKEN), 0);
@@ -878,12 +878,11 @@ fn purge_all_keeps_files_awm_did_not_create() {
     let (outcome, out) = env.run(true, "y\n", |io| {
         forget::purge_all(io, false, "awm purge --all")
     });
-    assert_eq!(outcome.0, Outcome::Done, "{out}");
-    assert!(
-        out.contains("Kept the directory: it also holds notes.txt"),
-        "{out}"
-    );
-    assert!(!env.db_path().exists());
+    assert_eq!(outcome.0, Outcome::Foreign, "{out}");
+    assert_eq!(outcome.0.exit_code(), 2);
+    assert!(out.contains("notes.txt"), "{out}");
+    assert!(!out.contains("[y/N]"), "{out}");
+    assert!(env.db_path().exists());
     assert!(env.data().join("notes.txt").exists());
 }
 
@@ -1070,4 +1069,545 @@ fn uninstall_names_the_binary_removal_for_the_install_method() {
         );
     }
     assert_eq!(binary_removal(None, None), "rm ~/.local/bin/awm");
+}
+
+// ---------------------------------------------------------------------------
+// F2: RV3 B1-B4 and minors
+
+fn capture_opts(env: &Env, now_ms: i64) -> awm::capture::CaptureOpts {
+    awm::capture::CaptureOpts {
+        data_dir: env.data(),
+        config: Config::default(),
+        now_ms,
+    }
+}
+
+fn hook_fixture(name: &str) -> Value {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/hooks")
+        .join(name);
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+fn search_payload(id: &str, query: &str, results: Value, summary: &str) -> Value {
+    json!({
+        "session_id": "sess-hook", "cwd": "/work/forget", "hook_event_name": "PostToolUse",
+        "tool_name": "WebSearch", "tool_use_id": id,
+        "tool_input": {"query": query},
+        "tool_response": {"query": query, "results": [
+            {"tool_use_id": "srvtoolu_9", "content": results}, summary], "durationSeconds": 1.0}
+    })
+}
+
+fn fetch_payload(id: &str, url: &str, prompt: &str, answer: &str) -> Value {
+    json!({
+        "session_id": "sess-hook", "cwd": "/work/forget", "hook_event_name": "PostToolUse",
+        "tool_name": "WebFetch", "tool_use_id": id,
+        "tool_input": {"url": url, "prompt": prompt},
+        "tool_response": {"bytes": 10, "code": 200, "result": answer, "url": url, "durationMs": 5}
+    })
+}
+
+/// `(rank, url_norm, title)` of a record's result rows.
+fn results_of(env: &Env, tool_use_id: &str) -> Vec<(i64, String, String)> {
+    let conn = env.conn();
+    let mut st = conn
+        .prepare(
+            "SELECT r.rank, r.url_norm, COALESCE(r.title, '') FROM result r \
+             JOIN event e ON e.id = r.event_id WHERE e.tool_use_id = ?1 ORDER BY r.rank",
+        )
+        .unwrap();
+    st.query_map([tool_use_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn match_text_of(env: &Env, tool_use_id: &str) -> String {
+    env.conn()
+        .query_row(
+            "SELECT match_text FROM event WHERE tool_use_id = ?1",
+            [tool_use_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// B1 (capture): a WebSearch captured after `forget <url>` keeps no result row
+/// of the URL, the other rows are re-ranked 1..n and `match_text` drops its title.
+#[test]
+fn capture_after_forget_url_drops_the_search_result_row_of_the_url() {
+    let env = Env::new();
+    let forgotten = "https://sqlite.org/fts5.html";
+    let (outcome, out) = env.forget(forget_url(forgotten));
+    assert_eq!(outcome, Outcome::Done, "{out}");
+
+    let payload = hook_fixture("PostToolUse-WebSearch-plugin-2.json");
+    let id = payload["tool_use_id"].as_str().unwrap().to_string();
+    let got = awm::capture::run(&payload, &capture_opts(&env, NOW)).unwrap();
+    assert_eq!(got, awm::capture::CaptureOutcome::Captured);
+    let rows = results_of(&env, &id);
+    assert_eq!(rows.len(), 9, "{rows:?}");
+    let norm = awm::normalize::norm_url(forgotten).unwrap();
+    assert!(rows.iter().all(|r| r.1 != norm), "{rows:?}");
+    let ranks: Vec<i64> = rows.iter().map(|r| r.0).collect();
+    assert_eq!(ranks, (1..=9).collect::<Vec<i64>>());
+    assert!(rows.iter().all(|r| r.2 != "SQLite FTS5 Extension"));
+    let mt = match_text_of(&env, &id);
+    assert!(!mt.contains("SQLite FTS5 Extension"), "{mt}");
+    assert!(mt.contains("SQLite User Forum"), "{mt}");
+    assert_eq!(mentions(&env, "sqlite.org/fts5.html"), 0);
+
+    // A search that lists only forgotten URLs is skipped, as an all-private one is.
+    let only = search_payload(
+        "toolu_hook_only",
+        "fts5 extension docs",
+        json!([{"title": "SQLite FTS5 Extension", "url": "https://SQLITE.org/fts5.html#x"}]),
+        "One result.",
+    );
+    let got = awm::capture::run(&only, &capture_opts(&env, NOW)).unwrap();
+    assert_eq!(got, awm::capture::CaptureOutcome::Skipped("tombstone"));
+    assert!(!env.exists("toolu_hook_only"));
+}
+
+/// B1 (import): a new transcript WebSearch that lists a forgotten URL is stored
+/// without that row; one that lists only forgotten URLs is skipped.
+#[test]
+fn import_after_forget_url_drops_the_search_result_row_of_the_url() {
+    let env = Env::new();
+    let (outcome, out) = env.forget(forget_url(URL));
+    assert_eq!(outcome, Outcome::Done, "{out}");
+    assert_eq!(mentions(&env, TOKEN), 0);
+
+    let mut more = search(
+        "2026-09-22T10:00:00.000Z",
+        "toolu_s_new",
+        "crate setup walkthrough",
+        json!([
+            {"title": "Walkthrough", "url": "https://walk.example.org/a"},
+            {"title": format!("{TOKEN} guide"), "url": "https://ZQXFORGETTOKEN.example.com/docs/"},
+            {"title": "Setup notes", "url": "https://setup.example.org/b"}
+        ]),
+        "The walkthrough and the setup notes cover it.",
+    );
+    more += &search(
+        "2026-09-22T10:01:00.000Z",
+        "toolu_s_only",
+        "forgotten docs only",
+        json!([{"title": format!("{TOKEN} docs"), "url": URL}]),
+        "One result.",
+    );
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(env.transcript())
+        .unwrap();
+    f.write_all(more.as_bytes()).unwrap();
+    drop(f);
+
+    let s = env.import();
+    assert_eq!(s.records_inserted, 1, "{s:?}");
+    assert_eq!(s.skipped_tombstone, 1, "{s:?}");
+    assert!(env.exists("toolu_s_new") && !env.exists("toolu_s_only"));
+    let rows = results_of(&env, "toolu_s_new");
+    let urls: Vec<(i64, &str)> = rows.iter().map(|r| (r.0, r.1.as_str())).collect();
+    assert_eq!(
+        urls,
+        [
+            (
+                1,
+                awm::normalize::norm_url("https://walk.example.org/a")
+                    .unwrap()
+                    .as_str()
+            ),
+            (
+                2,
+                awm::normalize::norm_url("https://setup.example.org/b")
+                    .unwrap()
+                    .as_str()
+            ),
+        ]
+    );
+    assert!(!match_text_of(&env, "toolu_s_new").contains(TOKEN));
+    assert_eq!(mentions(&env, TOKEN), 0);
+    assert_eq!(fts(&env, TOKEN), 0);
+    assert!(!env.raw_contains(TOKEN));
+}
+
+/// Answers `text` on the first read, after running `before` (B3: a record
+/// stored while the question waits).
+struct Answer<F: FnMut()> {
+    before: Option<F>,
+    text: &'static [u8],
+}
+
+impl<F: FnMut()> std::io::Read for Answer<F> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::BufRead;
+        let n = {
+            let avail = self.fill_buf()?;
+            let n = avail.len().min(buf.len());
+            buf[..n].copy_from_slice(&avail[..n]);
+            n
+        };
+        self.consume(n);
+        Ok(n)
+    }
+}
+
+impl<F: FnMut()> std::io::BufRead for Answer<F> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if let Some(mut f) = self.before.take() {
+            f();
+        }
+        Ok(self.text)
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.text = &self.text[n..];
+    }
+}
+
+fn run_answering<T>(
+    env: &Env,
+    before: impl FnMut(),
+    f: impl FnOnce(&mut Io<'_>) -> anyhow::Result<T>,
+) -> (T, String) {
+    let mut input = Answer {
+        before: Some(before),
+        text: b"y\n",
+    };
+    let mut out = Vec::new();
+    let r = {
+        let mut io = Io {
+            data_dir: env.data(),
+            terminal: true,
+            input: &mut input,
+            out: &mut out,
+            now_ms: NOW,
+        };
+        f(&mut io).unwrap()
+    };
+    (r, String::from_utf8(out).unwrap())
+}
+
+/// B3 (RV3 E8): a WebFetch of the URL stored while `forget <url>` waits for
+/// its answer is deleted too.
+#[test]
+fn forget_url_also_deletes_a_record_stored_while_the_question_waited() {
+    let env = Env::new();
+    let race = "zqxracetoken";
+    let opts = capture_opts(&env, NOW + 1);
+    let args = forget::Args {
+        target: Some(URL.into()),
+        ..forget::Args::default()
+    };
+    let (outcome, out) = run_answering(
+        &env,
+        || {
+            let p = fetch_payload(
+                "toolu_race_f",
+                "https://ZQXFORGETTOKEN.example.com/docs",
+                &format!("{race} what is new"),
+                &format!("The {race} release."),
+            );
+            assert_eq!(
+                awm::capture::run(&p, &opts).unwrap(),
+                awm::capture::CaptureOutcome::Captured
+            );
+        },
+        |io| forget::run_forget(&args, io),
+    );
+    assert_eq!(outcome, Outcome::Done, "{out}");
+    assert!(
+        !env.exists("toolu_race_f") && !env.exists("toolu_f1"),
+        "{out}"
+    );
+    assert!(out.contains("Deleted 2 record(s)"), "{out}");
+    assert_eq!(
+        env.count("SELECT COUNT(*) FROM tombstone WHERE value = 'toolu_race_f'"),
+        1
+    );
+    for token in [TOKEN, race] {
+        assert_eq!(mentions(&env, token), 0, "{token}");
+        assert_eq!(fts(&env, token), 0, "{token}");
+        assert!(!env.raw_contains(token), "{token}");
+    }
+}
+
+/// B3: a record older than the date stored while `purge --before` waits is deleted too.
+#[test]
+fn purge_before_also_deletes_a_record_stored_while_the_question_waited() {
+    let env = Env::new();
+    let race = "zqxoldracetoken";
+    let opts = capture_opts(&env, ms("2026-09-02"));
+    let args = PurgeArgs {
+        before: Some("2026-09-10".into()),
+        ..PurgeArgs::default()
+    };
+    let (outcome, out) = run_answering(
+        &env,
+        || {
+            let p = fetch_payload(
+                "toolu_old_race",
+                "https://old.example.net/race",
+                &format!("{race} notes"),
+                "Old.",
+            );
+            assert_eq!(
+                awm::capture::run(&p, &opts).unwrap(),
+                awm::capture::CaptureOutcome::Captured
+            );
+        },
+        |io| forget::run_purge_with(&args, io),
+    );
+    assert_eq!(outcome, Outcome::Done, "{out}");
+    assert!(!env.exists("toolu_old_race"), "{out}");
+    assert!(out.contains("Deleted 3 record(s)"), "{out}");
+    assert_eq!(mentions(&env, race), 0);
+    assert_eq!(fts(&env, race), 0);
+    assert!(!env.raw_contains(race));
+}
+
+/// B3: `forget --id` keeps the confirmed set; a record stored meanwhile stays.
+#[test]
+fn forget_id_deletes_only_the_confirmed_record() {
+    let env = Env::new();
+    let f1 = env.id_of("toolu_f1");
+    let opts = capture_opts(&env, NOW + 1);
+    let args = forget::Args {
+        id: Some(f1),
+        ..forget::Args::default()
+    };
+    let (outcome, out) = run_answering(
+        &env,
+        || {
+            let p = fetch_payload("toolu_meanwhile", URL, "again", "Same page.");
+            awm::capture::run(&p, &opts).unwrap();
+        },
+        |io| forget::run_forget(&args, io),
+    );
+    assert_eq!(outcome, Outcome::Done, "{out}");
+    assert!(!env.exists("toolu_f1") && env.exists("toolu_meanwhile"));
+}
+
+/// Raw bytes of `awm.db` and `awm.db-wal` as they are, without a checkpoint.
+fn raw_now_contains(env: &Env, token: &str) -> bool {
+    let needle = token.as_bytes();
+    ["awm.db", "awm.db-wal"].iter().any(|name| {
+        std::fs::read(env.data().join(name))
+            .is_ok_and(|b| b.windows(needle.len()).any(|w| w == needle))
+    })
+}
+
+/// B4 (RV3 E5a): with another idle connection open, only `forget`'s own
+/// `wal_checkpoint(TRUNCATE)` gets the old pages out of `awm.db` and `awm.db-wal`.
+#[test]
+fn forget_url_scrubs_the_files_while_another_connection_is_open() {
+    let env = Env::new();
+    let idle = env.conn();
+    let _: i64 = idle
+        .query_row("SELECT COUNT(*) FROM event", [], |r| r.get(0))
+        .unwrap();
+    assert!(raw_now_contains(&env, TOKEN));
+    let (outcome, out) = env.forget(forget_url(URL));
+    assert_eq!(outcome, Outcome::Done, "{out}");
+    assert!(!out.contains("Warning"), "{out}");
+    assert!(
+        !raw_now_contains(&env, TOKEN),
+        "awm.db or awm.db-wal still holds the token while another connection is open"
+    );
+    drop(idle);
+}
+
+/// m1 (RV3 E5b): a reader holds a transaction, so the checkpoint is busy; the
+/// warning names both files and says when to re-run.
+#[test]
+fn forget_warns_about_both_files_when_the_checkpoint_is_busy() {
+    let env = Env::new();
+    let reader = env.conn();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT COUNT(*) FROM event", [], |r| r.get(0))
+        .unwrap();
+    let (outcome, out) = env.forget(forget_url(URL));
+    reader.execute_batch("COMMIT").unwrap();
+    drop(reader);
+    assert_eq!(outcome, Outcome::Done, "{out}");
+    assert!(out.contains("awm.db and awm.db-wal"), "{out}");
+    assert!(out.contains("no Claude Code session is active"), "{out}");
+    assert!(out.contains(&format!("awm forget '{URL}' --yes")), "{out}");
+}
+
+/// m2: a failure after the commit (here FTS `optimize`) still deletes backups
+/// and spool files, prints what was deleted, then reports the error.
+#[test]
+fn a_failure_after_the_commit_still_deletes_backups_and_spool_files() {
+    let env = Env::new();
+    env.leftovers();
+    // `optimize` rewrites the index into one segment and deletes the old ones;
+    // the transaction itself only adds a segment.
+    env.conn()
+        .execute_batch(
+            "CREATE TRIGGER fail_optimize BEFORE DELETE ON event_fts_data \
+             WHEN EXISTS (SELECT 1 FROM tombstone WHERE kind = 'url_hash') \
+             BEGIN SELECT RAISE(ABORT, 'injected optimize failure'); END;",
+        )
+        .unwrap();
+    let mut out = Vec::new();
+    let r = {
+        let mut input: &[u8] = b"";
+        let mut io = Io {
+            data_dir: env.data(),
+            terminal: false,
+            input: &mut input,
+            out: &mut out,
+            now_ms: NOW,
+        };
+        forget::run_forget(&forget_url(URL), &mut io)
+    };
+    let out = String::from_utf8(out).unwrap();
+    let err = r.expect_err(&out);
+    // The injected failure hit `optimize`, after the commit.
+    assert!(
+        !env.exists("toolu_f1"),
+        "the deletion was committed: {err:#}"
+    );
+    assert!(format!("{err:#}").contains("constraint failed"), "{err:#}");
+    env.assert_leftovers_gone();
+    assert!(out.contains("Deleted 1 record(s)"), "{out}");
+    assert!(out.contains("Deleted 1 backup(s)"), "{out}");
+}
+
+/// m5 (RV3 E7f): a `spool` symlinked outside the data dir is not followed, and
+/// only `*.json` files are deleted from a real spool dir.
+#[test]
+fn cleanup_skips_a_symlinked_spool_and_files_that_are_not_json() {
+    let env = Env::new();
+    let outside = env.root.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("victim.json"), "{}").unwrap();
+    std::os::unix::fs::symlink(&outside, env.data().join("spool")).unwrap();
+    let (outcome, out) = env.forget(forget_url(URL));
+    assert_eq!(outcome, Outcome::Done, "{out}");
+    assert!(outside.join("victim.json").exists(), "{out}");
+    assert!(out.contains("Deleted 0 spool file(s)"), "{out}");
+
+    std::fs::remove_file(env.data().join("spool")).unwrap();
+    std::fs::create_dir(env.data().join("spool")).unwrap();
+    std::fs::write(env.data().join("spool/1-toolu_a.json"), "{}").unwrap();
+    std::fs::write(env.data().join("spool/keep.txt"), "mine").unwrap();
+    let (outcome, out) = env.forget(forget_url("https://other.example.org/crate"));
+    assert_eq!(outcome, Outcome::Done, "{out}");
+    assert!(!env.data().join("spool/1-toolu_a.json").exists());
+    assert!(env.data().join("spool/keep.txt").exists());
+    assert!(out.contains("Deleted 1 spool file(s)"), "{out}");
+}
+
+/// m9: the output says what deleting spool files means.
+#[test]
+fn deleting_spool_files_says_import_reads_them_again() {
+    let env = Env::new();
+    env.leftovers();
+    let (outcome, out) = env.forget(forget_url(URL));
+    assert_eq!(outcome, Outcome::Done, "{out}");
+    assert!(out.contains("Deleted 1 spool file(s)"), "{out}");
+    assert!(out.contains("pending captures"), "{out}");
+    assert!(out.contains("awm import"), "{out}");
+}
+
+/// m6: when no record is deleted but kept search records change, the question says so.
+#[test]
+fn forget_url_question_names_the_kept_search_records() {
+    let env = Env::new();
+    let f1 = env.id_of("toolu_f1");
+    env.forget(forget::Args {
+        id: Some(f1),
+        yes: true,
+        ..forget::Args::default()
+    });
+    let args = forget::Args {
+        target: Some(URL.into()),
+        ..forget::Args::default()
+    };
+    let (outcome, out) = env.run(true, "n\n", |io| forget::run_forget(&args, io));
+    assert_eq!(outcome, Outcome::Declined, "{out}");
+    assert!(!out.contains("Forget 0 record(s)"), "{out}");
+    assert!(
+        out.contains("Remove it from 1 kept search record(s)"),
+        "{out}"
+    );
+}
+
+/// m7: the re-run hint quotes the target for a POSIX shell.
+#[test]
+fn the_rerun_hint_quotes_a_url_with_a_single_quote() {
+    let env = Env::new();
+    let (code, out, err) = env.awm(&["forget", "https://q.example.com/it's"]);
+    assert_eq!(code, Some(2), "{out}{err}");
+    assert!(
+        out.contains(r"Re-run with --yes: awm forget 'https://q.example.com/it'\''s' --yes"),
+        "{out}"
+    );
+}
+
+/// B2 (RV3 E7a): foreign entries in the data dir stop `purge --all` before it deletes anything.
+#[test]
+fn purge_all_deletes_nothing_when_the_dir_holds_foreign_entries() {
+    let env = Env::new();
+    env.leftovers();
+    std::fs::write(env.data().join("notes.txt"), "mine").unwrap();
+    std::fs::write(
+        env.data().join("config.toml"),
+        "[package]\nname = \"mine\"\n",
+    )
+    .unwrap();
+    std::fs::write(env.data().join("spool/precious.txt"), "mine").unwrap();
+    for args in [
+        &["purge", "--all", "--yes"][..],
+        &["uninstall", "--yes"][..],
+    ] {
+        let (code, out, err) = env.awm(args);
+        assert_eq!(code, Some(2), "{args:?}: {out}{err}");
+        for name in ["notes.txt", "config.toml", "spool/precious.txt"] {
+            assert!(out.contains(name), "{args:?}: {out}");
+        }
+        assert!(!out.contains("To finish:"), "{out}");
+        assert!(env.db_path().exists());
+        assert!(env.data().join("awm.db.bak-v1").exists());
+        assert!(env.data().join("notes.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(env.data().join("config.toml")).unwrap(),
+            "[package]\nname = \"mine\"\n"
+        );
+        assert!(env.data().join("spool/precious.txt").exists());
+        assert!(env.data().join("spool/1790000000000-toolu_x.json").exists());
+    }
+}
+
+/// B2 (RV3 E7b): symlinked `spool` and backup are removed as links; their targets stay.
+#[test]
+fn purge_all_removes_symlinks_but_not_their_targets() {
+    let env = Env::new();
+    let outside = env.root.join("outside");
+    std::fs::create_dir_all(outside.join("spooldir")).unwrap();
+    std::fs::write(outside.join("spooldir/precious.txt"), "mine").unwrap();
+    std::fs::write(outside.join("spooldir/x.json"), "{}").unwrap();
+    std::fs::write(outside.join("backup"), "mine").unwrap();
+    std::os::unix::fs::symlink(outside.join("spooldir"), env.data().join("spool")).unwrap();
+    std::os::unix::fs::symlink(outside.join("backup"), env.data().join("awm.db.bak-v1")).unwrap();
+    // An awm config file is ours.
+    std::fs::write(
+        env.data().join("config.toml"),
+        "mode = \"shadow\"\n\n[inject]\nmax_notes = 2\n",
+    )
+    .unwrap();
+    let (code, out, err) = env.awm(&["purge", "--all", "--yes"]);
+    assert_eq!(code, Some(0), "{out}{err}");
+    assert!(!env.data().exists(), "{out}");
+    assert!(outside.join("spooldir/precious.txt").exists());
+    assert!(outside.join("spooldir/x.json").exists());
+    assert_eq!(
+        std::fs::read_to_string(outside.join("backup")).unwrap(),
+        "mine"
+    );
 }
