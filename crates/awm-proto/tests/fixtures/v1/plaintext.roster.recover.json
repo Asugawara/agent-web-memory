@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "entry": {
+    "type": "recover",
+    "member_id": "2b7e4c1a-5d3f-4a6b-8c9d-0e1f2a3b4c5d",
+    "handle": "alf",
+    "device_id": "e3f4a5b6-c7d8-4e9f-8a1b-2c3d4e5f6a7b",
+    "device_pub": "I7e7jJGuAIcR-xKEZ4C83x4GX4Ib3-xJ9X58fc1MSCM",
+    "recovered_at": 1790910000
+  }
+}

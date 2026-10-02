@@ -2,8 +2,9 @@
 //! and in which form. Pure: it reads the record, the configuration and the effective team
 //! policy, and returns a verdict plus, when the record may be shared, a cleaned copy.
 //!
-//! The engine (TM10) selects rows with `origin = 'local'` and `shareable <> 'no'` and calls
-//! [`check`], then [`crate::sync::payload::build`] on the cleaned copy.
+//! The engine (TM10) selects rows with `origin = 'local' AND shareable = 'no' AND sync_id IS
+//! NULL` (not pushed yet; `'never'` is a record the user unshared, RVT1 M4) and calls [`check`],
+//! then [`crate::sync::payload::build`] on the cleaned copy.
 
 use std::collections::BTreeMap;
 
@@ -98,8 +99,10 @@ pub struct OptIn {
     /// whatever their age.
     pub backfill: Vec<String>,
     /// With `team.share_all_projects`, records from this time on (the unit of
-    /// `event.created_at`) are opted in; the engine sets it to the time the switch was turned on.
-    pub share_all_since: i64,
+    /// `event.created_at`) are opted in. The engine reads it from `sync_state` key
+    /// `share_all_since`, written when the switch is turned on; without it nothing is opted in
+    /// through the switch, so turning it on never shares earlier history (RVT1 m14).
+    pub share_all_since: Option<i64>,
 }
 
 /// The effective team rules of this device: the admin policy (`plaintext.policy`, sync-v1 §15.4)
@@ -332,7 +335,7 @@ fn host_of(url: &str) -> Option<(Url, String)> {
 }
 
 fn opted_in(rec: &Record, cfg: &Config, opt: &OptIn) -> bool {
-    if cfg.team.share_all_projects && rec.created_at >= opt.share_all_since {
+    if cfg.team.share_all_projects && opt.share_all_since.is_some_and(|t| rec.created_at >= t) {
         return true;
     }
     let repo = opt
@@ -456,8 +459,10 @@ pub fn check(rec: &Record, cfg: &Config, policy: &TeamPolicy) -> Eligibility {
     };
     for row in &mut out.results {
         if let Some(t) = row.title.take() {
-            let t: String = t.chars().take(MAX_TITLE_CHARS).collect();
-            row.title = Some(take("title", scrub(&t, &all_terms), &mut edits));
+            // Re-redact the whole title before cutting it, so a secret straddling the cut is
+            // still found (RVT1 m1).
+            let t = take("title", scrub(&t, &all_terms), &mut edits);
+            row.title = Some(t.chars().take(MAX_TITLE_CHARS).collect());
         }
     }
     if share == Share::Full {

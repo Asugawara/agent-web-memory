@@ -236,12 +236,12 @@ pub fn build(rec: &Record, ctx: &ShareCtx) -> Result<Payload> {
         {
             continue;
         }
+        // Re-redacted whole, then cut (RVT1 m1).
         let title = match row.title.as_deref() {
-            Some(t) => Some(text_field(
-                &cut_chars(t, MAX_TITLE_CHARS),
-                &ctx.terms,
-                "a result title",
-            )?),
+            Some(t) => Some(cut_chars(
+                &text_field(t, &ctx.terms, "a result title")?,
+                MAX_TITLE_CHARS,
+            )),
             None => None,
         };
         results.push(ResultItem {

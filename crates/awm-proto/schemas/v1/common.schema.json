@@ -92,9 +92,14 @@
       ]
     },
     "epoch_wrap_bytes": {
-      "description": "a wrapped epoch key (TM3 fixes the layout)",
+      "description": "a wrap: 0x01, ephemeral key (32), nonce (24), sealed epoch key (48); exactly 105 bytes (docs/sync-v1-crypto.md section 5)",
       "type": "string",
-      "pattern": "^[A-Za-z0-9_-]{1,512}$"
+      "pattern": "^[A-Za-z0-9_-]{140}$"
+    },
+    "nonce16": {
+      "description": "16 bytes, unpadded base64url",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{21}[AQgw]$"
     }
   }
 }

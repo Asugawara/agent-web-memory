@@ -19,6 +19,7 @@ use crate::crypto::{
     aead_open, aead_seal, hkdf32, open_record, seal_record_with, Error, OsRng, RecordAd, Rng,
     Secret32, NONCE_LEN, TAG_LEN,
 };
+use crate::wire::RosterPlaintext;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -30,6 +31,10 @@ const INFO_JOIN: &[u8] = b"awm join v1";
 const INFO_CODE: &[u8] = b"awm code v1";
 const LABEL_FP: &[u8] = b"awm fp v1";
 const LABEL_EXPORT: &[u8] = b"awm export v1";
+const LABEL_ORG: &[u8] = b"awm org v1";
+
+/// Length of the organisation nonce in the genesis entry.
+pub const ORG_NONCE_LEN: usize = 16;
 
 /// Prefix of an invite string.
 pub const INVITE_PREFIX: &str = "awmi1_";
@@ -134,6 +139,25 @@ impl fmt::Debug for EpochKey {
     }
 }
 
+/// The organisation id of a genesis: the first 16 bytes of `SHA-256("awm org v1" ‖ device id
+/// ‖ device public key ‖ org nonce)` with the UUIDv4 version and variant bits set (RVT1 B1).
+///
+/// The id is self-certifying: every member receives it through the invite string, over the
+/// channel the admin trusts, so a genesis roster entry counts only if it hashes to it. Binding
+/// the device id as well as the key means a member cannot copy the genuine key and nonce into
+/// a genesis of their own stream (FT1).
+pub fn org_id(device_id: Uuid, device_pub: &[u8; 32], org_nonce: &[u8; ORG_NONCE_LEN]) -> Uuid {
+    let mut h = Sha256::new();
+    h.update(LABEL_ORG);
+    h.update(device_id.as_bytes());
+    h.update(device_pub);
+    h.update(org_nonce);
+    let d = h.finalize();
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&d[..16]);
+    uuid::Builder::from_random_bytes(id).into_uuid()
+}
+
 /// An organisation's id and every epoch key a device holds, contiguous from epoch 0.
 #[derive(Clone, Debug)]
 pub struct KeyRing {
@@ -142,19 +166,27 @@ pub struct KeyRing {
 }
 
 impl KeyRing {
-    /// A new organisation: a UUIDv4 organisation id and `K_0` (`awm team create`,
-    /// `awm cloud login`).
-    pub fn create() -> Result<KeyRing, Error> {
-        KeyRing::create_with(&mut OsRng)
+    /// A new organisation (`awm team create`, `awm cloud login`): `K_0` and the organisation
+    /// id derived from the first admin's device ([`org_id`]) and a random nonce. The device key
+    /// is made first; the nonce goes into the `genesis` roster entry.
+    pub fn create(
+        genesis_device: Uuid,
+        genesis_pub: &[u8; 32],
+    ) -> Result<(KeyRing, [u8; ORG_NONCE_LEN]), Error> {
+        KeyRing::create_with(&mut OsRng, genesis_device, genesis_pub)
     }
 
     /// [`KeyRing::create`] with an explicit random source (tests and vectors).
-    pub fn create_with(rng: &mut dyn Rng) -> Result<KeyRing, Error> {
-        let mut id = [0u8; 16];
-        rng.fill(&mut id)?;
-        let org = uuid::Builder::from_random_bytes(id).into_uuid();
+    pub fn create_with(
+        rng: &mut dyn Rng,
+        genesis_device: Uuid,
+        genesis_pub: &[u8; 32],
+    ) -> Result<(KeyRing, [u8; ORG_NONCE_LEN]), Error> {
+        let mut nonce = [0u8; ORG_NONCE_LEN];
+        rng.fill(&mut nonce)?;
+        let org = org_id(genesis_device, genesis_pub, &nonce);
         let k0 = EpochKey::generate_with(rng, 0)?;
-        KeyRing::from_keys(org, vec![k0])
+        Ok((KeyRing::from_keys(org, vec![k0])?, nonce))
     }
 
     /// A key ring from stored keys; the epochs must be exactly 0, 1, ..., n.
@@ -860,19 +892,26 @@ pub struct ApprovalInfo {
 
 /// Approves a verified join: wraps every epoch key to the device, authenticates each wrap
 /// with `S`, and builds the roster entry.
+///
+/// `roster` is the approver's verified roster. The approver takes the kind, handle and (for a
+/// device invite) the member id from its own invite record, never from the server's `pending`
+/// list; a `member` approval whose member id the roster already holds is refused, and a
+/// `device` approval needs the member in the roster under the invite's handle (RVT1 M2).
 pub fn approve(
     ring: &KeyRing,
+    roster: &Roster,
     invite: &Invite,
     join: &VerifiedJoin,
     info: ApprovalInfo,
 ) -> Result<Approval, Error> {
-    approve_with(&mut OsRng, ring, invite, join, info)
+    approve_with(&mut OsRng, ring, roster, invite, join, info)
 }
 
 /// [`approve`] with an explicit random source (tests and vectors).
 pub fn approve_with(
     rng: &mut dyn Rng,
     ring: &KeyRing,
+    roster: &Roster,
     invite: &Invite,
     join: &VerifiedJoin,
     info: ApprovalInfo,
@@ -882,6 +921,27 @@ pub fn approve_with(
     }
     if join.handle != invite.handle {
         return Err(Error::Rejected("verified join of another invite"));
+    }
+    match info.kind {
+        ApprovalKind::Member => {
+            if roster.members.contains_key(&info.member_id) {
+                return Err(Error::Rejected("member id already in the roster"));
+            }
+        }
+        ApprovalKind::Device => match roster.members.get(&info.member_id) {
+            None => {
+                return Err(Error::Rejected(
+                    "device approval for a member not in the roster",
+                ))
+            }
+            Some(m) if m.handle != join.handle => {
+                return Err(Error::Rejected("handle does not match the member"))
+            }
+            Some(_) => {}
+        },
+    }
+    if roster.devices.contains_key(&join.device_id) {
+        return Err(Error::Rejected("device id already in the roster"));
     }
     let auth_key = hkdf32(None, invite.secret.expose(), INFO_WRAP_AUTH);
     let auth = WrapAuth {
@@ -945,23 +1005,25 @@ pub fn accept_join(
 // ---------------------------------------------------------------------------------------
 // Roster
 
-mod b64_32 {
+mod b64_fixed {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     use serde::{Deserialize, Deserializer, Serializer};
 
-    pub fn serialize<S: Serializer>(v: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer, const N: usize>(v: &[u8; N], s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&URL_SAFE_NO_PAD.encode(v))
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>, const N: usize>(
+        d: D,
+    ) -> Result<[u8; N], D::Error> {
         let text = String::deserialize(d)?;
         let raw = URL_SAFE_NO_PAD
             .decode(text)
             .map_err(serde::de::Error::custom)?;
         raw.as_slice()
             .try_into()
-            .map_err(|_| serde::de::Error::custom("expected 32 bytes"))
+            .map_err(|_| serde::de::Error::custom(format!("expected {N} bytes")))
     }
 }
 
@@ -971,7 +1033,8 @@ mod b64_32 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RosterEntry {
-    /// The first admin's first device (`awm team create`), at index 0 under epoch 0.
+    /// The first admin's first device (`awm team create`), at index 0 under epoch 0. It counts
+    /// only if [`org_id`] of its device id, key and nonce is the organisation id (RVT1 B1).
     Genesis {
         /// The first admin's member id.
         member_id: Uuid,
@@ -980,8 +1043,11 @@ pub enum RosterEntry {
         /// Device id (the writer).
         device_id: Uuid,
         /// Device public key.
-        #[serde(with = "b64_32")]
+        #[serde(with = "b64_fixed")]
         device_pub: [u8; 32],
+        /// The random nonce of [`KeyRing::create`].
+        #[serde(with = "b64_fixed")]
+        org_nonce: [u8; ORG_NONCE_LEN],
         /// Unix seconds.
         created_at: i64,
     },
@@ -999,7 +1065,7 @@ pub enum RosterEntry {
         /// The approved device.
         device_id: Uuid,
         /// Its public key.
-        #[serde(with = "b64_32")]
+        #[serde(with = "b64_fixed")]
         device_pub: [u8; 32],
         /// Unix seconds.
         approved_at: i64,
@@ -1015,7 +1081,7 @@ pub enum RosterEntry {
         /// The new device (the writer).
         device_id: Uuid,
         /// Its public key.
-        #[serde(with = "b64_32")]
+        #[serde(with = "b64_fixed")]
         device_pub: [u8; 32],
         /// Unix seconds.
         recovered_at: i64,
@@ -1025,6 +1091,7 @@ pub enum RosterEntry {
         /// The member.
         member_id: Uuid,
         /// One device, or every device of the member when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         device_id: Option<Uuid>,
         /// Unix seconds.
         revoked_at: i64,
@@ -1042,12 +1109,6 @@ pub enum RosterEntry {
         /// The rotating device.
         by_device_id: Uuid,
     },
-}
-
-#[derive(Serialize, Deserialize)]
-struct RosterPlain {
-    schema: u32,
-    entry: RosterEntry,
 }
 
 /// A sealed roster record with the stream metadata the server holds.
@@ -1113,7 +1174,7 @@ pub fn seal_roster_with(
     slot: RosterSlot,
     entry: &RosterEntry,
 ) -> Result<RosterBlob, Error> {
-    let plain = serde_json::to_vec(&RosterPlain {
+    let plain = serde_json::to_vec(&RosterPlaintext {
         schema: ROSTER_SCHEMA,
         entry: entry.clone(),
     })
@@ -1182,6 +1243,9 @@ pub struct RosterReport {
     pub roster: Roster,
     /// Records that did not verify (never trusted, never wrapped to).
     pub rejected: Vec<RosterRejection>,
+    /// `extra_admins` was given but not used, because the roster holds a verified,
+    /// non-revoked admin (RVT1 M5).
+    pub extra_admins_ignored: bool,
 }
 
 struct Pending {
@@ -1196,10 +1260,35 @@ impl Roster {
     /// served from (so the server can neither forge one nor move one), the writer device is
     /// itself verified and belongs to the stream's member, and the writer may make that
     /// change: a member approves only their own devices; admins approve anyone, revoke anyone
-    /// and record epochs. `extra_admins` are members the caller treats as admins beyond the
-    /// roster (the server's role list after `awm serve promote`); see `sync-v1-crypto.md` for
-    /// what that trusts.
+    /// and record epochs. The genesis counts only if it hashes to the organisation id
+    /// ([`org_id`]).
+    ///
+    /// `extra_admins` are members the caller treats as admins beyond the roster (the server's
+    /// role list after `awm serve promote`, confirmed by the user). They apply only when the
+    /// roster verified without them holds no non-revoked admin; otherwise they are ignored and
+    /// [`RosterReport::extra_admins_ignored`] is set (RVT1 M5).
     pub fn verify(
+        ring: &KeyRing,
+        blobs: &[RosterBlob],
+        extra_admins: &BTreeSet<Uuid>,
+    ) -> RosterReport {
+        let mut report = Roster::verify_with(ring, blobs, &BTreeSet::new());
+        if extra_admins.is_empty() {
+            return report;
+        }
+        if report
+            .roster
+            .members
+            .values()
+            .any(|m| m.admin && !m.revoked)
+        {
+            report.extra_admins_ignored = true;
+            return report;
+        }
+        Roster::verify_with(ring, blobs, extra_admins)
+    }
+
+    fn verify_with(
         ring: &KeyRing,
         blobs: &[RosterBlob],
         extra_admins: &BTreeSet<Uuid>,
@@ -1207,7 +1296,18 @@ impl Roster {
         let mut report = RosterReport::default();
         let mut pending = Vec::new();
         let mut sorted: Vec<&RosterBlob> = blobs.iter().collect();
-        sorted.sort_by_key(|b| (b.member, b.device, b.idx));
+        sorted.sort_by(|a, b| {
+            (a.member, a.device, a.idx, a.record_id, a.epoch, &a.blob).cmp(&(
+                b.member,
+                b.device,
+                b.idx,
+                b.record_id,
+                b.epoch,
+                &b.blob,
+            ))
+        });
+        // The same record served twice counts once.
+        sorted.dedup();
         for b in sorted {
             let reject = |reason| RosterRejection {
                 member: b.member,
@@ -1224,7 +1324,7 @@ impl Roster {
                     continue;
                 }
             };
-            match serde_json::from_slice::<RosterPlain>(&plain) {
+            match serde_json::from_slice::<RosterPlaintext>(&plain) {
                 Ok(p) if p.schema == ROSTER_SCHEMA => pending.push(Pending {
                     meta: b.clone(),
                     entry: p.entry,
@@ -1235,66 +1335,72 @@ impl Roster {
         }
         let roster = &mut report.roster;
 
-        // The genesis: index 0 under epoch 0 in the first admin's own stream; at most one.
-        let mut geneses: Vec<usize> = pending
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| matches!(p.entry, RosterEntry::Genesis { .. }))
-            .map(|(i, _)| i)
-            .collect();
-        geneses.sort_by_key(|&i| match &pending[i].entry {
-            RosterEntry::Genesis {
-                created_at,
-                device_id,
-                ..
-            } => (*created_at, *device_id),
-            _ => unreachable!(),
-        });
+        // The genesis: index 0 under epoch 0 in the first admin's own stream, hashing to the
+        // organisation id. Its order or time is never trusted (RVT1 B1). Two passing geneses
+        // need a second preimage or a server that let a stream reuse the genesis device id;
+        // both are rejected then, so the failure is closed.
         let mut done = vec![false; pending.len()];
-        for i in geneses {
+        let mut passing = Vec::new();
+        for (i, p) in pending.iter().enumerate() {
+            let RosterEntry::Genesis {
+                member_id,
+                device_id,
+                device_pub,
+                org_nonce,
+                ..
+            } = &p.entry
+            else {
+                continue;
+            };
             done[i] = true;
-            let p = &pending[i];
+            let reason = if p.meta.idx != 0 || p.meta.epoch != 0 {
+                Some("genesis not at index 0 under epoch 0")
+            } else if *member_id != p.meta.member || *device_id != p.meta.device {
+                Some("genesis not written by its own device")
+            } else if org_id(*device_id, device_pub, org_nonce) != ring.org {
+                Some("genesis does not hash to the organisation id")
+            } else {
+                None
+            };
+            match reason {
+                Some(r) => report.rejected.push(rejection(&p.meta, r)),
+                None => passing.push(i),
+            }
+        }
+        if passing.len() > 1 {
+            for &i in &passing {
+                report
+                    .rejected
+                    .push(rejection(&pending[i].meta, "more than one genesis"));
+            }
+        } else if let Some(&i) = passing.first() {
             let RosterEntry::Genesis {
                 member_id,
                 handle,
                 device_id,
                 device_pub,
                 ..
-            } = &p.entry
+            } = &pending[i].entry
             else {
                 unreachable!()
             };
-            let reason = if !roster.members.is_empty() {
-                Some("second genesis")
-            } else if p.meta.idx != 0 || p.meta.epoch != 0 {
-                Some("genesis not at index 0 under epoch 0")
-            } else if *member_id != p.meta.member || *device_id != p.meta.device {
-                Some("genesis not written by its own device")
-            } else {
-                None
-            };
-            match reason {
-                Some(r) => report.rejected.push(rejection(&p.meta, r)),
-                None => {
-                    roster.members.insert(
-                        *member_id,
-                        RosterMember {
-                            handle: handle.clone(),
-                            admin: true,
-                            revoked: false,
-                        },
-                    );
-                    roster.devices.insert(
-                        *device_id,
-                        RosterDevice {
-                            member_id: *member_id,
-                            public_key: *device_pub,
-                            approver: *device_id,
-                            revoked: false,
-                        },
-                    );
-                }
-            }
+            roster.members.insert(
+                *member_id,
+                RosterMember {
+                    handle: handle.clone(),
+                    admin: true,
+                    revoked: false,
+                },
+            );
+            roster.devices.insert(
+                *device_id,
+                RosterDevice {
+                    member_id: *member_id,
+                    public_key: *device_pub,
+                    approver: *device_id,
+                    revoked: false,
+                },
+            );
         }
 
         // Approvals and recoveries, to a fixpoint: an entry waits until its writer (and, for
@@ -1614,6 +1720,46 @@ impl Roster {
         self.epochs.get(&epoch).map(Vec::as_slice)
     }
 
+    /// The joining device's check before its first push (RVT1 M2): a verified, non-revoked
+    /// roster entry names this device with the member id and handle of its join response and
+    /// with its own public key. The approval wraps do not bind the member id; this does. A
+    /// device refuses to push until it passes.
+    pub fn check_own_approval(
+        &self,
+        device_id: Uuid,
+        member_id: Uuid,
+        handle: &str,
+        public: &[u8; 32],
+    ) -> Result<(), Error> {
+        let d = self
+            .devices
+            .get(&device_id)
+            .ok_or(Error::Rejected("no verified roster entry for this device"))?;
+        if d.member_id != member_id {
+            return Err(Error::Rejected(
+                "the roster names another member for this device",
+            ));
+        }
+        if d.public_key != *public {
+            return Err(Error::Rejected(
+                "the roster names another key for this device",
+            ));
+        }
+        let m = self
+            .members
+            .get(&member_id)
+            .ok_or(Error::Rejected("member not in the roster"))?;
+        if m.handle != handle {
+            return Err(Error::Rejected(
+                "the roster names another handle for this member",
+            ));
+        }
+        if d.revoked || m.revoked {
+            return Err(Error::Rejected("this device or its member is revoked"));
+        }
+        Ok(())
+    }
+
     /// How `awm team members` shows a device the server lists.
     pub fn status(&self, listed: &ListedDevice) -> DeviceStatus {
         match self.devices.get(&listed.device_id) {
@@ -1721,8 +1867,10 @@ impl RotationPlan {
         &self.not_listed
     }
 
-    /// Devices of other members that a removed member approved; wrapped, but shown to the
-    /// rotating admin (an admin could have enrolled a device for someone else before removal).
+    /// Devices of other members that a removed member approved, and devices whose approving
+    /// device is revoked; wrapped, but shown to the rotating admin (an admin could have enrolled
+    /// a device for someone else before removal, and a lost device could have approved one
+    /// before its revocation; RVT1 m6).
     pub fn approved_by_removed(&self) -> &[Uuid] {
         &self.approved_by_removed
     }
@@ -1763,8 +1911,12 @@ pub fn plan_rotation(
         } else if d.revoked || roster.members.get(&d.member_id).is_none_or(|m| m.revoked) {
             plan.revoked.push(l.device_id);
         } else {
-            let approver_member = roster.devices.get(&d.approver).map(|a| a.member_id);
-            if approver_member.is_some_and(|m| m != d.member_id && removed_members.contains(&m)) {
+            let suspect = d.approver != l.device_id
+                && roster.devices.get(&d.approver).is_some_and(|a| {
+                    a.revoked
+                        || (a.member_id != d.member_id && removed_members.contains(&a.member_id))
+                });
+            if suspect {
                 plan.approved_by_removed.push(l.device_id);
             }
             plan.wrap_to.push(ListedDevice {

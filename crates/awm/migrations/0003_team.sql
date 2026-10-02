@@ -9,7 +9,9 @@ ALTER TABLE event ADD COLUMN origin TEXT NOT NULL DEFAULT 'local'
 ALTER TABLE event ADD COLUMN member TEXT;            -- team rows: author's member id; local rows: NULL
 ALTER TABLE event ADD COLUMN repo_key TEXT;          -- keyed hash of the normalised git remote, when known
 ALTER TABLE event ADD COLUMN shareable TEXT NOT NULL DEFAULT 'no'
-  CHECK (shareable IN ('no','full','link'));         -- local rows: decided at push; team rows: as received
+  CHECK (shareable IN ('no','never','full','link')); -- local rows: 'no' until pushed (eligibility is share_rule at push),
+                                                     -- 'never' after team unshare --record, the pushed level after the push;
+                                                     -- team rows: as received
 ALTER TABLE event ADD COLUMN sync_id TEXT;           -- record id on the wire (random UUIDv4)
 ALTER TABLE event ADD COLUMN pushed_at INTEGER;      -- local rows: when the server accepted the record
 ALTER TABLE event ADD COLUMN sync_idx INTEGER;       -- local rows: idx in this device's rec stream (re-seed)
@@ -31,11 +33,37 @@ CREATE TABLE sync_stream (
 
 CREATE TABLE sync_outbox (
   id          INTEGER PRIMARY KEY,
-  kind        TEXT    NOT NULL CHECK (kind IN ('record','delete','flag','stats','policy')),
-  ref         TEXT    NOT NULL,  -- event id, sync_id or a JSON body
+  kind        TEXT    NOT NULL CHECK (kind IN ('record','roster','delete','flag','stats','policy')),
+  ref         TEXT    NOT NULL,  -- record, roster, flag, stats, policy: "tag:idx" of the sync_own row
+                                 -- holding the exact item; delete: a sync_id or a JSON body
   created_at  INTEGER NOT NULL,
   attempts    INTEGER NOT NULL DEFAULT 0,
   last_error  TEXT
+);
+
+-- Every item this device pushed or queued, per own stream (sync-v1 §9.3, §11): the exact
+-- blob a retry resends, and what a re-seed after a restore pushes again.
+CREATE TABLE sync_own (
+  tag        TEXT    NOT NULL,
+  idx        INTEGER NOT NULL,
+  record_id  TEXT    NOT NULL,
+  epoch      INTEGER,            -- NULL for a marker
+  blob       BLOB,               -- the envelope as sent; NULL for a marker, and for rec once
+                                 -- pushed (rebuilt from event via sync_idx and re-sealed)
+  deleted    INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0,1)),  -- 1: a marker fills this idx
+  PRIMARY KEY (tag, idx)
+);
+
+-- Every roster record pulled or written, kept so the roster is re-verified from what this
+-- client has seen and a restored server cannot undo a revocation (sync-v1 §11, crypto §7).
+CREATE TABLE roster_record (
+  member_id  TEXT    NOT NULL,
+  device_id  TEXT    NOT NULL,
+  idx        INTEGER NOT NULL,
+  record_id  TEXT    NOT NULL,
+  epoch      INTEGER NOT NULL,
+  blob       BLOB    NOT NULL,
+  PRIMARY KEY (member_id, device_id, idx)
 );
 
 -- The roster this client has verified (plan-v3-team §5.1).
@@ -43,7 +71,7 @@ CREATE TABLE team_member (
   member_id   TEXT    PRIMARY KEY,
   handle      TEXT    NOT NULL,
   role        TEXT    NOT NULL CHECK (role IN ('member','admin')),
-  active      INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
+  active      INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),    -- a removal never goes back to 1
   updated_at  INTEGER NOT NULL
 );
 
@@ -52,7 +80,7 @@ CREATE TABLE team_device (
   member_id   TEXT    NOT NULL,
   pubkey      TEXT    NOT NULL,  -- base64url of the 32-byte X25519 public key
   verified    INTEGER NOT NULL CHECK (verified IN (0,1)),   -- a verified roster entry exists
-  revoked     INTEGER NOT NULL DEFAULT 0 CHECK (revoked IN (0,1)),
+  revoked     INTEGER NOT NULL DEFAULT 0 CHECK (revoked IN (0,1)),   -- only rises (sync-v1 §11)
   approver    TEXT,              -- device id that approved it (roster entry); NULL for genesis or unverified
   updated_at  INTEGER NOT NULL
 );

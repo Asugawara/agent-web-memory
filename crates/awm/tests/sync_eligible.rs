@@ -276,13 +276,26 @@ fn share_all_projects_opts_in_everything_from_its_time() {
     let mut cfg = Config::default();
     cfg.team.share_all_projects = true;
     let mut p = TeamPolicy::default();
-    p.opt_in.share_all_since = CREATED_MS;
+    p.opt_in.share_all_since = Some(CREATED_MS);
     assert!(check(&plain(), &cfg, &p).cleared().is_some());
-    p.opt_in.share_all_since = CREATED_MS + 1;
+    p.opt_in.share_all_since = Some(CREATED_MS + 1);
     assert!(check(&plain(), &cfg, &p).cleared().is_none());
     cfg.team.share_all_projects = false;
-    p.opt_in.share_all_since = 0;
+    p.opt_in.share_all_since = Some(0);
     assert!(check(&plain(), &cfg, &p).cleared().is_none());
+}
+
+/// RVT1 m14: the switch without a stored switch-on time shares no history at all.
+#[test]
+fn share_all_projects_without_a_stored_time_shares_nothing() {
+    let mut cfg = Config::default();
+    cfg.team.share_all_projects = true;
+    let p = TeamPolicy::default();
+    assert_eq!(p.opt_in.share_all_since, None);
+    assert!(matches!(
+        check(&plain(), &cfg, &p),
+        Eligibility::Skipped(SkipReason::NotOptedIn)
+    ));
 }
 
 // ----- row 3: hosts -----
@@ -670,6 +683,43 @@ fn a_secret_in_a_text_a_link_record_does_not_carry_does_not_block_it() {
         )],
     );
     blocked_secret(&run(&rec), "secret-assignment");
+}
+
+/// RVT1 m1: a title is re-redacted whole before it is cut to 120 characters, so a token that
+/// straddles the cut (here: 16 of its 36 characters before it) still blocks.
+#[test]
+fn a_secret_straddling_the_title_cut_blocks_the_record() {
+    let token = format!("ghp_{}", "b".repeat(36));
+    let title = format!("{} {token}", "x".repeat(99));
+    assert!(title.chars().count() > 120 && title.chars().take(120).count() == 120);
+    let rec = search(
+        "q",
+        "A summary of results.",
+        vec![row(1, "https://example.com/a", Some(&title))],
+    );
+    blocked_secret(&run(&rec), "github-token");
+    // payload::build follows the same order on a record that reaches it directly.
+    let ctx = ShareCtx::new(Share::Full, None, &Config::default(), &open());
+    let err = build(&rec, &ctx).unwrap_err().to_string();
+    assert!(err.contains("github-token"), "{err}");
+    // A long clean title is still cut to 120 characters.
+    let clean = "y".repeat(130);
+    let rec = search(
+        "q",
+        "A summary of results.",
+        vec![row(1, "https://example.com/a", Some(&clean))],
+    );
+    let e = run(&rec);
+    let c = shared(&e);
+    assert_eq!(
+        c.record.results[0]
+            .title
+            .as_deref()
+            .unwrap()
+            .chars()
+            .count(),
+        120
+    );
 }
 
 // ----- row 7: personal kinds replaced -----

@@ -2,57 +2,188 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://awm.invalid/schemas/v1/plaintext.roster.schema.json",
   "title": "Plaintext of a roster record, schema 1",
+  "description": "entry is keys::RosterEntry; the rules are docs/sync-v1-crypto.md section 7",
   "type": "object",
   "properties": {
     "schema": {
       "type": "integer",
       "minimum": 1,
       "maximum": 1,
-      "description": "a reader skips a higher schema (it decodes as Newer)"
+      "description": "a reader keeps a higher schema unverified (fail closed, docs/sync-v1.md 14.4)"
     },
-    "kind": {
-      "enum": [
-        "approve",
-        "revoke",
-        "epoch"
+    "entry": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "genesis"
+            },
+            "member_id": {
+              "$ref": "common.schema.json#/$defs/id"
+            },
+            "handle": {
+              "$ref": "common.schema.json#/$defs/handle"
+            },
+            "device_id": {
+              "$ref": "common.schema.json#/$defs/id"
+            },
+            "device_pub": {
+              "$ref": "common.schema.json#/$defs/key32"
+            },
+            "org_nonce": {
+              "$ref": "common.schema.json#/$defs/nonce16"
+            },
+            "created_at": {
+              "$ref": "common.schema.json#/$defs/time"
+            }
+          },
+          "required": [
+            "created_at",
+            "device_id",
+            "device_pub",
+            "handle",
+            "member_id",
+            "org_nonce",
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "approve"
+            },
+            "member_id": {
+              "$ref": "common.schema.json#/$defs/id"
+            },
+            "handle": {
+              "$ref": "common.schema.json#/$defs/handle"
+            },
+            "role": {
+              "$ref": "common.schema.json#/$defs/role"
+            },
+            "kind": {
+              "$ref": "common.schema.json#/$defs/invite_kind"
+            },
+            "device_id": {
+              "$ref": "common.schema.json#/$defs/id"
+            },
+            "device_pub": {
+              "$ref": "common.schema.json#/$defs/key32"
+            },
+            "approved_at": {
+              "$ref": "common.schema.json#/$defs/time"
+            },
+            "approver_device_id": {
+              "$ref": "common.schema.json#/$defs/id"
+            }
+          },
+          "required": [
+            "approved_at",
+            "approver_device_id",
+            "device_id",
+            "device_pub",
+            "handle",
+            "kind",
+            "member_id",
+            "role",
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "recover"
+            },
+            "member_id": {
+              "$ref": "common.schema.json#/$defs/id"
+            },
+            "handle": {
+              "$ref": "common.schema.json#/$defs/handle"
+            },
+            "device_id": {
+              "$ref": "common.schema.json#/$defs/id"
+            },
+            "device_pub": {
+              "$ref": "common.schema.json#/$defs/key32"
+            },
+            "recovered_at": {
+              "$ref": "common.schema.json#/$defs/time"
+            }
+          },
+          "required": [
+            "device_id",
+            "device_pub",
+            "handle",
+            "member_id",
+            "recovered_at",
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "revoke"
+            },
+            "member_id": {
+              "$ref": "common.schema.json#/$defs/id"
+            },
+            "device_id": {
+              "description": "absent: the whole member",
+              "$ref": "common.schema.json#/$defs/id"
+            },
+            "revoked_at": {
+              "$ref": "common.schema.json#/$defs/time"
+            },
+            "by_device_id": {
+              "$ref": "common.schema.json#/$defs/id"
+            }
+          },
+          "required": [
+            "by_device_id",
+            "member_id",
+            "revoked_at",
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "epoch"
+            },
+            "epoch": {
+              "$ref": "common.schema.json#/$defs/u32"
+            },
+            "devices": {
+              "type": "array",
+              "items": {
+                "$ref": "common.schema.json#/$defs/id"
+              }
+            },
+            "created_at": {
+              "$ref": "common.schema.json#/$defs/time"
+            },
+            "by_device_id": {
+              "$ref": "common.schema.json#/$defs/id"
+            }
+          },
+          "required": [
+            "by_device_id",
+            "created_at",
+            "devices",
+            "epoch",
+            "type"
+          ]
+        }
       ]
-    },
-    "member_id": {
-      "$ref": "common.schema.json#/$defs/id"
-    },
-    "handle": {
-      "$ref": "common.schema.json#/$defs/handle"
-    },
-    "role": {
-      "$ref": "common.schema.json#/$defs/role"
-    },
-    "device_id": {
-      "$ref": "common.schema.json#/$defs/id"
-    },
-    "device_pubkey": {
-      "$ref": "common.schema.json#/$defs/key32"
-    },
-    "epoch": {
-      "$ref": "common.schema.json#/$defs/u32"
-    },
-    "devices": {
-      "type": "array",
-      "items": {
-        "$ref": "common.schema.json#/$defs/id"
-      }
-    },
-    "at": {
-      "$ref": "common.schema.json#/$defs/time"
-    },
-    "approver_device_id": {
-      "$ref": "common.schema.json#/$defs/id"
     }
   },
   "required": [
-    "approver_device_id",
-    "at",
-    "kind",
-    "member_id",
+    "entry",
     "schema"
   ]
 }

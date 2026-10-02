@@ -26,6 +26,8 @@ const TABLES: &[&str] = &[
     "sync_state",
     "sync_stream",
     "sync_outbox",
+    "sync_own",
+    "roster_record",
     "team_member",
     "team_device",
     "project",
@@ -670,6 +672,28 @@ fn fresh_schema_has_every_team_column_table_and_foreign_key() {
             ],
         ),
         (
+            "sync_own",
+            vec![
+                col("tag", "TEXT", true, None),
+                col("idx", "INTEGER", true, None),
+                col("record_id", "TEXT", true, None),
+                col("epoch", "INTEGER", false, None),
+                col("blob", "BLOB", false, None),
+                col("deleted", "INTEGER", true, Some("0")),
+            ],
+        ),
+        (
+            "roster_record",
+            vec![
+                col("member_id", "TEXT", true, None),
+                col("device_id", "TEXT", true, None),
+                col("idx", "INTEGER", true, None),
+                col("record_id", "TEXT", true, None),
+                col("epoch", "INTEGER", true, None),
+                col("blob", "BLOB", true, None),
+            ],
+        ),
+        (
             "team_member",
             vec![
                 col("member_id", "TEXT", false, None),
@@ -735,6 +759,8 @@ fn fresh_schema_has_every_team_column_table_and_foreign_key() {
     assert_eq!(pk("sync_state"), ["key"]);
     assert_eq!(pk("sync_stream"), ["member_id", "device_id", "tag"]);
     assert_eq!(pk("sync_outbox"), ["id"]);
+    assert_eq!(pk("sync_own"), ["tag", "idx"]);
+    assert_eq!(pk("roster_record"), ["member_id", "device_id", "idx"]);
     assert_eq!(pk("team_member"), ["member_id"]);
     assert_eq!(pk("team_device"), ["device_id"]);
     assert_eq!(pk("project"), ["cwd_hash"]);
@@ -779,6 +805,8 @@ fn fresh_schema_has_every_team_column_table_and_foreign_key() {
         "sync_state",
         "sync_stream",
         "sync_outbox",
+        "sync_own",
+        "roster_record",
         "team_member",
         "team_device",
         "project",
@@ -825,14 +853,22 @@ fn team_checks_reject_values_outside_their_sets() {
     let inj = insert_injection_chain(&conn, "0000abcd", ev);
     let ok = [
         "UPDATE event SET origin = 'team', shareable = 'full' WHERE id = 1".to_string(),
+        // RVT1 M4: 'never' marks a record the user unshared; 'no' is "not pushed yet".
+        "UPDATE event SET origin = 'local', shareable = 'never' WHERE id = 1".to_string(),
         "UPDATE event SET shareable = 'link', sync_id = 'u1', member = 'm', repo_key = 'r', \
          pushed_at = 1, sync_idx = 0 WHERE id = 1"
             .to_string(),
         "INSERT INTO sync_state (key, value) VALUES ('deletion_head', '0')".to_string(),
         "INSERT INTO sync_stream VALUES ('m', 'd', 'rec', 0)".to_string(),
-        "INSERT INTO sync_outbox (kind, ref, created_at) VALUES ('record', '1', 1), \
-         ('delete', 'u', 1), ('flag', '{}', 1), ('stats', '{}', 1), ('policy', '{}', 1)"
+        "INSERT INTO sync_outbox (kind, ref, created_at) VALUES ('record', 'rec:0', 1), \
+         ('roster', 'roster:0', 1), ('delete', 'u', 1), ('flag', 'flag:0', 1), \
+         ('stats', 'stats:0', 1), ('policy', 'policy:0', 1)"
             .to_string(),
+        "INSERT INTO sync_own (tag, idx, record_id, epoch, blob) VALUES ('rec', 0, 'r0', 1, x'01'), \
+         ('roster', 0, 'r1', 1, x'01')"
+            .to_string(),
+        "INSERT INTO sync_own (tag, idx, record_id, deleted) VALUES ('rec', 1, 'r2', 1)".to_string(),
+        "INSERT INTO roster_record VALUES ('m', 'd', 0, 'r3', 0, x'01')".to_string(),
         "INSERT INTO team_member (member_id, handle, role, updated_at) VALUES ('m', 'h', 'member', 1), \
          ('a', 'g', 'admin', 1)"
             .to_string(),
@@ -853,6 +889,10 @@ fn team_checks_reject_values_outside_their_sets() {
         "UPDATE event SET shareable = 'yes' WHERE id = 1",
         "UPDATE event SET shareable = NULL WHERE id = 1",
         "INSERT INTO sync_outbox (kind, ref, created_at) VALUES ('other', '1', 1)",
+        "INSERT INTO sync_own (tag, idx, record_id, deleted) VALUES ('rec', 9, 'r9', 2)",
+        "INSERT INTO sync_own (tag, idx) VALUES ('rec', 9)",
+        "INSERT INTO roster_record (member_id, device_id, idx, record_id, epoch) \
+         VALUES ('m', 'd', 9, 'r', 0)",
         "INSERT INTO team_member (member_id, handle, role, updated_at) VALUES ('x', 'h', 'owner', 1)",
         "INSERT INTO team_member (member_id, handle, role, active, updated_at) VALUES ('x', 'h', 'member', 2, 1)",
         "INSERT INTO team_device (device_id, member_id, pubkey, verified, updated_at) VALUES ('x', 'm', 'k', 2, 1)",
@@ -1084,6 +1124,8 @@ fn v2_database_with_data_migrates_to_v3_and_keeps_every_row() {
         "sync_state",
         "sync_stream",
         "sync_outbox",
+        "sync_own",
+        "roster_record",
         "team_member",
         "team_device",
         "project",
