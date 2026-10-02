@@ -2571,11 +2571,15 @@ impl Store for SqliteStore {
     fn retention_batch(&self, cutoff: i64, limit: u32, now: i64) -> StoreFuture<'_, u64> {
         self.write(move |tx| {
             promote_retention(tx, now)?;
-            // TM9 F1: `roster` records are never deleted by retention (crypto §7).
+            // TM9 F1: `roster` records are never deleted by retention (crypto §7). TM9 P1: the
+            // newest `policy` record of each stream is kept whatever its age; older ones expire.
             let rows: Vec<(String, String)> = tx
                 .prepare(
                     "SELECT id, member_id FROM record \
                       WHERE blob IS NOT NULL AND received_at < ?1 AND tag <> 'roster' \
+                        AND NOT (tag = 'policy' AND idx = (SELECT MAX(p.idx) FROM record p \
+                              WHERE p.member_id = record.member_id \
+                                AND p.device_id = record.device_id AND p.tag = 'policy')) \
                       ORDER BY received_at, rowid LIMIT ?2",
                 )?
                 .query_map(params![cutoff, limit], |r| Ok((r.get(0)?, r.get(1)?)))?

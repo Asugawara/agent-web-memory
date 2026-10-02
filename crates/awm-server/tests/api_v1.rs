@@ -70,6 +70,30 @@ impl LogSink for Capture {
 // ---------------------------------------------------------------------------------------------
 // The server under test
 
+/// Which retention runner a test server gets.
+enum Runner {
+    Given(http::RetentionRunner),
+    /// TM9's runner over the server's store and the test clock.
+    Clocked,
+    /// Whatever `AppState::new` installs.
+    Default,
+}
+
+/// The test clock as TM9's `retention::Clock`; a sleep returns at once.
+struct TestClock(Arc<AtomicI64>);
+
+impl awm_server::retention::Clock for TestClock {
+    fn now(&self) -> i64 {
+        self.0.load(Ordering::SeqCst)
+    }
+    fn sleep(
+        &self,
+        _secs: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::ready(()))
+    }
+}
+
 struct Srv {
     store: Arc<SqliteStore>,
     state: AppState,
@@ -97,13 +121,9 @@ impl Srv {
     /// A server whose retention runner is `runner` (default: a counting stand-in).
     fn build(f: impl FnOnce(&mut ServerConfig), runner: Option<http::RetentionRunner>) -> Srv {
         let dir = TempDir::new("srv");
-        let data = dir.0.join("data");
-        let store = Arc::new(SqliteStore::open(&data).unwrap());
         let mut cfg = base_config();
         cfg.export_dir = dir.0.clone();
         f(&mut cfg);
-        let clock = Arc::new(AtomicI64::new(T0));
-        let logs = Arc::new(Capture::default());
         let calls = Arc::new(AtomicU32::new(0));
         let c = calls.clone();
         let runner = runner.unwrap_or_else(|| {
@@ -112,11 +132,90 @@ impl Srv {
                 Ok(7)
             })
         });
+        let clock = Arc::new(AtomicI64::new(T0));
+        Srv::assemble(
+            dir,
+            cfg,
+            clock,
+            Arc::new(Capture::default()),
+            calls,
+            Runner::Given(runner),
+        )
+    }
+
+    /// A server whose retention runner is TM9's `retention::runner_with_clock` over its store
+    /// and the test clock.
+    fn real(f: impl FnOnce(&mut ServerConfig)) -> Srv {
+        Srv::with_runner(f, Runner::Clocked)
+    }
+
+    /// A server that keeps `AppState::new`'s own default runner (`retention::runner`, which
+    /// reads the system clock).
+    fn default_runner(f: impl FnOnce(&mut ServerConfig)) -> Srv {
+        Srv::with_runner(f, Runner::Default)
+    }
+
+    fn with_runner(f: impl FnOnce(&mut ServerConfig), runner: Runner) -> Srv {
+        let dir = TempDir::new("srv");
+        let mut cfg = base_config();
+        cfg.export_dir = dir.0.clone();
+        f(&mut cfg);
+        let clock = Arc::new(AtomicI64::new(T0));
+        Srv::assemble(
+            dir,
+            cfg,
+            clock,
+            Arc::new(Capture::default()),
+            Arc::new(AtomicU32::new(0)),
+            runner,
+        )
+    }
+
+    /// Closes the store and opens a new `AppState` on the same `server.db`, with the same
+    /// configuration, clock and a `retention::runner_with_clock`: a process restart.
+    fn restart(self) -> Srv {
+        let Srv {
+            store,
+            state,
+            router,
+            clock,
+            logs,
+            retention_calls,
+            _dir,
+            ..
+        } = self;
+        let cfg = (*state.config).clone();
+        drop(router);
+        drop(state);
+        drop(store);
+        Srv::assemble(_dir, cfg, clock, logs, retention_calls, Runner::Clocked)
+    }
+
+    fn assemble(
+        dir: TempDir,
+        cfg: ServerConfig,
+        clock: Arc<AtomicI64>,
+        logs: Arc<Capture>,
+        calls: Arc<AtomicU32>,
+        runner: Runner,
+    ) -> Srv {
+        let data = dir.0.join("data");
+        let store = Arc::new(SqliteStore::open(&data).unwrap());
         let ck = clock.clone();
-        let state = AppState::new(store.clone() as Arc<dyn Store>, cfg)
+        let mut state = AppState::new(store.clone() as Arc<dyn Store>, cfg)
             .with_clock(Arc::new(move || ck.load(Ordering::SeqCst)))
-            .with_log_sink(logs.clone())
-            .with_retention_runner(runner);
+            .with_log_sink(logs.clone());
+        match runner {
+            Runner::Given(runner) => state = state.with_retention_runner(runner),
+            Runner::Clocked => {
+                let r = awm_server::retention::runner_with_clock(
+                    store.clone() as Arc<dyn Store>,
+                    Arc::new(TestClock(clock.clone())),
+                );
+                state = state.with_retention_runner(Arc::new(r));
+            }
+            Runner::Default => {}
+        }
         let router = http::router(state.clone());
         Srv {
             store,
@@ -3058,6 +3157,332 @@ async fn the_internal_retention_route_needs_its_token_and_runs_the_runner_once()
     srv.send(R::get("/internal/retention").no_client().bearer(token))
         .await
         .expect_err(404, ErrorCode::NotFound);
+}
+
+// --- TM9W: deletion and retention through the router (TM9's `delete` and `retention`) -------
+
+fn ids_of(items: &[Value]) -> Vec<String> {
+    items
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// `n` bytes that start with the envelope version byte and are otherwise unique to `seed`.
+fn noise(n: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut v = vec![0x01u8];
+    while v.len() < n {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        v.push((x >> 24) as u8);
+    }
+    v
+}
+
+fn contains_window(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// `server.db` and its WAL, one after the other.
+fn db_and_wal(srv: &Srv) -> Vec<u8> {
+    let db = srv.data.join(DB_FILE);
+    let mut wal = db.clone().into_os_string();
+    wal.push("-wal");
+    let mut out = std::fs::read(&db).unwrap();
+    out.extend(std::fs::read(PathBuf::from(wal)).unwrap_or_default());
+    out
+}
+
+/// The held (`true`) and deleted (`false`) positions of one stream, read as `admin`.
+async fn stream_state(srv: &Srv, admin: &Who, of: &Who, tag: &str) -> Vec<bool> {
+    let q = format!(
+        "/v1/records?member={}&device={}&tag={tag}&from=0&limit=100",
+        of.member, of.device
+    );
+    let r = srv.send(R::get(&q).auth(admin)).await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    r.json()["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i.get("deleted") != Some(&json!(true)))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_bulk_delete_writes_its_notice_and_the_hourly_limit_survives_a_restart() {
+    let srv = Srv::real(|_| {});
+    let admin = srv.bootstrap().await;
+    let roy = srv.add_member(&admin, "roy", "member").await;
+    let e = srv.epoch().await;
+    assert_eq!(
+        srv.push(&roy, srv.items("rec", 0, 2, e, SMALL))
+            .await
+            .status,
+        200
+    );
+    let r = srv
+        .send(
+            R::post("/v1/delete")
+                .auth(&roy)
+                .json(&json!({"all_mine": true})),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(r.json(), json!({"deleted": 2, "already": 0}));
+    let rows = srv.store.audit(0, 200).await.unwrap().rows;
+    let notices: Vec<_> = rows
+        .iter()
+        .filter(|r| r.action == "delete.notice")
+        .collect();
+    assert_eq!(notices.len(), 1, "one notice row for the bulk delete");
+    assert_eq!(notices[0].actor, Some(roy.member));
+    assert_eq!(
+        notices[0].target.as_deref(),
+        Some(roy.device.to_string().as_str())
+    );
+
+    // A new process on the same server.db: the allowance is read from the audit log.
+    let srv = srv.restart();
+    srv.advance(60);
+    let r = srv
+        .send(
+            R::post("/v1/delete")
+                .auth(&roy)
+                .json(&json!({"all_mine": true})),
+        )
+        .await;
+    let body = r.expect_err(429, ErrorCode::RateLimited);
+    assert_eq!(body.retry_after_s, Some(3_540));
+    assert_eq!(r.header("retry-after").as_deref(), Some("3540"));
+    // By ids is not limited, and the hour ends 3,600 s after the first bulk delete.
+    assert_eq!(
+        srv.send(
+            R::post("/v1/delete")
+                .auth(&roy)
+                .json(&json!({"ids": [Id::new_v4().to_string()]}))
+        )
+        .await
+        .status,
+        200
+    );
+    srv.advance(3_540);
+    let r = srv
+        .send(
+            R::post("/v1/delete")
+                .auth(&roy)
+                .json(&json!({"all_mine": true})),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+}
+
+#[tokio::test]
+async fn delete_ids_naming_a_roster_record_is_400_on_ids_and_deletes_nothing() {
+    let srv = Srv::real(|_| {});
+    let admin = srv.bootstrap().await;
+    let roy = srv.add_member(&admin, "roy", "member").await;
+    let e = srv.epoch().await;
+    let roster = srv.items("roster", 0, 2, e, SMALL);
+    let recs = srv.items("rec", 0, 2, e, SMALL);
+    assert_eq!(srv.push(&roy, roster.clone()).await.status, 200);
+    assert_eq!(srv.push(&roy, recs.clone()).await.status, 200);
+    let (roster, recs) = (ids_of(&roster), ids_of(&recs));
+    for who in [&roy, &admin] {
+        let r = srv
+            .send(
+                R::post("/v1/delete")
+                    .auth(who)
+                    .json(&json!({"ids": [recs[0], roster[1]]})),
+            )
+            .await;
+        let body = r.expect_err(400, ErrorCode::InvalidValue);
+        assert_eq!(body.field.as_deref(), Some("/ids"));
+    }
+    assert_eq!(
+        stream_state(&srv, &admin, &roy, "roster").await,
+        [true, true]
+    );
+    assert_eq!(stream_state(&srv, &admin, &roy, "rec").await, [true, true]);
+    let dl = srv
+        .send(R::get("/v1/deletions?from=0").auth(&admin))
+        .await
+        .json();
+    assert!(dl["entries"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_200_delete_leaves_no_deleted_bytes_in_the_database_or_the_wal() {
+    let srv = Srv::real(|_| {});
+    let admin = srv.bootstrap().await;
+    let roy = srv.add_member(&admin, "roy", "member").await;
+    let e = srv.epoch().await;
+    let (small, large, kept) = (noise(SMALL, 1), noise(LARGEST, 2), noise(SMALL, 3));
+    let items: Vec<Value> = [(&small, 0u64), (&large, 1), (&kept, 2)]
+        .iter()
+        .map(|(b, i)| json!({"tag": "rec", "idx": i, "id": Id::new_v4().to_string(), "epoch": e, "blob": b64(b)}))
+        .collect();
+    assert_eq!(srv.push(&roy, items.clone()).await.status, 200);
+    let windows = |b: &[u8]| -> Vec<Vec<u8>> {
+        [100usize, 5_000, 12_000]
+            .iter()
+            .filter(|o| **o + 48 <= b.len())
+            .map(|o| b[*o..*o + 48].to_vec())
+            .collect()
+    };
+    let before = db_and_wal(&srv);
+    for b in [&small, &large, &kept] {
+        for w in windows(b) {
+            assert!(contains_window(&before, &w), "positive control");
+        }
+    }
+    let ids = [items[0]["id"].clone(), items[1]["id"].clone()];
+    let r = srv
+        .send(
+            R::post("/v1/delete")
+                .auth(&roy)
+                .json(&json!({ "ids": ids })),
+        )
+        .await;
+    assert_eq!(r.json(), json!({"deleted": 2, "already": 0}));
+    let after = db_and_wal(&srv);
+    for b in [&small, &large] {
+        for w in windows(b) {
+            assert!(!contains_window(&after, &w), "deleted bytes remain");
+        }
+    }
+    for w in windows(&kept) {
+        assert!(contains_window(&after, &w), "the neighbour stays");
+    }
+}
+
+#[tokio::test]
+async fn removing_a_member_with_delete_records_keeps_their_roster_records() {
+    let srv = Srv::real(|_| {});
+    let admin = srv.bootstrap().await;
+    let roy = srv.add_member(&admin, "roy", "member").await;
+    let e = srv.epoch().await;
+    assert_eq!(
+        srv.push(&roy, srv.items("roster", 0, 2, e, SMALL))
+            .await
+            .status,
+        200
+    );
+    assert_eq!(
+        srv.push(&roy, srv.items("rec", 0, 3, e, SMALL))
+            .await
+            .status,
+        200
+    );
+    let r = srv
+        .send(
+            R::post(&format!("/v1/members/{}/remove", roy.member))
+                .auth(&admin)
+                .json(&json!({"delete_records": true})),
+        )
+        .await;
+    assert_eq!(r.status, 204, "{}", r.text());
+    assert_eq!(stream_state(&srv, &admin, &roy, "rec").await, [false; 3]);
+    assert_eq!(
+        stream_state(&srv, &admin, &roy, "roster").await,
+        [true, true]
+    );
+    let dl = srv
+        .send(R::get("/v1/deletions?from=0").auth(&admin))
+        .await
+        .json();
+    assert_eq!(
+        dl["entries"].as_array().unwrap().len(),
+        3,
+        "no roster entry"
+    );
+}
+
+#[tokio::test]
+async fn the_internal_route_runs_the_real_retention_once_an_hour() {
+    let token = "cloud-scheduler-secret";
+    let srv = Srv::real(|c| c.internal_token_hash = Some(auth::hash(token)));
+    let admin = srv.bootstrap().await;
+    let roy = srv.add_member(&admin, "roy", "member").await;
+    let e = srv.epoch().await;
+    assert_eq!(
+        srv.push(&roy, srv.items("rec", 0, 3, e, SMALL))
+            .await
+            .status,
+        200
+    );
+    assert_eq!(
+        srv.push(&roy, srv.items("roster", 0, 1, e, SMALL))
+            .await
+            .status,
+        200
+    );
+    let call = || srv.send(R::post("/internal/retention").no_client().bearer(token));
+    srv.advance(400 * DAY);
+    let r = call().await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(r.json(), json!({"removed": 3}));
+    assert_eq!(stream_state(&srv, &admin, &roy, "rec").await, [false; 3]);
+    assert_eq!(stream_state(&srv, &admin, &roy, "roster").await, [true]);
+    // The store-wide gate: a second call within the hour does nothing and writes nothing.
+    srv.advance(3_599);
+    assert_eq!(call().await.json(), json!({"removed": 0}));
+    let audit = srv.store.audit(0, 200).await.unwrap().rows;
+    assert_eq!(audit.iter().filter(|r| r.action == "retention").count(), 1);
+    srv.advance(1);
+    assert_eq!(call().await.json(), json!({"removed": 0}));
+    let audit = srv.store.audit(0, 200).await.unwrap().rows;
+    assert_eq!(audit.iter().filter(|r| r.action == "retention").count(), 2);
+}
+
+#[tokio::test]
+async fn app_state_new_installs_the_store_runner_not_the_stub() {
+    // The server clock runs 800 days behind the system clock, which the default runner reads.
+    let token = "cloud-scheduler-secret";
+    let srv = Srv::default_runner(|c| c.internal_token_hash = Some(auth::hash(token)));
+    srv.advance(-800 * DAY);
+    let admin = srv.bootstrap().await;
+    let roy = srv.add_member(&admin, "roy", "member").await;
+    let e = srv.epoch().await;
+    assert_eq!(
+        srv.push(&roy, srv.items("rec", 0, 2, e, SMALL))
+            .await
+            .status,
+        200
+    );
+    let call = || srv.send(R::post("/internal/retention").no_client().bearer(token));
+    let r = call().await;
+    assert_eq!(r.status, 200, "the stub would answer 500: {}", r.text());
+    assert_eq!(r.json(), json!({"removed": 2}));
+    assert_eq!(call().await.json(), json!({"removed": 0}));
+}
+
+#[tokio::test]
+async fn request_time_retention_runs_the_real_runner_off_the_request_thread() {
+    let srv = Srv::real(|c| c.retention = RetentionMode::InRequests);
+    let admin = srv.bootstrap().await;
+    let roy = srv.add_member(&admin, "roy", "member").await;
+    let e = srv.epoch().await;
+    assert_eq!(
+        srv.push(&roy, srv.items("rec", 0, 2, e, SMALL))
+            .await
+            .status,
+        200
+    );
+    srv.advance(400 * DAY);
+    assert_eq!(
+        srv.send(R::get("/v1/status").auth(&admin)).await.status,
+        200
+    );
+    assert!(srv.log_lines().iter().any(|l| l == "retention removed=2"));
+    assert_eq!(srv.store.deletions(0, 10).await.unwrap().entries.len(), 2);
+    // Within the hour no further run happens, in this process or in the store.
+    srv.advance(60);
+    srv.send(R::get("/v1/status").auth(&admin)).await;
+    let audit = srv.store.audit(0, 200).await.unwrap().rows;
+    assert_eq!(audit.iter().filter(|r| r.action == "retention").count(), 2);
 }
 
 // --- graceful shutdown ----------------------------------------------------------------------

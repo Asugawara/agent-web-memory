@@ -12,6 +12,7 @@ use super::error::{parse_json, ApiError};
 use super::{json, no_content, reply, AppState};
 use crate::auth;
 use crate::authz::Action;
+use crate::delete;
 
 /// `GET /v1/members`.
 pub(super) async fn list_members(State(app): State<AppState>, req: Request) -> Response {
@@ -109,7 +110,7 @@ async fn remove_inner(app: &AppState, id: &str, req: Request) -> Result<Response
     let id = path_id(id)?;
     let body: RemoveRequest = cx.json_or_empty().await?;
     let caller = cx.authenticate().await?;
-    auth::remove_member(
+    delete::remove_member(
         &*app.store,
         &caller,
         id,

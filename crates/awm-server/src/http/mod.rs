@@ -141,6 +141,8 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(store: Arc<dyn Store>, config: ServerConfig) -> AppState {
+        let retention_runner: RetentionRunner =
+            Arc::new(crate::retention::runner(Arc::clone(&store)));
         AppState {
             store,
             config: Arc::new(config),
@@ -152,7 +154,7 @@ impl AppState {
             }),
             log: Arc::new(StderrLog),
             limiter: Arc::new(RateLimiter::new()),
-            retention_runner: Arc::new(crate::retention::sweep),
+            retention_runner,
             retention_last: Arc::new(Mutex::new(None)),
         }
     }
