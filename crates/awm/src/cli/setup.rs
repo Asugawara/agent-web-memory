@@ -262,12 +262,25 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     result
 }
 
-/// This binary's path, single-quoted when it holds a space.
+/// This binary's path, single-quoted (`'` written as `'\''`) when it has any character
+/// outside `[A-Za-z0-9_./-]`.
 fn exe_for_shell(exe: &str) -> String {
-    if exe.contains(' ') {
-        format!("'{exe}'")
-    } else {
+    let plain = !exe.is_empty()
+        && exe
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'/' | b'-'));
+    if plain {
         exe.to_string()
+    } else {
+        format!("'{}'", exe.replace('\'', "'\\''"))
+    }
+}
+
+/// The inverse of [`exe_for_shell`]: a path in one single-quoted word, or unquoted.
+fn unquote_exe(word: &str) -> String {
+    match word.strip_prefix('\'').and_then(|w| w.strip_suffix('\'')) {
+        Some(inner) => inner.replace("'\\''", "'"),
+        None => word.to_string(),
     }
 }
 
@@ -281,7 +294,7 @@ fn statusline_line(exe: &str) -> String {
     )
 }
 
-/// True for `awm statusline` and `<path>/awm statusline` (path optionally single-quoted),
+/// True for `awm statusline` and `<path>/awm statusline` (path as [`exe_for_shell`] writes it),
 /// optionally followed by ` --quiet`.
 fn is_our_statusline(command: &str) -> bool {
     let c = command.trim();
@@ -289,8 +302,8 @@ fn is_our_statusline(command: &str) -> bool {
     let Some(exe) = c.strip_suffix(" statusline") else {
         return false;
     };
-    let exe = exe.trim_matches('\'');
-    Path::new(exe).file_name().is_some_and(|f| f == "awm")
+    let exe = unquote_exe(exe);
+    Path::new(&exe).file_name().is_some_and(|f| f == "awm")
 }
 
 /// Asks (or refuses without a terminal) as the hook flags do. False: the answer was no.

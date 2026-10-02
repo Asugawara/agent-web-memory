@@ -60,9 +60,25 @@ fn last_of_session(path: &Path, sid: &str) -> Option<Sample> {
     lines.filter_map(Sample::parse_line).rfind(|s| s.sid == sid)
 }
 
+/// False only when `path` is non-empty and its last byte is not `\n`. Unreadable counts as fine.
+fn ends_with_newline_or_empty(path: &Path) -> bool {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return true;
+    };
+    let Ok(len) = f.metadata().map(|m| m.len()) else {
+        return true;
+    };
+    if len == 0 {
+        return true;
+    }
+    let mut b = [0u8; 1];
+    f.seek(SeekFrom::Start(len - 1)).is_err() || f.read_exact(&mut b).is_err() || b[0] == b'\n'
+}
+
 /// Appends `s` to its month file unless the newest line of the same session
 /// has equal `h5`, `d7` and `cost`. `dir` is created (0700) when missing; the
-/// file is created 0600 and written with one `write` on an `O_APPEND` handle.
+/// file is created 0600 and written with one `write` on an `O_APPEND` handle (led by a
+/// `\n` when the file ends in an unterminated fragment).
 pub fn record(dir: &Path, s: &Sample) -> io::Result<Recorded> {
     crate::paths::ensure_private_dir(dir).map_err(|e| io::Error::other(e.to_string()))?;
     let path = month_file(dir, s.t);
@@ -79,7 +95,12 @@ pub fn record(dir: &Path, s: &Sample) -> io::Result<Recorded> {
         open.mode(0o600);
     }
     let mut f = open.open(&path)?;
-    let mut line = s.to_line();
+    let mut line = String::new();
+    if !ends_with_newline_or_empty(&path) {
+        // A fragment left by a failed write must not swallow this sample.
+        line.push('\n');
+    }
+    line.push_str(&s.to_line());
     line.push('\n');
     f.write_all(line.as_bytes())?;
     Ok(Recorded::Written)

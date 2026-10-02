@@ -507,3 +507,24 @@ fn prune_goes_on_after_a_file_it_cannot_delete() {
     assert!(stuck.exists());
     assert!(!d.join("samples-2026-02.ndjson").exists());
 }
+
+#[test]
+fn an_unterminated_fragment_does_not_swallow_the_next_sample() {
+    let env = Env::new();
+    std::fs::create_dir_all(env.quota()).unwrap();
+    let fragment = r#"{"v":1,"t":1,"sid":"zz","h5":{"p":1,"r":5}"#;
+    std::fs::write(env.month_file(), fragment).unwrap();
+    assert_silent_ok(&env.quiet(&fixture("integer.json")));
+    let raw = std::fs::read_to_string(env.month_file()).unwrap();
+    let lines: Vec<&str> = raw.lines().collect();
+    assert_eq!(lines.len(), 2, "{raw}");
+    assert_eq!(lines[0], fragment);
+    assert!(raw.ends_with('\n'));
+    assert!(serde_json::from_str::<Value>(lines[1]).is_ok(), "{raw}");
+    let all = store::read_all(&env.quota());
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].t, NOW.parse::<i64>().unwrap());
+    // The same values again: deduped against the new line.
+    assert_silent_ok(&env.quiet(&fixture("integer.json")));
+    assert_eq!(std::fs::read_to_string(env.month_file()).unwrap(), raw);
+}

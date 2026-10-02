@@ -1750,3 +1750,81 @@ fn config_list_shows_quota_keys() {
     }
     assert_eq!(std::fs::read_to_string(&file).unwrap(), saved);
 }
+
+/// A copy of the binary, named `awm`, in a directory named `dir_name`.
+#[cfg(unix)]
+fn awm_copy_in(root: &Path, dir_name: &str) -> PathBuf {
+    let dir = root.join(dir_name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let exe = dir.join("awm");
+    std::fs::copy(env!("CARGO_BIN_EXE_awm"), &exe).unwrap();
+    std::fs::canonicalize(exe).unwrap()
+}
+
+/// Runs `script` under `sh -c` with a fresh `AWM_HOME`; true when one sample was written.
+#[cfg(unix)]
+fn sh_writes_a_sample(script: &str) -> bool {
+    let home = tempfile::tempdir().unwrap();
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/statusline/integer.json");
+    let o = Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .env("AWM_HOME", home.path())
+        .env("FIXTURE", fixture)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{script}: {o:?}");
+    let quota = home.path().join("quota");
+    std::fs::read_dir(quota).is_ok_and(|d| {
+        d.flatten()
+            .any(|e| std::fs::read_to_string(e.path()).is_ok_and(|t| t.lines().count() == 1))
+    })
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_statusline_quotes_an_unusual_executable_path() {
+    let root = tempfile::tempdir().unwrap();
+    for dir_name in ["with space", "it's", "a&b", "x;y $z"] {
+        let exe = awm_copy_in(root.path(), dir_name);
+        let env = Env::new();
+        let settings = settings_of(&env);
+        let run = |args: &[&str]| {
+            let o = Command::new(&exe)
+                .args(args)
+                .env("AWM_HOME", env.awm_home())
+                .env("HOME", env.home())
+                .env_remove("CODEX_HOME")
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "{dir_name}: {o:?}");
+            String::from_utf8(o.stdout).unwrap()
+        };
+
+        // Written form: runs under sh and is removed again.
+        run(&["setup", "--statusline", "--yes"]);
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let command = v["statusLine"]["command"].as_str().unwrap().to_string();
+        assert!(
+            sh_writes_a_sample(&format!("{command} < \"$FIXTURE\"")),
+            "{dir_name}: {command}"
+        );
+        run(&["setup", "--remove-statusline", "--yes"]);
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert!(v.get("statusLine").is_none(), "{dir_name}: {command}");
+
+        // Printed form: runs under sh.
+        std::fs::write(
+            &settings,
+            json!({"statusLine": {"type": "command", "command": "bash x.sh"}}).to_string(),
+        )
+        .unwrap();
+        let text = run(&["setup", "--statusline"]);
+        let line = text.lines().nth(1).unwrap();
+        assert!(
+            sh_writes_a_sample(&format!("input=$(cat \"$FIXTURE\"); {line} wait")),
+            "{dir_name}: {line}"
+        );
+    }
+}
