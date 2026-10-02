@@ -116,12 +116,37 @@ async fn sqlite_fixture() -> Option<Fixture> {
 /// cases do not change.
 #[cfg(feature = "pg")]
 async fn pg_fixture() -> Option<Fixture> {
-    let url = std::env::var("AWM_TEST_PG_URL").ok()?;
-    let _ = awm_server::store::pg::PgStore::connect;
-    panic!(
-        "TM26: build a Fixture over PgStore for AWM_TEST_PG_URL ({} bytes)",
-        url.len()
-    );
+    // A schema of its own per fixture (dropped with it), migrated by the owner role and served
+    // by the application role; `store` is a new organisation scope, `reopen` a new pool on the
+    // same scope, `fresh` another new scope of the same database.
+    #[path = "support/pg.rs"]
+    mod support;
+    let env = Arc::new(support::PgEnv::new("conf").await?);
+    let org = Id::new_v4();
+    let store = env.store.create_org(org).await.unwrap();
+    let root = TempDir::new("pg");
+    let scratch = root.path().join("scratch");
+    std::fs::create_dir(&scratch).unwrap();
+    let reopen_url = env.app_url.clone();
+    let fresh_env = Arc::clone(&env);
+    Some(Fixture {
+        store,
+        reopen: Box::new(move || {
+            let url = reopen_url.clone();
+            Box::pin(async move {
+                let pg = awm_server::store::pg::PgStore::connect(&url, None, 10)
+                    .await
+                    .unwrap();
+                pg.for_org(org)
+            })
+        }),
+        fresh: Box::new(move || {
+            let env = Arc::clone(&fresh_env);
+            Box::pin(async move { env.store.create_org(Id::new_v4()).await.unwrap() })
+        }),
+        scratch,
+        _keep: Box::new((env, root)),
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
