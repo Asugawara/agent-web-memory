@@ -58,6 +58,16 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             dry_run: args.dry_run,
             ..Opts::default()
         };
+        // A joined device takes its keys once approved (TM12); until then there is nothing to do.
+        if !args.dry_run {
+            if let crate::team::JoinState::Waiting { .. } = crate::team::finish_join(&env.data_dir)?
+            {
+                return Ok(Outcome::Done(sync::Report {
+                    waiting_for_approval: true,
+                    ..sync::Report::default()
+                }));
+            }
+        }
         sync::run(&env, &opts)
     })();
     match result {

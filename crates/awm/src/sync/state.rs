@@ -109,6 +109,27 @@ pub fn skipped(conn: &Connection) -> Result<std::collections::BTreeMap<String, u
     Ok(out)
 }
 
+/// Members the user confirmed as admins with `awm team members --trust-admin @h` (a JSON list of
+/// member ids). `Roster::verify` uses them only while the verified roster holds no admin
+/// (RVT1 M5). Written by `awm team` (TM12).
+pub const TRUSTED_ADMINS: &str = "trusted_admins";
+
+/// The member ids of [`TRUSTED_ADMINS`] (TM12).
+pub fn trusted_admins(conn: &Connection) -> Result<Vec<String>> {
+    Ok(get(conn, TRUSTED_ADMINS)?
+        .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
+        .unwrap_or_default())
+}
+
+/// Adds member ids to [`TRUSTED_ADMINS`] (TM12).
+pub fn add_trusted_admins(conn: &Connection, ids: &[String]) -> Result<()> {
+    let mut all = trusted_admins(conn)?;
+    all.extend(ids.iter().cloned());
+    all.sort();
+    all.dedup();
+    set(conn, TRUSTED_ADMINS, &serde_json::to_string(&all)?)
+}
+
 /// The values of `sync_state` that `awm doctor` and `awm team status` show.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SyncState {

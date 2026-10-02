@@ -289,6 +289,15 @@ impl Client {
         self.call(Method::POST, path, Some(encode(body)?))
     }
 
+    /// `PUT path` with a JSON body, JSON answer (`PUT /v1/org/settings`, TM12).
+    pub fn put<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T, CallError> {
+        self.call(Method::PUT, path, Some(encode(body)?))
+    }
+
     /// `POST path` with a JSON body, no answer body (204).
     pub fn post_unit<B: Serialize>(&self, path: &str, body: &B) -> Result<(), CallError> {
         self.exchange(Method::POST, path, Some(encode(body)?))
