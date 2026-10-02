@@ -1828,3 +1828,427 @@ fn setup_statusline_quotes_an_unusual_executable_path() {
         );
     }
 }
+
+// ---- quota block of `stats --savings` (plan-quota §10.1, §14.7) -------------------------
+
+/// A `d7.r` far in the future (2096-10-02): always inside the 7-day recency bound.
+const QD7: i64 = 3_999_999_960;
+/// First `h5.r` of the quota tests: its window starts at 06:00 UTC of a day in 2026-09 plus 10 h - 5 h.
+const QR: i64 = 1_789_984_800;
+const QHOUR: i64 = 3_600_000;
+
+fn quota_sample(
+    sid: &str,
+    t: i64,
+    p5: f64,
+    r5: i64,
+    d7: i64,
+    cost: f64,
+) -> awm::quota::sample::Sample {
+    use awm::quota::sample::{Sample, Window};
+    Sample {
+        t,
+        sid: sid.to_string(),
+        model: None,
+        h5: Some(Window { p: p5, r: r5 }),
+        d7: Some(Window { p: 50.0, r: d7 }),
+        cost: Some(cost),
+        dur: None,
+    }
+}
+
+/// `n` valid windows (Δp 12, $100 each; 12 h apart, first samples 1 h after the window start)
+/// of one account-week, one session `{tag}-{i}` each.
+fn quota_windows(d7: i64, base_r: i64, n: i64, tag: &str) -> Vec<awm::quota::sample::Sample> {
+    (0..n)
+        .flat_map(|i| {
+            let r = base_r + i * 43_200;
+            let t0 = (r - 18_000) * 1000;
+            let sid = format!("{tag}-{i}");
+            [
+                quota_sample(&sid, t0 + QHOUR, 10.0, r, d7, 0.0),
+                quota_sample(&sid, t0 + 2 * QHOUR, 22.0, r, d7, 100.0),
+            ]
+        })
+        .collect()
+}
+
+/// An early 7-day-only sample: it fixes the capture start before every window.
+fn quota_anchor() -> awm::quota::sample::Sample {
+    let mut s = quota_sample("anchor", 1000, 0.0, 1, QD7, 0.0);
+    s.h5 = None;
+    s
+}
+
+fn write_quota_samples(env: &Env, samples: &[awm::quota::sample::Sample]) {
+    let dir = env.awm_home().join("quota");
+    std::fs::create_dir_all(&dir).unwrap();
+    for s in samples {
+        let path = awm::quota::store::month_file(&dir, s.t);
+        let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+        text.push_str(&s.to_line());
+        text.push('\n');
+        std::fs::write(path, text).unwrap();
+    }
+}
+
+/// A transcript with a first timestamp and a `cost-state` line: `cost` USD of which `cache_read`
+/// USD are cache reads of Opus 5.5 ($0.20 per million tokens).
+fn write_totals(projects: &Path, sid: &str, cost: f64, cache_read: f64) {
+    let dir = projects.join("-work-q");
+    std::fs::create_dir_all(&dir).unwrap();
+    let tokens = (cache_read / 0.20 * 1e6).round();
+    std::fs::write(
+        dir.join(format!("{sid}.jsonl")),
+        format!(
+            "{{\"type\":\"user\",\"timestamp\":\"2026-09-01T00:00:00.000Z\"}}\n\
+             {{\"type\":\"cost-state\",\"totalCostUSD\":{cost},\"modelUsage\":\
+             {{\"claude-opus-5-5\":{{\"cacheReadInputTokens\":{tokens}}}}}}}\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn quota_json(env: &Env, extra: &[&str]) -> Value {
+    let mut args = vec!["stats", "--savings", "--json"];
+    args.extend(extra);
+    let v: Value = serde_json::from_str(env.awm(&args).ok()).unwrap();
+    v["savings"]["quota"].clone()
+}
+
+fn near(got: &Value, want: f64) {
+    assert!(
+        (got.as_f64().unwrap() - want).abs() < 1e-9,
+        "{got} != {want}"
+    );
+}
+
+#[test]
+fn stats_savings_quota_without_samples_prints_the_setup_line() {
+    let env = Env::new();
+    seed_savings(&env);
+    let text = env.awm(&["stats", "--savings"]).ok().to_string();
+    let want = "  quota: no status line samples yet. To see these savings as a share of your 5-hour and 7-day usage\n  limits, run: awm setup --statusline\n";
+    assert!(text.ends_with(want), "{text}");
+    // Directly after the footnote, no blank line.
+    assert!(
+        text.contains("pays none of this per call.\n  quota: no status line samples yet."),
+        "{text}"
+    );
+    assert!(
+        text.lines()
+            .skip(1)
+            .all(|l| l.is_empty() || l.starts_with("  ")),
+        "{text}"
+    );
+    assert!(!text.contains("since"), "{text}");
+    let q = quota_json(&env, &[]);
+    assert_eq!(q["status"], "no_samples");
+    assert_eq!(q["samples"], 0);
+}
+
+#[test]
+fn stats_savings_quota_collecting_prints_counts() {
+    let env = Env::new();
+    let mut s = quota_windows(QD7, QR, 2, "c");
+    s.push(quota_anchor());
+    write_quota_samples(&env, &s);
+    let text = env.awm(&["stats", "--savings"]).ok().to_string();
+    let want = "  quota: collecting status line samples (5 from 3 sessions, the first on 1970-01-01). A figure needs\n  5 five-hour windows on 2 days with at least 10 points and $20 of local use each, per 7-day reset;\n  2 valid windows so far.\n";
+    assert!(text.ends_with(want), "{text}");
+    let q = quota_json(&env, &[]);
+    assert_eq!(q["status"], "collecting");
+    assert_eq!(q["windows"]["valid"], 2);
+    assert_eq!(q["rates"], json!([]));
+}
+
+/// Fetches F1, F2, F3 and F4 (past ok calls with 40 / 80 / 8 / 8 MB pages), and four injections:
+/// 1 deny-mode over F1, 2 inject-mode over F2 (label 2) and F3, 3 Codex inject-mode over F4.
+/// Costs at $1 / $5 per million tokens, summaries of 400 / 800 / 400 / 400 chars:
+///   F1 40e6 / 4 = 10e6 tokens = $10 + 100 tokens = $10.0005
+///   F2 20e6 tokens = $20 + 200 tokens = $20.001
+///   F3 2e6 tokens = $2 + 100 tokens = $2.0005
+///   F4 $2.0005 (Codex, not counted)
+/// estimated = 10.0005 + 20.001 + 2.0005 = 32.002; proven = 10.0005 + 20.001 = 30.0015.
+fn seed_quota_savings(env: &Env) {
+    let conn = env.conn();
+    for (id, url, chars, bytes) in [
+        (1, "https://example.org/f1", 400, 40_000_000),
+        (2, "https://example.org/f2", 800, 80_000_000),
+        (3, "https://example.org/f3", 400, 8_000_000),
+        (4, "https://example.org/f4", 400, 8_000_000),
+    ] {
+        let mut e = ev(id, "WebFetch", "s0", BASE + id * 1_000);
+        e.url = Some(url);
+        insert(&conn, &e);
+        conn.execute(
+            "UPDATE event SET duration_ms = 5000, summary = ?1, bytes = ?2 WHERE id = ?3",
+            params!["x".repeat(chars), bytes, id],
+        )
+        .unwrap();
+    }
+    injection(&conn, 1, "deny", "url", "i1", BASE + 100_000, &[(1, 1.0)]);
+    injection(
+        &conn,
+        2,
+        "inject",
+        "url",
+        "i2",
+        BASE + 200_000,
+        &[(2, 1.0), (3, 0.5)],
+    );
+    injection(&conn, 3, "inject", "url", "i3", BASE + 300_000, &[(4, 1.0)]);
+    conn.execute(
+        "UPDATE injection SET transcript_path = '/h/.codex/sessions/r.jsonl' WHERE id = 3",
+        [],
+    )
+    .unwrap();
+    label(&conn, 2, 1, "2");
+}
+
+/// Five valid windows of one account-week on three days (k = 60 / 500 = 0.12) and three finished
+/// sessions of $100 with $45 of cache reads (σ = 0.45).
+fn seed_quota_ready(env: &Env, projects: &Path) {
+    let mut s = quota_windows(QD7, QR, 5, "s");
+    s.push(quota_anchor());
+    write_quota_samples(env, &s);
+    for i in 0..3 {
+        write_totals(projects, &format!("s-{i}"), 100.0, 45.0);
+    }
+}
+
+#[test]
+fn stats_savings_quota_ready_matches_hand_computed_numbers() {
+    let env = Env::new();
+    seed_quota_savings(&env);
+    seed_quota_ready(&env, &env.home().join(".claude/projects"));
+    // k5 = 0.12 %/$ at w = 1, w0 = 0.12 / 0.55, w10 = 0.12 / 5.05.
+    // estimated 32.002: 3.84024 (w1), 6.98225 (w0), 0.76044 (w10);
+    // proven 30.0015: 3.60018, 6.54578, 0.71291. 1 / 0.12 = $8.33.
+    let text = env.awm(&["stats", "--savings"]).ok().to_string();
+    let want = "
+  quota: share of your Claude usage limits (11 status line samples from 6 sessions)
+  7d reset 2096-10-02, 5 windows on 3 days: 1% of a 5h window = $8.33 (windows $8.33-$8.33)
+    5h: estimated 3.84% of one window in total (0.76%-6.98%), proven 3.60% (0.71%-6.55%)
+    7d: collecting (0 of 10 points of 7-day use in these windows)
+  note: 1 Codex injections are not counted (Codex has its own limits).
+  estimated: an upper bound; it assumes every avoided note replaced a call, and the fetch summariser
+";
+    assert!(
+        text.contains(&format!("pays none of this per call.{want}")),
+        "{text}"
+    );
+    assert!(
+        text.lines()
+            .skip(1)
+            .all(|l| l.is_empty() || (l.len() <= 100 && l.starts_with("  "))),
+        "{text}"
+    );
+    assert!(!text.contains("since"), "{text}");
+    let q = quota_json(&env, &[]);
+    assert_eq!(q["status"], "ready");
+    near(&q["saved_usd"]["estimated"], 32.002);
+    near(&q["saved_usd"]["proven"], 30.0015);
+    assert_eq!(q["codex_injections_excluded"], 1);
+    let r = &q["rates"][0];
+    assert_eq!(r["selection"], "recent");
+    near(&r["k5"]["w1"], 0.12);
+    near(&r["k5"]["w0"], 0.12 / 0.55);
+    near(&r["k5"]["w10"], 0.12 / 5.05);
+    near(&r["cache_read_share"], 0.45);
+    assert!(r["k7"].is_null() && r["seven_day_pct"].is_null());
+    for (kind, saved) in [("estimated", 32.002), ("proven", 30.0015)] {
+        let p = &r["five_hour_pct"][kind];
+        near(&p["w1"], saved * 0.12);
+        near(&p["w0"], saved * 0.12 / 0.55);
+        near(&p["w10"], saved * 0.12 / 5.05);
+    }
+}
+
+#[test]
+fn stats_savings_quota_one_line_per_recent_account_week() {
+    let env = Env::new();
+    let mut s = quota_windows(QD7, QR, 5, "a");
+    s.extend(quota_windows(QD7 + 604_800, QR + 5 * 86_400, 5, "b"));
+    s.push(quota_anchor());
+    write_quota_samples(&env, &s);
+    let text = env.awm(&["stats", "--savings"]).ok().to_string();
+    let a = text.find("  7d reset 2096-10-09, 5 windows").expect(&text);
+    let b = text.find("  7d reset 2096-10-02, 5 windows").expect(&text);
+    assert!(a < b, "newest first: {text}");
+    assert!(
+        text.contains(
+            "  note: savings are not split by account; each line prices all of them at its own rate.\n"
+        ),
+        "{text}"
+    );
+    let q = quota_json(&env, &[]);
+    assert_eq!(q["rates"].as_array().unwrap().len(), 2);
+    assert_eq!(q["groups"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn stats_savings_quota_withheld_for_a_non_usd_currency() {
+    let env = Env::new();
+    seed_quota_savings(&env);
+    seed_quota_ready(&env, &env.home().join(".claude/projects"));
+    write_pricing(&env, "[pricing]\ncurrency = \"EUR\"\n");
+    let text = env.awm(&["stats", "--savings"]).ok().to_string();
+    assert!(
+        text.ends_with(
+            "  quota: shown only with [pricing] currency = \"USD\"; the status line reports cost in USD.\n"
+        ),
+        "{text}"
+    );
+    let q = quota_json(&env, &[]);
+    assert_eq!(q["status"], "not_usd");
+    assert_eq!(q["rates"], json!([]));
+}
+
+#[test]
+fn stats_savings_quota_reads_totals_from_projects_flag() {
+    let env = Env::new();
+    seed_quota_savings(&env);
+    let elsewhere = env.dir.path().join("elsewhere");
+    seed_quota_ready(&env, &elsewhere);
+    // Without the flag the transcripts are not found: σ is unknown.
+    let without = env.awm(&["stats", "--savings"]).ok().to_string();
+    assert!(without.contains("(range pending)"), "{without}");
+    assert!(
+        without.contains(
+            "  note: the cache-read range needs the totals of 3 finished sessions in these windows; 0 so far.\n"
+        ),
+        "{without}"
+    );
+    assert!(quota_json(&env, &[])["rates"][0]["k5"]["w0"].is_null());
+    let dir = elsewhere.to_str().unwrap();
+    let with = env
+        .awm(&["stats", "--savings", "--projects", dir])
+        .ok()
+        .to_string();
+    assert!(!with.contains("(range pending)"), "{with}");
+    assert!(with.contains("(0.76%-6.98%)"), "{with}");
+    let q = quota_json(&env, &["--projects", dir]);
+    near(&q["rates"][0]["cache_read_share"], 0.45);
+    assert_eq!(q["rates"][0]["sessions_with_totals"], 3);
+}
+
+#[test]
+fn stats_savings_json_quota_shape() {
+    let env = Env::new();
+    let keys = |v: &Value| {
+        let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        k.sort();
+        k
+    };
+    let q = quota_json(&env, &[]);
+    assert_eq!(q["status"], "no_samples");
+    assert_eq!(q["rates"], json!([]));
+    assert_eq!(q["groups"], json!([]));
+    assert_eq!(q["windows"]["list"], json!([]));
+    assert!(q["first_sample_ms"].is_null());
+    near(&q["saved_usd"]["estimated"], 0.0);
+    assert_eq!(q["codex_injections_excluded"], 0);
+
+    seed_quota_savings(&env);
+    seed_quota_ready(&env, &env.home().join(".claude/projects"));
+    let q = quota_json(&env, &[]);
+    assert_eq!(
+        keys(&q),
+        [
+            "codex_injections_excluded",
+            "first_sample_ms",
+            "groups",
+            "rates",
+            "samples",
+            "saved_usd",
+            "sessions",
+            "status",
+            "windows"
+        ]
+    );
+    assert_eq!(
+        keys(&q["windows"]),
+        [
+            "before_capture",
+            "list",
+            "mixed",
+            "saturated",
+            "seen",
+            "start_from_dur",
+            "too_small",
+            "valid"
+        ]
+    );
+    assert_eq!(
+        keys(&q["windows"]["list"][0]),
+        [
+            "cost_usd",
+            "d7_reset",
+            "dp5",
+            "dp7",
+            "first_ms",
+            "fresh_sessions",
+            "h5_reset",
+            "last_ms",
+            "r5",
+            "saturated",
+            "verdict"
+        ]
+    );
+    assert_eq!(q["windows"]["list"][0]["verdict"], "valid");
+    assert_eq!(
+        keys(&q["groups"][0]),
+        ["d7_reset", "days", "k5", "qualifies", "valid"]
+    );
+    let r = &q["rates"][0];
+    for k in [
+        "selection",
+        "d7_reset",
+        "windows",
+        "days",
+        "k5",
+        "k7",
+        "dp7_sum",
+        "spread5",
+        "cache_read_share",
+        "sessions_with_totals",
+        "sessions_without_totals",
+        "unpriced_sessions",
+        "five_hour_pct",
+        "seven_day_pct",
+    ] {
+        assert!(r.get(k).is_some(), "missing {k}: {r}");
+    }
+    assert_eq!(keys(&r["spread5"]), ["median", "p25", "p75"]);
+    assert_eq!(keys(&r["five_hour_pct"]), ["estimated", "proven"]);
+    assert_eq!(keys(&r["five_hour_pct"]["estimated"]), ["w0", "w1", "w10"]);
+}
+
+#[test]
+fn stats_savings_fallback_median_ignores_later_calls() {
+    // RVQ0 m5. The shown item (event 1, ok, no duration) has no durations of its own; ok fetches
+    // of other urls last 2 s before the note and 60 s and 70 s after it. The fallback median
+    // is over the calls up to the note: 2 s, not 60 s.
+    let env = Env::new();
+    let conn = env.conn();
+    for (id, url, at, ms) in [
+        (1, "https://example.org/item", BASE + 1_000, None),
+        (2, "https://example.org/b", BASE + 2_000, Some(2_000)),
+        (3, "https://example.org/c", BASE + 200_000, Some(60_000)),
+        (4, "https://example.org/d", BASE + 210_000, Some(70_000)),
+    ] {
+        let mut e = ev(id, "WebFetch", "s0", at);
+        e.url = Some(url);
+        insert(&conn, &e);
+        conn.execute(
+            "UPDATE event SET duration_ms = ?1 WHERE id = ?2",
+            params![ms, id],
+        )
+        .unwrap();
+    }
+    injection(&conn, 1, "inject", "url", "s1", BASE + 100_000, &[(1, 1.0)]);
+    let v: Value = serde_json::from_str(env.awm(&["stats", "--savings", "--json"]).ok()).unwrap();
+    assert_eq!(v["savings"]["avoided"], 1);
+    assert_eq!(v["savings"]["time_saved_ms"], 2_000.0);
+}
