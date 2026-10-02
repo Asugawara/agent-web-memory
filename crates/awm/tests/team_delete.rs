@@ -499,12 +499,14 @@ fn member(srv: &Srv, admin: &Node, handle: &str) -> Node {
     n
 }
 
-/// `owner`'s next machine: a device invite, approved by `owner`'s next sync.
+/// `owner`'s next machine: a device invite, approved by `owner` with the code it prints
+/// (`team.auto_approve = none`, the default since RVT2 m3).
 fn other_machine(srv: &Srv, owner: &Node) -> Node {
     let t = token_of(srv, &owner.ok(&["team", "add-device"]));
     let n = Node::new();
-    n.ok(&["team", "join", &srv.url(), "--token", &t]);
-    owner.ok(&["sync"]);
+    let out = n.ok(&["team", "join", &srv.url(), "--token", &t]);
+    let handle = owner.ident().team.handle;
+    owner.ok(&["team", "approve", &handle, "--code", &code_of(&out)]);
     n.ok(&["sync"]);
     assert_eq!(n.member(), owner.member());
     n

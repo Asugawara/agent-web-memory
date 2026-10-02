@@ -9,12 +9,14 @@
 use std::collections::BTreeSet;
 
 use anyhow::Result;
+use awm_proto::crypto::{open_record, RecordAd};
 use awm_proto::keys::{
     approve, plan_rotation, rotate, ApprovalInfo, ApprovalKind, Invite, JoinRequest, ListedDevice,
-    Role as KeyRole, Roster, RosterBlob,
+    Role as KeyRole, Roster, RosterBlob, RosterEntry, ROSTER_TAG,
 };
 use awm_proto::wire::{
-    ApproveRequest, DeviceWrap, EpochWrap, ErrorCode, Id, InviteKind, Key32, RotateRequest, B64,
+    ApproveRequest, DeviceWrap, EpochWrap, ErrorCode, Id, InviteKind, Key32, RosterPlaintext,
+    RotateRequest, B64,
 };
 use rusqlite::{params, Connection};
 
@@ -159,8 +161,10 @@ fn to_wrap_item(w: &awm_proto::keys::Wrap) -> EpochWrap {
 
 /// Approves pending devices (plan-v3-team §4.6 item 7): the device's join MAC must verify under
 /// the secret of an invite this device created, and `decide` (`team::auto_approve`) must say
-/// yes for that kind of join. The member id and kind come from the invite record, never from
-/// the server's pending list (RVT1 M2). Returns how many were approved.
+/// yes for that kind of join. Under the default `team.auto_approve = none` it never does: a
+/// verifying MAC proves only possession of the invite string, so every join waits for
+/// `awm team approve --code N` (RVT2 m3). The member id and kind come from the invite record,
+/// never from the server's pending list (RVT1 M2). Returns how many were approved.
 pub fn approve_pending(
     s: &mut Session<'_>,
     decide: &dyn Fn(AutoApprove, bool) -> bool,
@@ -257,14 +261,96 @@ pub fn approve_pending(
     Ok(approved)
 }
 
-/// Rotates the epoch key when the server says so and this device is an admin (item 7): the new
-/// key is wrapped only to devices the roster verifies (`plan_rotation`), then the `epoch`
-/// roster entry is queued under the new key. Returns whether a rotation happened.
+/// Whether the current epoch's key has reached a device the verified roster now revokes, by the
+/// client's own records rather than the server's `rotation_needed` (`docs/sync-v1.md` §5.2,
+/// RVT2 M3). Either the current epoch's verified `epoch` entry lists a device that is now
+/// revoked (the revocation came after the rotation), or a revocation the verified roster applies
+/// is dated after that entry (`revoked_at` > `created_at`: a device approved after the rotation
+/// got the key with its approval wraps). Under epoch 0 there is no `epoch` entry, so any applied
+/// revocation counts. Both dates are inside sealed roster plaintexts, so the server can neither
+/// forge nor re-date them; it can only withhold them, which this device's own `roster_record`
+/// rows survive. The sealing epoch is no order: a revocation queued before a rotation is re-sealed
+/// under the new epoch when its push meets 409 `stale_epoch` (§9.3).
+pub fn revoked_since_current_epoch(
+    conn: &Connection,
+    ring: &awm_proto::keys::KeyRing,
+    roster: &Roster,
+) -> Result<bool> {
+    let current = ring.current_epoch();
+    let revoked_device = |d| roster.device(d).is_some_and(|d| d.revoked);
+    let listed = roster.epoch_devices(current);
+    if listed.is_some_and(|devices| devices.iter().any(|d| revoked_device(*d))) {
+        return Ok(true);
+    }
+    let mut epoch_at: Option<i64> = None;
+    let mut revoked_at = Vec::new();
+    for b in blobs(conn)? {
+        let ad = RecordAd {
+            org: ring.org(),
+            member: b.member,
+            device: b.device,
+            tag: ROSTER_TAG.to_string(),
+            idx: b.idx,
+            record_id: b.record_id,
+            epoch: b.epoch,
+        };
+        let Ok(plain) = open_record(ring, &ad, &b.blob) else {
+            continue;
+        };
+        let Ok(p) = serde_json::from_slice::<RosterPlaintext>(&plain) else {
+            continue;
+        };
+        match p.entry {
+            // The entry the verified roster applied for the current epoch.
+            RosterEntry::Epoch {
+                epoch,
+                devices,
+                created_at,
+                ..
+            } if epoch == current && listed == Some(devices.as_slice()) => {
+                epoch_at = Some(epoch_at.map_or(created_at, |t| t.max(created_at)));
+            }
+            RosterEntry::Revoke {
+                member_id,
+                device_id,
+                revoked_at: at,
+                ..
+            } => {
+                // Only a revocation the verified roster applies counts (a rejected entry naming
+                // an active member or device does not).
+                let applied = match device_id {
+                    Some(d) => revoked_device(d),
+                    None => roster.member(member_id).is_some_and(|m| m.revoked),
+                };
+                if applied {
+                    revoked_at.push(at);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(match epoch_at {
+        Some(t) => revoked_at.iter().any(|&at| at > t),
+        // Epoch 0, or an epoch whose entry this device never saw: the key predates every
+        // revocation it holds.
+        None => !revoked_at.is_empty(),
+    })
+}
+
+/// Rotates the epoch key when this device is an admin and either the server says so or the
+/// verified roster holds a revocation newer than the current epoch
+/// ([`revoked_since_current_epoch`]; a hostile or rolled-back server that withholds
+/// `rotation_needed` does not keep a removed member on the old key). The new key is wrapped only
+/// to devices the roster verifies (`plan_rotation`), then the `epoch` roster entry is queued
+/// under the new key. Returns whether a rotation happened.
 pub fn rotate_if_needed(s: &mut Session<'_>) -> Result<bool> {
     let Some(status) = s.status.clone() else {
         return Ok(false);
     };
-    if !status.rotation_needed || !own_member_is_admin(&s.roster, &s.ident) {
+    if !own_member_is_admin(&s.roster, &s.ident) {
+        return Ok(false);
+    }
+    if !status.rotation_needed && !revoked_since_current_epoch(&s.conn, &s.ring, &s.roster)? {
         return Ok(false);
     }
     let members = s.client.members()?;

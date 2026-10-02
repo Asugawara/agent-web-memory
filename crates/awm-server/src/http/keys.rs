@@ -33,9 +33,9 @@ pub(super) async fn rotate_keys(State(app): State<AppState>, req: Request) -> Re
 
 async fn rotate_inner(app: &AppState, req: Request) -> Result<Response, ApiError> {
     let mut cx = Cx::open(app, req, Client::Required, Class::Token, Cap::Body)?;
-    let body: RotateRequest = cx.json(Cap::Body).await?;
     let caller = cx.authenticate().await?;
     cx.authorise(&caller, Action::RotateKeys).await?;
+    let body: RotateRequest = cx.json(Cap::Body).await?;
     let actor = caller
         .actor()
         .ok_or_else(|| ApiError::from(authz::Refusal::Forbidden))?;

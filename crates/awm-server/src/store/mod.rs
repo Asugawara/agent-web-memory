@@ -465,6 +465,9 @@ pub mod meta_keys {
     pub const BACKUP_CURSOR: &str = "backup_cursor";
     pub const BACKUP_VERIFIED_AT: &str = "backup_verified_at";
     pub const BACKUP_PREFIX: &str = "backup_";
+    /// `SqliteStore`'s [`super::Store::claim`] keys, `backup_claim_{name}`: under the `backup_`
+    /// prefix so that no backup, export or dump carries them (as `PgStore`'s `claim` table).
+    pub const CLAIM_PREFIX: &str = "backup_claim_";
 
     /// Whether `meta_set` refuses `key`.
     pub fn reserved(key: &str) -> bool {
@@ -676,7 +679,9 @@ pub trait Store: Send + Sync + 'static {
     fn revoke_device(&self, device_id: Id, by: Actor, now: i64) -> StoreFuture<'_, ()>;
 
     /// `POST /v1/members/{id}/remove`: `LastAdmin` for the only active admin; revokes the
-    /// member, every device and its open invites, sets `rotation_needed`, with
+    /// member, every device and its open invites, and the pending devices of the invites it
+    /// created (nobody else may approve them; with the members a member invite created, when
+    /// they have no approved device: RVT2 m2), sets `rotation_needed`, with
     /// `delete_records` deletes every record of the member except its `roster` records
     /// (deletion-stream entries; TM9 F2), audits `member.remove`. Idempotent. Returns the
     /// number of records deleted.
@@ -773,8 +778,24 @@ pub trait Store: Send + Sync + 'static {
     ) -> StoreFuture<'_, PullResponse>;
 
     /// Records pushed by the member since `since` (the daily quota, TM8): record items
-    /// received since then plus ids the member pre-deleted since then; markers do not count.
+    /// received since then, plus the deletion-stream entries the member appended since then
+    /// for ids that were never a record: pre-deletions and markers with a new id (RVT2 M1;
+    /// a pre-deleted id that the writer later fills with a marker still counts once). A
+    /// marker for a record that was stored, and the deletion of a stored record, do not count.
     fn pushed_since(&self, member_id: Id, since: i64) -> StoreFuture<'_, u64>;
+
+    /// How many distinct `ids` the store has never seen: no record or marker and no
+    /// deletion-stream entry holds them (RVT2 M1: what a pre-deletion or a marker would add to
+    /// the deletion stream, counted against the daily quota before it is written).
+    fn unknown_ids(&self, ids: Vec<Id>) -> StoreFuture<'_, u64>;
+
+    /// A compare-and-set claim of the run `name` at `at` (TM9 P2, RVT2 m12): true when no claim
+    /// of `name` lies less than `interval_s` seconds before or after `at` (or the claim is this
+    /// run's, at the same `at`), and the claim is then `at`; false when another holds the
+    /// interval. Atomic across connections and instances on one database (`PgStore`: the
+    /// `claim` table under the organisation lock; `SqliteStore`: a `backup_claim_{name}` meta
+    /// key, which no backup or export carries, in an immediate transaction).
+    fn claim(&self, name: String, at: i64, interval_s: i64) -> StoreFuture<'_, bool>;
 
     // --- deletion and retention (TM9) --------------------------------------------------------
 

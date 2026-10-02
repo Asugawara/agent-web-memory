@@ -109,6 +109,16 @@ pub enum RateKey {
     Device(Id),
 }
 
+/// The address a per-address bucket is keyed on (RVT2 m5): an IPv4 address (a v4-mapped IPv6
+/// address counts as its IPv4 form) as it is, an IPv6 address by its /64, the smallest prefix
+/// a client is usually given, so rotating through a /64 gives no new budget.
+pub fn bucket_addr(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => IpAddr::V6((u128::from(v6) & !((1u128 << 64) - 1)).into()),
+    }
+}
+
 /// A token bucket: `capacity` tokens, refilled at `per_s` tokens per second.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rule {
@@ -181,6 +191,18 @@ impl RateLimiter {
             bucket.tokens = have;
             bucket.at = now;
             Err(retry_after(have, rule))
+        }
+    }
+
+    /// Gives back a token taken by [`take`] for work that turned out not to count (a token
+    /// that authenticated, RVT2 B1), up to the bucket's capacity.
+    ///
+    /// [`take`]: RateLimiter::take
+    pub fn refund(&self, key: RateKey, now: i64) {
+        let mut map = self.buckets.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(b) = map.get_mut(&key) {
+            b.tokens = (b.refilled(now) + 1.0).min(f64::from(b.rule.capacity));
+            b.at = now;
         }
     }
 
@@ -260,6 +282,41 @@ mod tests {
         assert_eq!(l.take(key, rule, 0), Ok(()));
         assert_eq!(l.take(key, rule, 0), Ok(()));
         assert_eq!(l.check(key, rule, 0), Err(2));
+    }
+
+    #[test]
+    fn ipv6_buckets_are_keyed_on_the_64_and_v4_mapped_on_the_v4_address() {
+        let a: IpAddr = "2001:db8:1:2:aaaa::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:ffff:ffff:ffff:ffff".parse().unwrap();
+        let c: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_eq!(bucket_addr(a), bucket_addr(b));
+        assert_eq!(bucket_addr(a), "2001:db8:1:2::".parse::<IpAddr>().unwrap());
+        assert_ne!(bucket_addr(a), bucket_addr(c));
+        let mapped: IpAddr = "::ffff:192.0.2.7".parse().unwrap();
+        assert_eq!(bucket_addr(mapped), "192.0.2.7".parse::<IpAddr>().unwrap());
+        assert_eq!(bucket_addr(ip(9)), ip(9));
+    }
+
+    #[test]
+    fn refund_gives_back_one_token_up_to_the_capacity() {
+        let l = RateLimiter::new();
+        let rule = Rule::per_minute(30, 2);
+        let key = RateKey::FailedAuth(ip(4));
+        assert_eq!(l.take(key, rule, 0), Ok(()));
+        assert_eq!(l.take(key, rule, 0), Ok(()));
+        assert_eq!(l.check(key, rule, 0), Err(2));
+        l.refund(key, 0);
+        assert_eq!(l.take(key, rule, 0), Ok(()));
+        // Never above the capacity.
+        for _ in 0..5 {
+            l.refund(key, 0);
+        }
+        assert_eq!(l.take(key, rule, 0), Ok(()));
+        assert_eq!(l.take(key, rule, 0), Ok(()));
+        assert_eq!(l.take(key, rule, 0), Err(2));
+        // A key without a bucket stays without one.
+        l.refund(RateKey::FailedAuth(ip(5)), 0);
+        assert_eq!(l.len(), 1);
     }
 
     #[test]

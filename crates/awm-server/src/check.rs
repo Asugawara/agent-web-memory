@@ -556,7 +556,17 @@ async fn database_line(input: &CheckInput) -> Line {
             }
             line(level, "database", text)
         }
-        StoreChoice::Postgres { .. } => match input.store.restore_state().await {
+        StoreChoice::Postgres {
+            insecure_network, ..
+        } => match input.store.restore_state().await {
+            // RVT2 M4: the operator accepted a host outside loopback and the private ranges.
+            Ok(_) if *insecure_network => line(
+                Level::Warn,
+                "database",
+                "postgres answers over a network without TLS (--database-insecure-network): \
+                 anyone on the path can read and change the data; use a private network or the \
+                 Cloud SQL socket",
+            ),
             Ok(_) => line(
                 Level::Ok,
                 "database",

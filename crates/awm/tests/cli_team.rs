@@ -889,22 +889,50 @@ fn a_withheld_or_forged_approval_blocks_the_push_and_status_says_so() {
 // add-device and approve
 
 #[test]
-fn an_own_device_is_approved_at_the_next_sync_and_another_members_by_hand() {
+fn an_own_device_waits_for_the_code_unless_auto_approve_is_devices_and_another_members_by_hand() {
     let srv = Srv::start();
     let a = create(&srv, "ann");
     a.ok(&["sync"]);
     let b = member(&srv, &a, "bob");
 
-    // Ann's second machine: her first device approves it at its next sync (team.auto_approve
-    // = devices), after the MAC verified.
-    let t = token_of(&srv, &a.ok(&["team", "add-device"]));
-    let (a2, _) = join(&srv, &t);
+    // Ann's second machine. By default (team.auto_approve = none, RVT2 m3) a MAC that verifies
+    // is not enough, since a leaked invite string makes one too: her first device approves it
+    // only with the code the new machine prints.
+    let o = a.run(&["team", "add-device"]);
+    assert_eq!(o.code, Some(0), "{}", o.stderr);
+    assert!(
+        o.stderr.contains("awm team approve ann --code NNNNNN"),
+        "{}",
+        o.stderr
+    );
+    let t = token_of(&srv, &o.stdout);
+    let (a2, code) = join(&srv, &t);
     assert_eq!(a2.member(), a.member());
     let out = a.ok(&["sync"]);
     assert!(out.contains("synced"), "{out}");
+    assert_ne!(
+        a2.status()["approval"],
+        "approved",
+        "own device: not automatic by default"
+    );
+    a.ok(&["team", "approve", "ann", "--code", &code]);
     a2.ok(&["sync"]);
     assert_eq!(a2.status()["approval"], "approved");
     assert_eq!(a2.status()["role"], "admin");
+
+    // With the opt-in `devices`, her next machine is approved at the next sync after the MAC
+    // verified.
+    a.ok(&["config", "set", "team.auto_approve", "devices"]);
+    let o = a.run(&["team", "add-device"]);
+    assert!(
+        o.stderr.contains("approves it at its next awm sync"),
+        "{}",
+        o.stderr
+    );
+    let (a3, _) = join(&srv, &token_of(&srv, &o.stdout));
+    a.ok(&["sync"]);
+    a3.ok(&["sync"]);
+    assert_eq!(a3.status()["approval"], "approved");
 
     // --for is for admins, refused locally before any request.
     let before = srv.log_len();
@@ -1118,8 +1146,8 @@ fn remove_revokes_the_member_and_rotates_wrapping_only_to_verified_devices() {
     // Bob's second machine is approved by Bob's first, but the server withholds that roster
     // record from Ann: for her it is unverified.
     let t = token_of(&srv, &b.ok(&["team", "add-device"]));
-    let (b2, _) = join(&srv, &t);
-    b.ok(&["sync"]);
+    let (b2, code) = join(&srv, &t);
+    b.ok(&["team", "approve", "bob", "--code", &code]);
     b2.ok(&["sync"]);
     assert_eq!(b2.status()["approval"], "approved");
     let (bm, bd) = (b.member(), b.device());
@@ -1769,4 +1797,26 @@ fn the_server_helper_reads_no_unknown_rows() {
         .optional()
         .unwrap();
     assert_eq!(none, None);
+}
+
+/// TM29 finding 1: in a `sync,serve` build the help of `team`, `sync` and `serve` does not call
+/// them unimplemented (the default build's stubs still do, `tests/cli.rs`).
+#[test]
+fn the_help_of_team_sync_and_serve_does_not_call_them_unimplemented() {
+    let n = Node::new();
+    let top = n.ok(&["--help"]);
+    for (sub, first) in [
+        ("team", "Team sync: membership and sharing"),
+        ("sync", "Sync with the team server"),
+        ("serve", "Run the team server"),
+    ] {
+        let line = top
+            .lines()
+            .find(|l| l.trim_start().starts_with(&format!("{sub} ")))
+            .unwrap_or_else(|| panic!("{sub} missing from {top}"));
+        assert!(line.contains(first), "{line}");
+        assert!(!line.contains("not implemented"), "{line}");
+        let help = n.ok(&[sub, "--help"]);
+        assert_eq!(help.lines().next(), Some(first), "{help}");
+    }
 }

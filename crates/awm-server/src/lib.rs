@@ -12,6 +12,8 @@ pub mod config;
 pub mod delete;
 pub mod http;
 pub mod limits;
+pub mod lockfile;
+pub mod quota;
 pub mod retention;
 #[cfg(feature = "sqlite")]
 pub mod serve;

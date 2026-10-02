@@ -94,6 +94,7 @@ pub struct FileConfig {
     pub database_url: Option<Secret>,
     pub database_url_env: Option<String>,
     pub database_url_owner_env: Option<String>,
+    pub database_insecure_network: Option<bool>,
     pub backup: Option<String>,
     pub listen: Option<String>,
     pub behind_tls_proxy: Option<bool>,
@@ -185,6 +186,7 @@ impl FileConfig {
             "database_url" => self.database_url = Some(Secret(string(v)?)),
             "database_url_env" => self.database_url_env = Some(string(v)?),
             "database_url_owner_env" => self.database_url_owner_env = Some(string(v)?),
+            "database_insecure_network" => self.database_insecure_network = Some(boolean(v)?),
             "backup" => self.backup = Some(string(v)?),
             "listen" => self.listen = Some(string(v)?),
             "behind_tls_proxy" => self.behind_tls_proxy = Some(boolean(v)?),
@@ -348,6 +350,9 @@ pub struct Flags {
     pub database_url: Option<Secret>,
     pub database_url_env: Option<String>,
     pub database_url_owner_env: Option<String>,
+    /// `--database-insecure-network`: let `PgStore` connect without TLS to a TCP host outside
+    /// loopback and the private ranges (RVT2 M4).
+    pub database_insecure_network: bool,
     pub domain: Option<String>,
     pub backup: Option<String>,
     pub behind_tls_proxy: bool,
@@ -372,9 +377,11 @@ pub enum StoreChoice {
     /// `SqliteStore` in `{data}/server.db`.
     Sqlite { data: PathBuf },
     /// `PgStore`: the application URL, and the owner URL when migrations should run.
+    /// `insecure_network`: `--database-insecure-network` (RVT2 M4).
     Postgres {
         url: Secret,
         owner_url: Option<Secret>,
+        insecure_network: bool,
     },
 }
 
@@ -517,7 +524,9 @@ impl Resolved {
         }
         c.trusted_proxies = self.trusted_proxies.clone();
         c.forwarded_last_entry = self.cloud_run;
-        c.hsts = self.terminates_tls();
+        // RVT2 m10: behind a TLS-terminating proxy (Cloud Run included) clients reach the
+        // server over HTTPS too, so the header applies.
+        c.hsts = self.terminates_tls() || self.behind_tls_proxy;
         c.retention = if self.request_time_retention {
             RetentionMode::InRequests
         } else {
@@ -570,6 +579,12 @@ pub fn resolve(flags: &Flags, env: Env<'_>) -> Result<Resolved, ConfigError> {
         .clone()
         .or_else(|| file.database_url_owner_env.clone());
     let has_url = url_env.is_some() || url_direct.is_some();
+    let insecure = flags.database_insecure_network || file.database_insecure_network == Some(true);
+    if insecure && !has_url {
+        return Err(ConfigError::refused(
+            "--database-insecure-network needs --database-url or --database-url-env",
+        ));
+    }
     if data.is_some() && has_url {
         return Err(ConfigError::refused(
             "--data and --database-url are exclusive: SqliteStore or PgStore, not both",
@@ -599,7 +614,11 @@ pub fn resolve(flags: &Flags, env: Env<'_>) -> Result<Resolved, ConfigError> {
                         || ConfigError::refused(format!("environment variable {name} is not set")),
                     )?)),
                 };
-                StoreChoice::Postgres { url, owner_url }
+                StoreChoice::Postgres {
+                    url,
+                    owner_url,
+                    insecure_network: insecure,
+                }
             }
             (None, false) => return Err(ConfigError::refused(
                 "no store: give --data DIR (SqliteStore) or --database-url / --database-url-env \
@@ -653,6 +672,14 @@ pub fn resolve(flags: &Flags, env: Env<'_>) -> Result<Resolved, ConfigError> {
         return Err(ConfigError::refused(
             "--behind-tls-proxy needs --trusted-proxy CIDR (repeatable) or --trusted-proxy \
              cloud-run: without it every client would share the proxy's address",
+        ));
+    }
+    // RVT2 m4: the preset believes the last X-Forwarded-For entry whoever the peer is, which
+    // only Google's front end makes true; off Cloud Run every client would choose its address.
+    if cloud_run && env("K_SERVICE").filter(|v| !v.is_empty()).is_none() {
+        return Err(ConfigError::refused(
+            "--trusted-proxy cloud-run is only for Cloud Run (K_SERVICE is not set): elsewhere \
+             name the proxy's address range with --trusted-proxy CIDR",
         ));
     }
 

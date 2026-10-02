@@ -2284,6 +2284,26 @@ impl Store for SqliteStore {
                     "UPDATE device SET revoked_at = ?2 WHERE member_id = ?1 AND revoked_at IS NULL",
                     params![id, now],
                 )?;
+                // RVT2 m2: only an invite's creator approves its join, so a pending join of
+                // the removed member's invites could never be approved: revoke those devices,
+                // and the members their member invites created (they never held a key).
+                tx.execute(
+                    "UPDATE member SET revoked_at = ?2 \
+                      WHERE revoked_at IS NULL AND id IN \
+                            (SELECT d.member_id FROM device d JOIN invite i ON i.id = d.invite_id \
+                              WHERE i.kind = 'member' AND d.approved = 0 \
+                                AND i.created_by IN (SELECT id FROM device WHERE member_id = ?1)) \
+                        AND NOT EXISTS (SELECT 1 FROM device x \
+                                         WHERE x.member_id = member.id AND x.approved = 1)",
+                    params![id, now],
+                )?;
+                tx.execute(
+                    "UPDATE device SET revoked_at = ?2 \
+                      WHERE approved = 0 AND revoked_at IS NULL AND invite_id IN \
+                            (SELECT id FROM invite WHERE created_by IN \
+                                    (SELECT id FROM device WHERE member_id = ?1))",
+                    params![id, now],
+                )?;
                 tx.execute(
                     "UPDATE org SET rotation_needed = 1 WHERE rotation_needed = 0",
                     [],
@@ -2556,11 +2576,48 @@ impl Store for SqliteStore {
                           WHERE member_id = ?1 AND epoch IS NOT NULL AND received_at >= ?2) \
                       + (SELECT COUNT(*) FROM deletion d \
                           WHERE d.member_id = ?1 AND d.deleted_at >= ?2 \
-                            AND NOT EXISTS (SELECT 1 FROM record r WHERE r.id = d.record_id))",
+                            AND NOT EXISTS (SELECT 1 FROM record r \
+                                             WHERE r.id = d.record_id AND r.epoch IS NOT NULL))",
                 params![member_id.to_string(), hour(since)],
                 |r| r.get(0),
             )?;
             Ok(u64::try_from(n).unwrap_or(0))
+        })
+    }
+
+    fn unknown_ids(&self, ids: Vec<Id>) -> StoreFuture<'_, u64> {
+        self.read(move |tx| {
+            let mut seen = HashSet::new();
+            let mut n = 0u64;
+            for id in ids.iter().filter(|id| seen.insert(**id)) {
+                let known: bool = tx
+                    .prepare_cached(
+                        "SELECT EXISTS (SELECT 1 FROM record WHERE id = ?1) \
+                             OR EXISTS (SELECT 1 FROM deletion WHERE record_id = ?1)",
+                    )?
+                    .query_row([id.to_string()], |r| r.get(0))?;
+                n += u64::from(!known);
+            }
+            Ok(n)
+        })
+    }
+
+    fn claim(&self, name: String, at: i64, interval_s: i64) -> StoreFuture<'_, bool> {
+        self.write(move |tx| {
+            let key = format!("{}{name}", meta_keys::CLAIM_PREFIX);
+            let prev: Option<i64> = meta_value(tx, &key)?.and_then(|v| v.parse().ok());
+            if let Some(prev) = prev {
+                if prev == at {
+                    return Ok(true);
+                }
+                // Either direction, as `PgOrg::claim`: a clock behind the winner's does not
+                // win the same interval again.
+                if at.abs_diff(prev) < interval_s.unsigned_abs() {
+                    return Ok(false);
+                }
+            }
+            meta_put(tx, &key, &at.to_string())?;
+            Ok(true)
         })
     }
 

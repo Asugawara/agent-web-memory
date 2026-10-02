@@ -101,9 +101,13 @@ fn unique_schema(tag: &str) -> String {
 }
 
 impl PgEnv {
-    /// `None` when `AWM_TEST_PG_URL` is unset (the backend is not configured: skip).
+    /// `None` when `AWM_TEST_PG_URL` is unset (the backend is not configured: skip). The SKIP
+    /// line is what `scripts/check.sh` counts (RVT2 M6).
     pub async fn new(tag: &str) -> Option<PgEnv> {
-        let admin_url = std::env::var("AWM_TEST_PG_URL").ok()?;
+        let Ok(admin_url) = std::env::var("AWM_TEST_PG_URL") else {
+            eprintln!("SKIP ({tag}): AWM_TEST_PG_URL is not set, this case did not run");
+            return None;
+        };
         ensure_roles(&admin_url).await;
         let schema = unique_schema(tag);
         let admin = connect(&admin_url).await;

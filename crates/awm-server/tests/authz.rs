@@ -792,6 +792,8 @@ async fn every_cell_of_the_matrix_holds() {
     let actions = all_actions();
     let mut cells = 0;
     let mut table = String::new();
+    // RVT2 m1: a pending device's `not_approved` refusals are audited once per hour.
+    let mut pending_audited = false;
     for a in &actions {
         let want = spec_row(*a);
         let got: Vec<E> = callers
@@ -825,7 +827,10 @@ async fn every_cell_of_the_matrix_holds() {
                 }
             }
             let audited = after.head > before;
-            let expect_row = want[i] != E::Y && c.device().is_some();
+            let throttled = matches!(c, Caller::Pending(_)) && want[i] == E::P;
+            let expect_row =
+                want[i] != E::Y && c.device().is_some() && !(throttled && pending_audited);
+            pending_audited |= throttled && audited;
             assert_eq!(audited, expect_row, "{a:?} {c:?}");
             if audited {
                 let row = after.rows.last().unwrap();

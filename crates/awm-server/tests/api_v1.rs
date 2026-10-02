@@ -1904,26 +1904,37 @@ async fn more_than_5000_records_a_day_is_429_with_retry_after_markers_and_a_new_
     let srv = Srv::new();
     let admin = srv.bootstrap().await;
     let roy = srv.add_member(&admin, "roy", "member").await;
+    // One pre-deletion (an id the server has never seen) counts like a record (RVT2 M1).
+    let in_flight = Id::new_v4();
+    let r = srv
+        .send(
+            R::post("/v1/delete")
+                .auth(&roy)
+                .json(&json!({"ids": [in_flight.to_string()]})),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
     for b in 0..50u64 {
-        let r = srv
-            .push(&roy, srv.items("rec", b * 100, 100, 0, SMALL))
-            .await;
+        let n = if b == 49 { 99 } else { 100 };
+        let r = srv.push(&roy, srv.items("rec", b * 100, n, 0, SMALL)).await;
         assert_eq!(r.status, 200, "batch {b}: {}", r.text());
         // 60 requests a minute: stay inside the token limit.
         srv.advance(1);
     }
     let now = srv.now();
-    let r = srv.push(&roy, srv.items("rec", 5000, 1, 0, SMALL)).await;
+    let r = srv.push(&roy, srv.items("rec", 4999, 1, 0, SMALL)).await;
     let e = r.expect_err(429, ErrorCode::RateLimited);
     assert_eq!(e.limit.as_deref(), Some("records_per_day"));
     let until_midnight = (now - now.rem_euclid(DAY) + DAY - now) as u32;
     assert_eq!(e.retry_after_s, Some(until_midnight));
     assert_eq!(r.header("retry-after"), Some(until_midnight.to_string()));
-    // Markers do not count.
-    let r = srv
-        .push(&roy, vec![marker("rec", 5000, Id::new_v4())])
-        .await;
+    // A marker for an id the server knows (the pre-deleted one, filling its index) does not
+    // count; a marker with a new id would add a deletion entry, so it counts (RVT2 M1).
+    let r = srv.push(&roy, vec![marker("rec", 4999, in_flight)]).await;
     assert_eq!(r.status, 200, "{}", r.text());
+    srv.push(&roy, vec![marker("rec", 5000, Id::new_v4())])
+        .await
+        .expect_err(429, ErrorCode::RateLimited);
     // The quota is per member: another member is not affected.
     assert_eq!(
         srv.push(&admin, srv.items("rec", 0, 1, 0, SMALL))
@@ -1934,7 +1945,7 @@ async fn more_than_5000_records_a_day_is_429_with_retry_after_markers_and_a_new_
     // The next UTC day starts again.
     srv.advance(until_midnight as i64 + 1);
     assert_eq!(
-        srv.push(&roy, srv.items("rec", 5001, 1, 0, SMALL))
+        srv.push(&roy, srv.items("rec", 5000, 1, 0, SMALL))
             .await
             .status,
         200
@@ -2075,6 +2086,281 @@ async fn unauthenticated_requests_are_30_a_minute_per_address_and_joins_10_an_ho
     srv.send(join("198.51.100.9"))
         .await
         .expect_err(410, ErrorCode::InviteGone);
+}
+
+#[tokio::test]
+async fn an_ipv6_client_is_limited_on_its_64_not_on_each_address() {
+    // RVT2 m5: rotating addresses inside one /64 gives no new budget.
+    let srv = Srv::new();
+    for i in 0..30u32 {
+        let ip = format!("2001:db8:1:2::{:x}", i + 1);
+        assert_eq!(
+            srv.send(R::get("/v1/info").no_client().from(&ip))
+                .await
+                .status,
+            200,
+            "{ip}"
+        );
+    }
+    srv.send(R::get("/v1/info").no_client().from("2001:db8:1:2:ffff::9"))
+        .await
+        .expect_err(429, ErrorCode::RateLimited);
+    // Another /64 has its own budget; a v4-mapped address shares its IPv4 address's.
+    assert_eq!(
+        srv.send(R::get("/v1/info").no_client().from("2001:db8:1:3::1"))
+            .await
+            .status,
+        200
+    );
+    for _ in 0..30 {
+        srv.send(R::get("/v1/info").no_client().from("198.51.100.77"))
+            .await;
+    }
+    srv.send(R::get("/v1/info").no_client().from("::ffff:198.51.100.77"))
+        .await
+        .expect_err(429, ErrorCode::RateLimited);
+}
+
+#[tokio::test]
+async fn a_bad_token_with_a_bad_body_is_401_and_counted_until_the_address_gets_429() {
+    // RVT2 B1: the token is checked before the body is read, so a malformed body does not skip
+    // the failed-token budget of the address (30 a minute).
+    let srv = Srv::new();
+    let admin = srv.bootstrap().await;
+    let well_formed = format!("awm_t_{}_{}", admin.org, "B".repeat(42) + "A");
+    for (n, token) in [(0u8, well_formed.as_str()), (1, "awm_t_x")] {
+        let ip = format!("203.0.113.{}", 20 + n);
+        let bad = |path: &str| {
+            R::post(path)
+                .bearer(token)
+                .from(&ip)
+                .raw(b"{not json".to_vec())
+        };
+        for i in 0..30 {
+            let path = ["/v1/records", "/v1/delete", "/v1/pull"][i % 3];
+            srv.send(bad(path))
+                .await
+                .expect_err(401, ErrorCode::Unauthenticated);
+        }
+        for path in ["/v1/records", "/v1/delete", "/v1/pull", "/v1/invites"] {
+            let r = srv.send(bad(path)).await;
+            let e = r.expect_err(429, ErrorCode::RateLimited);
+            assert!(e.retry_after_s.unwrap() >= 1, "{path}");
+        }
+        // A valid token from the address still gets through, and its malformed body is 400.
+        srv.send(
+            R::post("/v1/records")
+                .auth(&admin)
+                .from(&ip)
+                .raw(b"{".to_vec()),
+        )
+        .await
+        .expect_err(400, ErrorCode::Malformed);
+    }
+}
+
+#[tokio::test]
+async fn pre_deletions_and_new_id_markers_count_against_the_daily_quota() {
+    // RVT2 M1: ids the server has never seen add deletion entries like records add rows.
+    let srv = Srv::new();
+    let admin = srv.bootstrap().await;
+    let roy = srv.add_member(&admin, "roy", "member").await;
+    let fresh = |n: usize| -> Vec<String> { (0..n).map(|_| Id::new_v4().to_string()).collect() };
+    let delete =
+        |who: &Who, ids: Vec<String>| R::post("/v1/delete").auth(who).json(&json!({ "ids": ids }));
+    let mut codes = Vec::new();
+    for _ in 0..7 {
+        let r = srv.send(delete(&roy, fresh(1_000))).await;
+        if r.status == 429 {
+            let e = r.expect_err(429, ErrorCode::RateLimited);
+            assert_eq!(e.limit.as_deref(), Some("records_per_day"));
+            let now = srv.now();
+            assert_eq!(e.retry_after_s, Some((DAY - now.rem_euclid(DAY)) as u32));
+        }
+        codes.push(r.status);
+        srv.advance(1);
+    }
+    assert_eq!(codes, [200, 200, 200, 200, 200, 429, 429]);
+    // The quota is full: a record and a marker with a new id are refused too.
+    srv.push(&roy, srv.items("rec", 0, 1, 0, SMALL))
+        .await
+        .expect_err(429, ErrorCode::RateLimited);
+    srv.push(&roy, vec![marker("rec", 0, Id::new_v4())])
+        .await
+        .expect_err(429, ErrorCode::RateLimited);
+    // A refused batch deleted nothing: the deletion stream holds the 5,000 accepted ids.
+    assert_eq!(srv.store.deletion_heads().await.unwrap().head, 4_999);
+
+    // Deleting records the server holds is not counted: kit fills the quota with 100 records
+    // and 4,900 pre-deletions, then still deletes its own records.
+    let kit = srv.add_member(&admin, "kit", "member").await;
+    let held = srv.items("rec", 0, 100, 0, SMALL);
+    let held_ids: Vec<String> = held
+        .iter()
+        .map(|v| v["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(srv.push(&kit, held).await.status, 200);
+    for n in [1_000, 1_000, 1_000, 1_000, 900] {
+        let r = srv.send(delete(&kit, fresh(n))).await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        srv.advance(1);
+    }
+    srv.send(delete(&kit, fresh(1)))
+        .await
+        .expect_err(429, ErrorCode::RateLimited);
+    let r = srv.send(delete(&kit, held_ids)).await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    // The next UTC day starts again.
+    srv.advance(DAY);
+    assert_eq!(srv.send(delete(&roy, fresh(1))).await.status, 200);
+}
+
+#[tokio::test]
+async fn a_pending_device_sees_nothing_of_others_in_its_status_and_an_approved_one_sees_all() {
+    // RVT2 M2: a leaked invite lets its holder join, but not read who is in the team, what
+    // they pushed, or which other devices wait.
+    let srv = Srv::new();
+    let admin = srv.bootstrap().await;
+    let roy = srv.add_member(&admin, "roy", "member").await;
+    assert_eq!(
+        srv.push(&roy, srv.items("rec", 0, 3, 0, SMALL))
+            .await
+            .status,
+        200
+    );
+    let gone = srv.items("rec", 3, 1, 0, SMALL);
+    let gone_id = gone[0]["id"].as_str().unwrap().to_string();
+    assert_eq!(srv.push(&roy, gone).await.status, 200);
+    let r = srv
+        .send(
+            R::post("/v1/delete")
+                .auth(&roy)
+                .json(&json!({"ids": [gone_id]})),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let kit = srv.join_pending(&admin, "kit", 6).await;
+    let other = srv.join_pending(&admin, "mia", 7).await;
+
+    let full = srv.send(R::get("/v1/status").auth(&admin)).await.json();
+    assert_eq!(full["streams"].as_array().unwrap().len(), 1, "{full}");
+    assert_eq!(full["pending"].as_array().unwrap().len(), 2, "{full}");
+    assert_eq!(full["deletions"]["head"], 0);
+
+    let r = srv.send(R::get("/v1/status").auth(&kit)).await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let p = r.json();
+    assert_eq!(p["approved"], false);
+    assert_eq!(p["device_id"], kit.device.to_string());
+    assert_eq!(p["member_id"], kit.member.to_string());
+    assert_eq!(p["generation"], full["generation"]);
+    assert_eq!(p["current_epoch"], full["current_epoch"]);
+    assert_eq!(p["settings"]["min_client"], full["settings"]["min_client"]);
+    assert_eq!(p["streams"], json!([]));
+    assert_eq!(p["deletions"]["head"], -1);
+    assert_eq!(p["settings"]["max_members"], 0);
+    assert_eq!(p["rotation_needed"], false);
+    let pending = p["pending"].as_array().unwrap();
+    assert_eq!(pending.len(), 1, "{p}");
+    assert_eq!(pending[0]["device_id"], kit.device.to_string());
+    let text = r.text();
+    for hidden in [
+        roy.member.to_string(),
+        roy.device.to_string(),
+        other.device.to_string(),
+        other.member.to_string(),
+    ] {
+        assert!(!text.contains(&hidden), "{hidden} in {text}");
+    }
+    // Same schema: the same fields, with empty or neutral values.
+    let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+    assert_eq!(keys(&p), keys(&full));
+    assert_eq!(keys(&p["settings"]), keys(&full["settings"]));
+
+    // Approved, the same device sees the full status.
+    srv.approve(&admin, &kit).await;
+    let a = srv.send(R::get("/v1/status").auth(&kit)).await.json();
+    assert_eq!(a["approved"], true);
+    assert_eq!(a["streams"], full["streams"]);
+    assert_eq!(a["deletions"], full["deletions"]);
+    assert_eq!(a["settings"], full["settings"]);
+}
+
+impl Srv {
+    /// A new member whose one device joined and waits for approval.
+    async fn join_pending(&self, admin: &Who, handle: &str, seed: u8) -> Who {
+        let inv = self
+            .send(
+                R::post("/v1/invites")
+                    .auth(admin)
+                    .json(&json!({"kind": "member", "handle": handle, "role": "member"})),
+            )
+            .await
+            .json();
+        let device = Id::new_v4();
+        let j = self
+            .send(R::post("/v1/join").json(&json!({
+                "invite_id": inv["invite_id"], "invite_token": inv["invite_token"],
+                "handle": handle, "device_id": device.to_string(),
+                "device_pubkey": b64(&[seed; 32]), "join_mac": b64(&[seed; 32]),
+            })))
+            .await
+            .json();
+        Who {
+            token: j["device_token"].as_str().unwrap().to_string(),
+            member: Id::parse(j["member_id"].as_str().unwrap()).unwrap(),
+            device,
+            org: admin.org,
+        }
+    }
+
+    async fn refusals_of(&self, who: &Who) -> usize {
+        let audit = self.store.audit(0, 100_000).await.unwrap();
+        audit
+            .rows
+            .iter()
+            .filter(|r| {
+                r.action == "authz.refused" && r.target.as_deref() == Some(&*who.device.to_string())
+            })
+            .count()
+    }
+}
+
+#[tokio::test]
+async fn a_pending_device_polling_adds_one_refusal_row_an_hour_not_one_a_request() {
+    // RVT2 m1: a pending device that polls must not grow the audit log without bound.
+    let srv = Srv::new();
+    let admin = srv.bootstrap().await;
+    let kit = srv.join_pending(&admin, "kit", 6).await;
+    for _ in 0..50 {
+        srv.send(R::get("/v1/members").auth(&kit))
+            .await
+            .expect_err(403, ErrorCode::NotApproved);
+        srv.advance(1);
+    }
+    assert_eq!(srv.refusals_of(&kit).await, 1);
+    // Another pending device has its own row.
+    let mia = srv.join_pending(&admin, "mia", 7).await;
+    srv.send(R::get("/v1/members").auth(&mia))
+        .await
+        .expect_err(403, ErrorCode::NotApproved);
+    assert_eq!(srv.refusals_of(&mia).await, 1);
+    // An hour later, one more.
+    srv.advance(3_600);
+    for _ in 0..5 {
+        srv.send(R::get("/v1/members").auth(&kit))
+            .await
+            .expect_err(403, ErrorCode::NotApproved);
+    }
+    assert_eq!(srv.refusals_of(&kit).await, 2);
+    // An approved member's refusals are still audited one by one.
+    let roy = srv.add_member(&admin, "roy", "member").await;
+    for _ in 0..3 {
+        srv.send(R::get("/v1/audit?from=0").auth(&roy))
+            .await
+            .expect_err(403, ErrorCode::Forbidden);
+    }
+    assert_eq!(srv.refusals_of(&roy).await, 3);
 }
 
 #[tokio::test]
@@ -3076,6 +3362,28 @@ async fn healthz_answers_200_without_authentication_or_client_header() {
     for _ in 0..40 {
         assert_eq!(srv.send(R::get("/healthz").no_client()).await.status, 200);
     }
+}
+
+#[tokio::test]
+async fn healthz_reuses_the_store_answer_for_a_second() {
+    // RVT2 m6: an unauthenticated, unlimited route costs at most one store read a second.
+    let srv = Srv::new();
+    assert_eq!(srv.send(R::get("/healthz").no_client()).await.status, 200);
+    let conn = open_connection(&srv.data.join(DB_FILE)).unwrap();
+    conn.execute_batch("ALTER TABLE meta RENAME TO meta_gone;")
+        .unwrap();
+    // Inside the second, the cached answer: no store read.
+    for _ in 0..100 {
+        assert_eq!(srv.send(R::get("/healthz").no_client()).await.status, 200);
+    }
+    tokio::time::sleep(http::HEALTH_CACHE + std::time::Duration::from_millis(100)).await;
+    let r = srv.send(R::get("/healthz").no_client()).await;
+    assert_eq!(r.status, 503);
+    assert_eq!(r.body, b"unavailable");
+    conn.execute_batch("ALTER TABLE meta_gone RENAME TO meta;")
+        .unwrap();
+    tokio::time::sleep(http::HEALTH_CACHE + std::time::Duration::from_millis(100)).await;
+    assert_eq!(srv.send(R::get("/healthz").no_client()).await.status, 200);
 }
 
 #[tokio::test]

@@ -60,8 +60,11 @@ pub(super) async fn put_settings(State(app): State<AppState>, req: Request) -> R
 
 async fn put_settings_inner(app: &AppState, req: Request) -> Result<Response, ApiError> {
     let mut cx = Cx::open(app, req, Client::Required, Class::Token, Cap::Body)?;
-    let update: SettingsUpdate = cx.json_or_empty().await?;
     let caller = cx.authenticate().await?;
+    // The widest settings write first, so a member's body is not read (RVT2 B1).
+    cx.authorise(&caller, Action::WriteSettings { min_client: false })
+        .await?;
+    let update: SettingsUpdate = cx.json_or_empty().await?;
     let action = Action::WriteSettings {
         min_client: update.min_client.is_some(),
     };
@@ -85,9 +88,9 @@ pub(super) async fn complete_restore(State(app): State<AppState>, req: Request) 
 
 async fn complete_restore_inner(app: &AppState, req: Request) -> Result<Response, ApiError> {
     let mut cx = Cx::open(app, req, Client::Required, Class::Token, Cap::Body)?;
-    let body: RestoreCompleteRequest = cx.json(Cap::Body).await?;
     let caller = cx.authenticate().await?;
     cx.authorise(&caller, Action::CompleteRestore).await?;
+    let body: RestoreCompleteRequest = cx.json(Cap::Body).await?;
     let actor = caller
         .actor()
         .ok_or_else(|| ApiError::from(authz::Refusal::Forbidden))?;

@@ -152,6 +152,16 @@ impl Srv {
     fn log_text(&self) -> String {
         self.logs.0.lock().unwrap().join("\n")
     }
+
+    /// A server that withholds the rotation flag (compromised, or rolled back by its operator):
+    /// clears `rotation_needed` in its database (RVT2 M3).
+    fn withhold_rotation(&self) {
+        let conn = Connection::open(self.dir.path().join("data").join("server.db")).unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        conn.execute("UPDATE org SET rotation_needed = 0", [])
+            .unwrap();
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1046,6 +1056,38 @@ fn a_member_who_is_removed_gets_no_wrap_of_the_new_epoch_and_the_roster_shows_it
         1
     );
     assert!(c.try_sync(&c.opts()).is_err(), "carol's token is revoked");
+}
+
+#[test]
+fn an_admin_rotates_after_a_removal_even_when_the_server_never_sets_rotation_needed() {
+    let (srv, a, b) = org_of_two();
+    let c = add_member(&srv, &a, "carol", "member");
+    c.sync();
+    let cid = c.ident().team.device_id;
+    remove_member(&a, c.ident().team.member_id);
+    srv.withhold_rotation();
+    let status: Value = a.client().get("/v1/status").unwrap();
+    assert_eq!(status["rotation_needed"], json!(false));
+    let r = a.sync();
+    assert!(
+        r.rotated,
+        "the admin's own roster asks for the rotation: {r:?}"
+    );
+    let keys = embedded::block_on(srv.store.keys(cid)).unwrap();
+    assert!(
+        keys.wraps.iter().all(|w| w.epoch == 0),
+        "no wrap of epoch 1 for carol"
+    );
+    let keys = embedded::block_on(srv.store.keys(b.ident().team.device_id)).unwrap();
+    assert!(keys.wraps.iter().any(|w| w.epoch == 1));
+    assert_eq!(a.ident().ring().unwrap().current_epoch(), 1);
+    // The revocation is now older than the current epoch: no second rotation.
+    srv.withhold_rotation();
+    assert!(!a.sync().rotated);
+    assert_eq!(a.ident().ring().unwrap().current_epoch(), 1);
+    // A member's client never rotates, whatever its roster holds.
+    srv.withhold_rotation();
+    assert!(!b.sync().rotated);
 }
 
 #[test]

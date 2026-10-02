@@ -11,7 +11,9 @@
 //! wrap (it never holds the invite secret `S`): it stores them as given and the clients verify
 //! them (`docs/sync-v1-crypto.md` §4-§6).
 
+use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Mutex;
 
 use awm_proto::crypto::{OsRng, Secret32};
 use awm_proto::wire::{
@@ -339,7 +341,9 @@ pub async fn authenticate(
 /// [`authz::require`], plus the audit row of a refusal when a token was presented (pending,
 /// member or admin device): actor = the member, target = the device, detail = the action and
 /// the error code. Anonymous refusals are not audited (the request log has them), so a caller
-/// without a token cannot grow the audit table.
+/// without a token cannot grow the audit table. A pending device's `not_approved` refusals are
+/// audited once per device and hour in this process (RVT2 m1): an unapproved device that keeps
+/// polling adds at most 24 rows a day, not one per request.
 pub async fn authorise(
     store: &dyn Store,
     caller: &Caller,
@@ -349,6 +353,11 @@ pub async fn authorise(
     let Err(refusal) = authz::require(caller, action) else {
         return Ok(());
     };
+    if let (Caller::Pending(d), Refusal::NotApproved) = (caller, refusal) {
+        if !first_pending_refusal_this_hour(d.device_id, now) {
+            return Err(refusal.into());
+        }
+    }
     if let Some(d) = caller.device() {
         let code = match refusal {
             Refusal::Unauthenticated => "unauthenticated",
@@ -366,6 +375,26 @@ pub async fn authorise(
             .await?;
     }
     Err(refusal.into())
+}
+
+/// Pending devices whose `not_approved` refusal was audited, with the time of that row.
+static PENDING_AUDITED: Mutex<BTreeMap<Id, i64>> = Mutex::new(BTreeMap::new());
+
+/// Whether `device` has no audited `not_approved` refusal within the hour before `now`; if so,
+/// records `now` as its audited one. Entries older than an hour are dropped as it goes.
+fn first_pending_refusal_this_hour(device: Id, now: i64) -> bool {
+    const HOUR_S: i64 = 3_600;
+    let mut m = PENDING_AUDITED.lock().unwrap_or_else(|e| e.into_inner());
+    if m.len() > 10_000 {
+        m.retain(|_, at| (0..HOUR_S).contains(&(now - *at)));
+    }
+    match m.get(&device) {
+        Some(at) if (0..HOUR_S).contains(&(now - at)) => false,
+        _ => {
+            m.insert(device, now);
+            true
+        }
+    }
 }
 
 /// The approved caller's actor after a successful [`authorise`].

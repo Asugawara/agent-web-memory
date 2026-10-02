@@ -31,6 +31,7 @@ use crate::backup::{Clock, SystemClock, Target};
 use crate::check::{self, CheckInput, External, Health, HostFacts};
 use crate::config::{self, ConfigError, Flags, Resolved, StoreChoice};
 use crate::http::{self, AppState, LogSink, StderrLog};
+use crate::lockfile::{self, DataLock, LockError};
 use crate::retention;
 use crate::store::sqlite::SqliteStore;
 use crate::store::{Store, StoreError};
@@ -120,16 +121,38 @@ pub async fn open_store(r: &Resolved) -> Result<Arc<dyn Store>, StartError> {
                 .map_err(|e| store_err(&e))?;
             Ok(Arc::new(store))
         }
-        StoreChoice::Postgres { url, owner_url } => {
-            open_pg(url.expose(), owner_url.as_ref().map(config::Secret::expose)).await
+        StoreChoice::Postgres {
+            url,
+            owner_url,
+            insecure_network,
+        } => {
+            open_pg(
+                url.expose(),
+                owner_url.as_ref().map(config::Secret::expose),
+                *insecure_network,
+            )
+            .await
         }
     }
 }
 
 #[cfg(feature = "pg")]
-async fn open_pg(url: &str, owner: Option<&str>) -> Result<Arc<dyn Store>, StartError> {
-    use crate::store::pg::PgStore;
-    let pg = PgStore::connect(url, owner, 10)
+async fn open_pg(
+    url: &str,
+    owner: Option<&str>,
+    insecure_network: bool,
+) -> Result<Arc<dyn Store>, StartError> {
+    use crate::store::pg::{parse_url, public_host, public_host_refusal, PgStore};
+    // RVT2 M4: a refused host is a configuration refusal (exit 2), checked before connecting.
+    if !insecure_network {
+        for u in std::iter::once(url).chain(owner) {
+            let cfg = parse_url(u).map_err(|e| start_err(2, e.to_string()))?;
+            if let Some(host) = public_host(&cfg).await {
+                return Err(start_err(2, public_host_refusal(&host)));
+            }
+        }
+    }
+    let pg = PgStore::connect_with(url, owner, 10, insecure_network)
         .await
         .map_err(|e| store_err(&e))?;
     use awm_proto::wire::Id;
@@ -138,7 +161,11 @@ async fn open_pg(url: &str, owner: Option<&str>) -> Result<Arc<dyn Store>, Start
 }
 
 #[cfg(not(feature = "pg"))]
-async fn open_pg(_url: &str, _owner: Option<&str>) -> Result<Arc<dyn Store>, StartError> {
+async fn open_pg(
+    _url: &str,
+    _owner: Option<&str>,
+    _insecure_network: bool,
+) -> Result<Arc<dyn Store>, StartError> {
     Err(start_err(2, "this build has no PgStore (feature pg)"))
 }
 
@@ -164,15 +191,19 @@ pub struct Server {
     pub no_admin: bool,
     shutdown: watch::Sender<bool>,
     tasks: Vec<(&'static str, JoinHandle<()>)>,
+    /// `{data}/server.lock` (`SqliteStore`), released when the server is stopped or dropped.
+    lock: Option<DataLock>,
 }
 
 impl Server {
-    /// Asks every task to stop, waits for in-flight requests (up to the grace), and returns.
+    /// Asks every task to stop, waits for in-flight requests (up to the grace), and returns;
+    /// the data directory's lock is released last.
     pub async fn stop(self, grace: Duration) {
         let _ = self.shutdown.send(true);
         for (_, t) in self.tasks {
             let _ = tokio::time::timeout(grace + Duration::from_secs(5), t).await;
         }
+        drop(self.lock);
     }
 
     /// The future the tasks wait on.
@@ -221,19 +252,48 @@ where
     tasks.push((name, tokio::spawn(f)));
 }
 
-/// The scratch directory for exports and verification: private, below the temp directory.
+/// The scratch directory for exports and verification when there is no `--data` (`PgStore`):
+/// `awm-{tag}-{random}` below `$XDG_RUNTIME_DIR` (per user, mode 0700, on systemd hosts) or else
+/// the temporary directory. It is created by this call, mode 0700 and not recursively; an
+/// existing path is refused rather than used, so another local user cannot plant a directory
+/// (or a link) and swap a canonical export before it is uploaded (RVT2 m8).
 fn private_scratch(tag: &str) -> Result<PathBuf, StartError> {
-    let dir = std::env::temp_dir().join(format!("awm-{tag}-{}", std::process::id()));
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute() && p.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = base.join(format!("awm-{tag}-{}", awm_proto::wire::Id::new_v4()));
+    create_new_private_dir(&dir)?;
+    Ok(dir)
+}
+
+/// Creates `dir` with mode 0700; an existing path (a directory, a file or a link) is an error.
+fn create_new_private_dir(dir: &Path) -> Result<(), StartError> {
     let mut b = std::fs::DirBuilder::new();
-    b.recursive(true);
+    b.recursive(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
         b.mode(0o700);
     }
-    b.create(&dir)
-        .map_err(|e| start_err(1, format!("cannot create {}: {}", dir.display(), e.kind())))?;
-    Ok(dir)
+    b.create(dir)
+        .map_err(|e| start_err(1, format!("cannot create {}: {}", dir.display(), e.kind())))
+}
+
+/// Takes `{data}/server.lock` for a server's lifetime: exit 2 while another server or a restore
+/// holds it.
+fn lock_data(data: &Path) -> Result<DataLock, StartError> {
+    lockfile::try_lock(data).map_err(|e| match e {
+        LockError::Held(p) => start_err(
+            2,
+            format!(
+                "{} is held: another awm serve or a restore uses {}; stop it first",
+                p.display(),
+                data.display()
+            ),
+        ),
+        LockError::Io(m) => start_err(1, m),
+    })
 }
 
 /// Installs `AWM_BOOTSTRAP_SHA256` / `AWM_BOOTSTRAP_EXPIRES` (path A) while no admin exists.
@@ -275,7 +335,25 @@ async fn install_bootstrap_env(
 /// `--domain`) a certificate is installed.
 pub async fn start(r: &Resolved, s: &Settings) -> Result<Server, StartError> {
     config::verify_files(r)?;
+    // RVT2 M5: one server per data directory, and no restore under a running one. The lock is
+    // taken before the store opens (a migration writes), or right after it created a new
+    // directory, which no other process can hold yet.
+    let early = match r.data_dir() {
+        Some(d) if d.is_dir() => Some(lock_data(d)?),
+        _ => None,
+    };
     let store = open_store(r).await?;
+    let lock = match (early, r.data_dir()) {
+        (Some(l), _) => Some(l),
+        (None, Some(d)) => Some(lock_data(d)?),
+        (None, None) => {
+            s.log(
+                "PgStore: no server.lock (a restore into PgStore refuses a database that holds \
+                 an organisation)",
+            );
+            None
+        }
+    };
     let now = s.clock.now();
     let bootstrap_installed = install_bootstrap_env(&*store, s, now).await?;
     let no_admin = store.org(now).await.map_err(|e| store_err(&e))?.is_none();
@@ -311,6 +389,7 @@ pub async fn start(r: &Resolved, s: &Settings) -> Result<Server, StartError> {
         no_admin,
         shutdown: tx,
         tasks: Vec::new(),
+        lock,
     };
 
     match serve_listeners(r, s, &mut server, router).await {
@@ -329,10 +408,11 @@ pub async fn start(r: &Resolved, s: &Settings) -> Result<Server, StartError> {
             s.clone(),
             server.shutdown.subscribe(),
         );
+        let data = r.data_dir().map(Path::to_path_buf);
         spawn_named(
             &mut server.tasks,
             "retention",
-            retention_loop(st, sc, log, wait(rx)),
+            retention_loop(st, sc, log, data, wait(rx)),
         );
     }
     if let Err(e) = start_backup(r, s, &mut server).await {
@@ -488,14 +568,30 @@ async fn serve_tls_listeners(
 }
 
 /// The hourly retention task of a host. Unlike `retention::hourly` it logs each run and each
-/// failure (TM9 P3).
-async fn retention_loop<F>(store: Arc<dyn Store>, clock: Arc<dyn Clock>, s: Settings, shutdown: F)
-where
+/// failure (TM9 P3), and with `SqliteStore` it removes the local copies of the database that
+/// are older than the backups' window, with or without `--backup` (RVT2 B2).
+async fn retention_loop<F>(
+    store: Arc<dyn Store>,
+    clock: Arc<dyn Clock>,
+    s: Settings,
+    data: Option<PathBuf>,
+    shutdown: F,
+) where
     F: Future<Output = ()> + Send,
 {
     let mut shutdown = std::pin::pin!(shutdown);
     loop {
         let now = clock.now();
+        if let Some(dir) = &data {
+            match crate::backup::local::sweep(&*store, dir, now).await {
+                Ok(removed) if !removed.is_empty() => s.log(&format!(
+                    "retention: {} local database copy file(s) older than the backups' window removed",
+                    removed.len()
+                )),
+                Ok(_) => {}
+                Err(e) => s.log(&format!("retention: local copies: {e}")),
+            }
+        }
         let wait_s = match retention::run(&*store, now).await {
             Ok(Some(r)) => {
                 s.log(&format!(
@@ -1324,6 +1420,15 @@ async fn cmd_restore(
     }
     if let Some(p) = &report.pre_restore {
         let _ = writeln!(io.out, "  previous database kept as {}", p.display());
+        if let Some(t) = report.pre_restore_removed_by {
+            // §5.6 (RVT2 B2): it holds deleted blobs, so it follows the backups' window.
+            let _ = writeln!(
+                io.out,
+                "  awm serve removes it by {} UTC (earlier once every backup older than it has \
+                 expired); copy it elsewhere first if you need it longer",
+                check::fmt_utc(t)
+            );
+        }
     }
     let _ = writeln!(
         io.out,
@@ -1336,4 +1441,34 @@ async fn cmd_restore(
 /// For tests and the CLI: the path of `server.db` in `data`.
 pub fn db_path(data: &Path) -> PathBuf {
     data.join(crate::store::sqlite::DB_FILE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_scratch_directory_is_new_private_and_unpredictable() {
+        // RVT2 m8: no directory another user could have made first is ever used.
+        let a = private_scratch("t").unwrap();
+        let b = private_scratch("t").unwrap();
+        assert_ne!(a, b);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&a).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+        let e = create_new_private_dir(&a).unwrap_err();
+        assert_eq!(e.code, 1, "{e}");
+        #[cfg(unix)]
+        {
+            let link = a.with_extension("link");
+            std::os::unix::fs::symlink(&b, &link).unwrap();
+            assert!(create_new_private_dir(&link).is_err());
+            std::fs::remove_file(&link).unwrap();
+        }
+        std::fs::remove_dir(&a).unwrap();
+        std::fs::remove_dir(&b).unwrap();
+    }
 }

@@ -193,7 +193,8 @@ fn team_defaults_parse_set_and_clamp() {
     assert!(c.team.mute.is_empty() && c.team.exclude_hosts.is_empty());
     assert!(!c.team.share_all_projects && !c.team.share_stats);
     assert_eq!(c.team.summary_chars, 1000);
-    assert_eq!(c.team.auto_approve, AutoApprove::Devices);
+    // RVT2 m3: no join is approved without the 6-digit code unless the user opts in.
+    assert_eq!(c.team.auto_approve, AutoApprove::None);
     assert_eq!(c.team.push_delay_s, 0);
     for (key, want) in [
         ("team.auto_sync", "true"),
@@ -204,7 +205,7 @@ fn team_defaults_parse_set_and_clamp() {
         ("team.exclude_hosts", ""),
         ("team.summary_chars", "1000"),
         ("team.share_stats", "false"),
-        ("team.auto_approve", "devices"),
+        ("team.auto_approve", "none"),
         ("team.push_delay_s", "0"),
     ] {
         assert_eq!(c.get(key).as_deref(), Some(want), "{key}");
@@ -236,6 +237,10 @@ fn team_defaults_parse_set_and_clamp() {
     // TM14: `set` stores bare handles (an `@` is accepted and dropped).
     assert_eq!(c.get("team.mute").unwrap(), "a,b");
     assert_eq!(c.get("team.auto_approve").unwrap(), "all");
+    c.set("team.auto_approve", "devices").unwrap();
+    assert_eq!(c.team.auto_approve, AutoApprove::Devices);
+    c.set("team.auto_approve", "none").unwrap();
+    assert_eq!(c.team.auto_approve, AutoApprove::None);
     assert_eq!(c.get("team.push_delay_s").unwrap(), "900");
 }
 

@@ -4,8 +4,8 @@
 use std::collections::HashSet;
 
 use awm_proto::wire::{
-    check_envelope, DeleteRequest, DeletionsQuery, KnownTag, PullRequest, PushItem, PushRequest,
-    RecordsQuery,
+    check_envelope, DeleteRequest, DeletionsQuery, Id, KnownTag, PullRequest, PushItem,
+    PushRequest, RecordsQuery,
 };
 use axum::extract::{Request, State};
 use axum::response::Response;
@@ -15,9 +15,9 @@ use super::error::ApiError;
 use super::{json, reply, AppState};
 use crate::authz::{self, Action};
 use crate::delete;
+use crate::quota::{self, Quota};
 use crate::store::PushBatch;
 
-const DAY_S: i64 = 86_400;
 /// Indexes stay below 2^53 (`docs/sync-v1.md` §1).
 const MAX_IDX: u64 = 1 << 53;
 
@@ -30,7 +30,11 @@ async fn push_inner(app: &AppState, req: Request) -> Result<Response, ApiError> 
     let limits = &app.config.limits;
     let mut cx = Cx::open(app, req, Client::Required, Class::Token, Cap::Batch)?;
 
-    // Step 1: the body.
+    // Step 1: the token, before the body is read (RVT2 B1).
+    let caller = cx.authenticate().await?;
+    cx.authorise(&caller, Action::Push(KnownTag::Rec)).await?;
+
+    // Step 2: the body.
     let body: PushRequest = cx.json(Cap::Batch).await?;
     let items = body.records;
     if items.is_empty() {
@@ -53,9 +57,7 @@ async fn push_inner(app: &AppState, req: Request) -> Result<Response, ApiError> 
         ));
     }
 
-    // Step 2: the caller.
-    let caller = cx.authenticate().await?;
-    cx.authorise(&caller, Action::Push(KnownTag::Rec)).await?;
+    // Step 3: the rest of the caller's checks.
     cx.restore_gate_for(&caller).await?;
     if authz::push_needs_min_client(&items) {
         let min = cx.min_client().await?;
@@ -82,7 +84,7 @@ async fn push_inner(app: &AppState, req: Request) -> Result<Response, ApiError> 
         .ok_or_else(|| ApiError::from(authz::Refusal::Forbidden))?;
     quota(&cx, &actor, &items).await?;
 
-    // Step 3: each blob.
+    // Step 4: each blob.
     for (i, item) in items.iter().enumerate() {
         if let PushItem::Record(r) = item {
             let n = r.blob.0.len();
@@ -99,7 +101,7 @@ async fn push_inner(app: &AppState, req: Request) -> Result<Response, ApiError> 
         }
     }
 
-    // Steps 4 and 5.
+    // Steps 5 and 6.
     let resp = app
         .store
         .push(PushBatch {
@@ -112,32 +114,43 @@ async fn push_inner(app: &AppState, req: Request) -> Result<Response, ApiError> 
     json(&resp)
 }
 
-/// The member's daily quota: 429 `rate_limited` (`records_per_day`) with `Retry-After` until
-/// 00:00 UTC. Markers do not count, and neither does anything pushed in the 24 hours after a
-/// new generation (the re-seed).
+/// The member's daily quota ([`crate::quota`]): 429 `rate_limited` (`records_per_day`) with
+/// `Retry-After` until 00:00 UTC. Record items count, and markers whose id the store has never
+/// seen (each would append a new deletion-stream entry, RVT2 M1); a marker for a stored or
+/// already deleted id does not, and nothing does in the 24 hours after a new generation.
 async fn quota(cx: &Cx, actor: &crate::store::Actor, items: &[PushItem]) -> Result<(), ApiError> {
     let records = items
         .iter()
         .filter(|i| matches!(i, PushItem::Record(_)))
         .count() as u64;
-    if records == 0 {
-        return Ok(());
+    let markers: Vec<Id> = items
+        .iter()
+        .filter_map(|i| match i {
+            PushItem::Deleted(d) => Some(d.id),
+            PushItem::Record(_) => None,
+        })
+        .collect();
+    let new_markers = if markers.is_empty() {
+        0
+    } else {
+        cx.app.store.unknown_ids(markers).await?
+    };
+    let per_day = cx.app.config.limits.records_per_day;
+    match quota::check(
+        &*cx.app.store,
+        actor.member_id,
+        records + new_markers,
+        per_day,
+        cx.now,
+    )
+    .await?
+    {
+        Quota::Within => Ok(()),
+        Quota::Exceeded { retry_after_s } => Err(ApiError::rate_limited(
+            retry_after_s,
+            Some("records_per_day"),
+        )),
     }
-    let state = cx.app.store.restore_state().await?;
-    if state.restored_at.is_some_and(|t| cx.now - t < DAY_S) {
-        return Ok(());
-    }
-    let day_start = cx.now - cx.now.rem_euclid(DAY_S);
-    let used = cx
-        .app
-        .store
-        .pushed_since(actor.member_id, day_start)
-        .await?;
-    if used + records > u64::from(cx.app.config.limits.records_per_day) {
-        let retry = (day_start + DAY_S - cx.now).max(1) as u32;
-        return Err(ApiError::rate_limited(retry, Some("records_per_day")));
-    }
-    Ok(())
 }
 
 fn page_limit(limit: Option<u32>, max: u32, field: &str) -> Result<u32, ApiError> {
@@ -188,6 +201,8 @@ pub(super) async fn pull(State(app): State<AppState>, req: Request) -> Response 
 async fn pull_inner(app: &AppState, req: Request) -> Result<Response, ApiError> {
     let limits = &app.config.limits;
     let mut cx = Cx::open(app, req, Client::Required, Class::Token, Cap::Body)?;
+    let caller = cx.authenticate().await?;
+    cx.authorise(&caller, Action::Pull).await?;
     let body: PullRequest = cx.json(Cap::Body).await?;
     if body.cursors.len() > limits.pull_cursors {
         return Err(ApiError::too_large(
@@ -196,8 +211,6 @@ async fn pull_inner(app: &AppState, req: Request) -> Result<Response, ApiError> 
             None,
         ));
     }
-    let caller = cx.authenticate().await?;
-    cx.authorise(&caller, Action::Pull).await?;
     if body.cursors.is_empty() {
         return Err(ApiError::invalid(
             "/cursors",
@@ -257,9 +270,10 @@ pub(super) async fn delete_records(State(app): State<AppState>, req: Request) ->
 async fn delete_inner(app: &AppState, req: Request) -> Result<Response, ApiError> {
     let limits = &app.config.limits;
     let mut cx = Cx::open(app, req, Client::Required, Class::Token, Cap::Body)?;
+    let caller = cx.authenticate().await?;
     let body: DeleteRequest = cx.json(Cap::Body).await?;
     // Kept in front of `delete::run` (which checks the same cap after authorising): it rejects an
-    // oversized list before the token lookup.
+    // oversized list before any store read for its ids.
     if let DeleteRequest::Ids(ids) = &body {
         if ids.len() > limits.delete_ids {
             return Err(ApiError::too_large(
@@ -269,6 +283,6 @@ async fn delete_inner(app: &AppState, req: Request) -> Result<Response, ApiError
             ));
         }
     }
-    let caller = cx.authenticate().await?;
-    json(&delete::run(&*app.store, &caller, body, cx.now).await?)
+    let quota = limits.records_per_day;
+    json(&delete::run_with_quota(&*app.store, &caller, body, cx.now, quota).await?)
 }

@@ -734,9 +734,16 @@ mod imp {
             "device",
             Some(member),
         )?;
-        if member == ident.team.member_id {
+        let own = member == ident.team.member_id;
+        if own && ctx.env.config.team.auto_approve != crate::config::AutoApprove::None {
             eprintln!(
                 "awm: run it on the new machine; this device approves it at its next awm sync"
+            );
+        } else if own {
+            // `team.auto_approve = none` (the default, RVT2 m3): a leaked string is not enough.
+            eprintln!(
+                "awm: run it on the new machine, then compare the code it prints and run here: \
+                 awm team approve {handle} --code NNNNNN"
             );
         } else {
             eprintln!("awm: when the device has joined, compare the code and run: awm team approve {handle}");

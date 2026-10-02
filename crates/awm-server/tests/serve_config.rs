@@ -348,7 +348,29 @@ fn behind_a_tls_proxy_the_server_listens_on_port_and_trusts_the_named_proxies() 
         trusted_proxies: vec!["cloud-run".into()],
         ..Flags::default()
     };
-    let r = resolve_with(&flags, &[("PORT", "8080"), ("DB", "postgres://u@h/d")]).unwrap();
+    // `cloud-run` is refused off Cloud Run, where anyone can write the last X-Forwarded-For entry
+    // (RVT2 m4).
+    for env in [
+        &[("PORT", "8080"), ("DB", "postgres://u@h/d")][..],
+        &[
+            ("PORT", "8080"),
+            ("DB", "postgres://u@h/d"),
+            ("K_SERVICE", ""),
+        ][..],
+    ] {
+        let e = resolve_with(&flags, env).unwrap_err();
+        assert_eq!(e.code, 2, "{e}");
+        assert!(e.message.contains("K_SERVICE"), "{e}");
+    }
+    let r = resolve_with(
+        &flags,
+        &[
+            ("PORT", "8080"),
+            ("DB", "postgres://u@h/d"),
+            ("K_SERVICE", "awm"),
+        ],
+    )
+    .unwrap();
     assert_eq!(
         r.listen,
         vec!["0.0.0.0:8080".parse::<SocketAddr>().unwrap()]
@@ -357,7 +379,9 @@ fn behind_a_tls_proxy_the_server_listens_on_port_and_trusts_the_named_proxies() 
     let c = r.server_config(Version::new(0, 2, 0), Version::new(0, 2, 0));
     assert!(c.forwarded_last_entry);
     assert_eq!(c.retention, RetentionMode::InRequests);
-    assert!(!c.hsts, "the proxy terminates TLS");
+    // The proxy terminates TLS but the client still reached the server over https, so the header
+    // is sent (RVT2 m10).
+    assert!(c.hsts);
 
     // CIDR ranges, repeatable; no PORT keeps the loopback default.
     let r = resolve(&Flags {
@@ -640,10 +664,14 @@ fn server_toml_has_a_key_for_every_flag_and_flags_override_it() {
          records_per_day = 99\n\
          request_timeout_s = 7\n",
     );
-    let from_file = resolve(&Flags {
-        config: Some(file.clone()),
-        ..Flags::default()
-    })
+    // `cloud-run` needs K_SERVICE (RVT2 m4).
+    let from_file = resolve_with(
+        &Flags {
+            config: Some(file.clone()),
+            ..Flags::default()
+        },
+        &[("K_SERVICE", "awm")],
+    )
     .unwrap();
     assert_eq!(
         from_file.store,
@@ -762,7 +790,7 @@ fn the_default_config_file_is_data_server_toml() {
         ],
     )
     .unwrap();
-    let StoreChoice::Postgres { url, owner_url } = r.store else {
+    let StoreChoice::Postgres { url, owner_url, .. } = r.store else {
         panic!("PgStore");
     };
     assert_eq!(url.expose(), "postgres://app@h/d");
@@ -1120,7 +1148,11 @@ async fn trusted_proxy_cloud_run_takes_the_last_x_forwarded_for_entry() {
         trusted_proxies: vec!["cloud-run".into()],
         ..Flags::default()
     };
-    let server = running(&flags, &log).await;
+    // Only on Cloud Run (RVT2 m4).
+    let r = resolve_with(&flags, &[("K_SERVICE", "awm")]).expect("a valid configuration");
+    let server = serve::start(&r, &settings(&log))
+        .await
+        .expect("the server starts");
     let router = http::router(server.state.clone());
     // The left part is client-supplied; the last entry is what the front end saw.
     send(
@@ -1221,6 +1253,15 @@ async fn retention_runs_hourly_on_a_host_and_in_requests_on_cloud_run() {
         let router = http::router(state);
         assert_eq!(bootstrap(&router, t.as_str(), "alf").await.status, 200);
     }
+    // RVT2 B2: the hourly task also removes local copies of the database past the backups'
+    // window, with no backup target: one 9 days old goes, one an hour old stays.
+    let now = SystemClock.now();
+    let old_copy = dir.join(format!("server.db.pre-restore-{}", now - 9 * 86_400));
+    let new_copy = dir.join(format!("server.db.pre-restore-{}", now - 3_600));
+    for p in [&old_copy, &new_copy] {
+        std::fs::write(p, b"copy").unwrap();
+        chmod(p, 0o600);
+    }
     let server = running(&data_flags(&dir), &log).await;
     assert_eq!(server.state.config.retention, RetentionMode::Off);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1232,6 +1273,9 @@ async fn retention_runs_hourly_on_a_host_and_in_requests_on_cloud_run() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    assert!(!old_copy.exists(), "{}", log.text());
+    assert!(new_copy.exists());
+    assert!(log.text().contains("local database copy"), "{}", log.text());
     server.stop(Duration::from_secs(1)).await;
 
     // Request-time mode (PORT set): the server spawns no hourly task and the state says so.
@@ -1598,6 +1642,51 @@ async fn backup_verify_and_restore_are_wired_with_their_exit_codes() {
     .await;
     assert_eq!(c, 0, "{err}");
     assert!(out.contains("previous database kept as"), "{out}");
+    // RVT2 B2: the copy holds deleted blobs; the report says when it goes (8 days on at the
+    // latest).
+    let line = out
+        .lines()
+        .find(|l| l.contains("awm serve removes it by"))
+        .unwrap_or_else(|| panic!("{out}"));
+    let day = |t: i64| awm_server::check::fmt_utc(t)[..10].to_string();
+    let now = SystemClock.now();
+    assert!(
+        [day(now + 8 * 86_400 - 60), day(now + 8 * 86_400)]
+            .iter()
+            .any(|d| line.contains(d.as_str())),
+        "{line}"
+    );
+    assert!(line.contains("copy it elsewhere"), "{line}");
+
+    // RVT2 M5: no restore while a server runs on the directory, and one server per directory.
+    let server = running(&data_flags(&restored), &log).await;
+    for (from, force, mark) in [(Some(url.clone()), true, false), (None, false, true)] {
+        let (c, _, err) = cmd(
+            data_flags(&restored),
+            Command::Restore {
+                from,
+                at: None,
+                force,
+                mark_restored: mark,
+            },
+            settings(&log),
+            false,
+        )
+        .await;
+        assert_eq!(c, 2, "{err}");
+        assert!(err.contains("stop the server"), "{err}");
+    }
+    let e = serve::start(&resolve(&data_flags(&restored)).unwrap(), &settings(&log))
+        .await
+        .err()
+        .expect("a second server on the directory is refused");
+    assert_eq!(e.code, 2, "{e}");
+    assert!(
+        e.message.contains("server.lock") && e.message.contains("stop it first"),
+        "{e}"
+    );
+    // The lock goes with the server.
+    server.stop(Duration::from_secs(1)).await;
     // --mark-restored only changes the generation; no --from; both together are refused.
     let (c, _, err) = cmd(
         data_flags(&restored),
@@ -1681,6 +1770,105 @@ async fn backup_verify_and_restore_are_wired_with_their_exit_codes() {
     )
     .await;
     assert_eq!(c, 3, "{err}");
+}
+
+// --- the Postgres host (RVT2 M4) ---------------------------------------------------------
+
+#[cfg(feature = "pg")]
+#[tokio::test]
+async fn a_public_database_host_is_exit_2_unless_the_insecure_network_flag_is_given() {
+    use awm_server::store::pg::{parse_url, public_host};
+    // The connection has no TLS: hosts outside loopback and the private ranges are refused
+    // before anything connects.
+    let log = Arc::new(Capture::default());
+    for (url, host) in [
+        ("postgres://awm@8.8.8.8/awm", "8.8.8.8"),
+        (
+            "postgres://awm@[2001:4860::8888]:5432/awm",
+            "2001:4860::8888",
+        ),
+        (
+            "postgres://awm@127.0.0.1/awm?hostaddr=192.0.2.7",
+            "192.0.2.7",
+        ),
+    ] {
+        let flags = Flags {
+            database_url: Some(Secret::new(url)),
+            listen: Some("127.0.0.1:0".into()),
+            ..Flags::default()
+        };
+        let r = resolve(&flags).unwrap();
+        let e = serve::start(&r, &settings(&log))
+            .await
+            .err()
+            .expect("a public host is refused");
+        assert_eq!(e.code, 2, "{url}: {e}");
+        assert!(
+            e.message.contains(host) && e.message.contains("--database-insecure-network"),
+            "{e}"
+        );
+        // The refusal names no password or URL.
+        assert!(!e.message.contains("postgres://"), "{e}");
+    }
+    // Loopback, RFC 1918, link-local, ULA, `localhost` and the Cloud SQL socket are accepted.
+    for url in [
+        "postgres://awm@127.0.0.1/awm",
+        "postgres://awm@[::1]/awm",
+        "postgres://awm@localhost/awm",
+        "postgres://awm@10.1.2.3/awm",
+        "postgres://awm@172.16.0.9/awm",
+        "postgres://awm@192.168.5.5/awm",
+        "postgres://awm@169.254.1.1/awm",
+        "postgres://awm@[fd00::5]/awm",
+        "postgres://awm@[fe80::1]/awm",
+        "postgres://awm@/awm?host=/cloudsql/proj:region:inst",
+        "host=/cloudsql/proj:region:inst user=awm dbname=awm",
+        "postgres://awm@db.example.com/awm?hostaddr=10.0.0.4",
+    ] {
+        let cfg = parse_url(url).unwrap();
+        assert_eq!(public_host(&cfg).await, None, "{url}");
+    }
+    // The flag (or its server.toml key) accepts the risk; without a URL it is refused.
+    let flags = Flags {
+        database_url: Some(Secret::new("postgres://awm@8.8.8.8/awm")),
+        database_insecure_network: true,
+        ..Flags::default()
+    };
+    match resolve(&flags).unwrap().store {
+        StoreChoice::Postgres {
+            insecure_network, ..
+        } => assert!(insecure_network),
+        other => panic!("{other:?}"),
+    }
+    let m = refused(&Flags {
+        data: Some("/d".into()),
+        database_insecure_network: true,
+        ..Flags::default()
+    });
+    assert!(m.contains("--database-insecure-network"), "{m}");
+    let dir = scratch("insecure-toml");
+    let file = dir.join("server.toml");
+    std::fs::write(
+        &file,
+        "database_url_env = \"DB\"\ndatabase_insecure_network = true\n",
+    )
+    .unwrap();
+    chmod(&file, 0o600);
+    let r = resolve_with(
+        &Flags {
+            config: Some(file),
+            ..Flags::default()
+        },
+        &[("DB", "postgres://awm@8.8.8.8/awm")],
+    )
+    .unwrap();
+    assert!(matches!(
+        r.store,
+        StoreChoice::Postgres {
+            insecure_network: true,
+            ..
+        }
+    ));
 }
 
 // --- logs ----------------------------------------------------------------------------------

@@ -16,7 +16,9 @@ RUN mkdir /data && chmod 0700 /data && chown 65532:65532 /data
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=builder /src/target/release/awm /usr/local/bin/awm
-COPY --from=builder --chown=65532:65532 /data /data
+# COPY recreates the directory with the default mode (0755), so the mode is set again here
+# (BuildKit's --chmod); without it a fresh container's `awm serve check` fails on files.
+COPY --from=builder --chown=65532:65532 --chmod=0700 /data /data
 COPY LICENSE THIRD_PARTY_LICENSES.md /licenses/
 
 # AWM_DATA and AWM_LISTEN are read by `awm serve` and by `awm serve healthcheck` alike (the

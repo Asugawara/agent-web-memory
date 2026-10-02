@@ -14,7 +14,7 @@ use super::error::{parse_json, query_error, ApiError};
 use super::AppState;
 use crate::auth::{self, AuthError, Caller};
 use crate::authz::{self, Action, Refusal};
-use crate::limits::RateKey;
+use crate::limits::{bucket_addr, RateKey};
 
 /// What the request log learns about a request while a handler runs.
 #[derive(Debug, Default, Clone)]
@@ -170,17 +170,29 @@ impl Cx {
 
         // The address limits come before anything is read or looked up.
         let limiter = &app.limiter;
+        let bucket = bucket_addr(ip);
         let over = |r: Result<(), u32>| r.map_err(|s| ApiError::rate_limited(s, None));
-        match class {
-            // A request with a token is limited per device once the token is known (and per
-            // address if the token fails): a team behind one address shares no budget.
-            Class::Token if auth_header.is_some() => {}
-            Class::Token | Class::Anonymous => {
-                over(limiter.take(RateKey::Anonymous(ip), limits.anonymous_rule(), now))?
+        match (class, &auth_header) {
+            // A request with a token is limited per device once the token is known, and per
+            // address while its token fails: a team behind one address shares no budget. An
+            // address whose failed-token budget is empty gets 429 here for a header that cannot
+            // be a device token; a well-formed one is decided by `authenticate`, before the
+            // body is read (RVT2 B1).
+            (Class::Token, Some(h)) => {
+                if let Err(s) =
+                    limiter.check(RateKey::FailedAuth(bucket), limits.anonymous_rule(), now)
+                {
+                    if !auth::parse(h).is_ok_and(|p| p.kind() == auth::TokenKind::Device) {
+                        return Err(ApiError::rate_limited(s, None));
+                    }
+                }
             }
-            Class::Join => {
-                over(limiter.take(RateKey::Anonymous(ip), limits.anonymous_rule(), now))?;
-                over(limiter.take(RateKey::Join(ip), limits.join_rule(), now))?;
+            (Class::Token | Class::Anonymous, _) => {
+                over(limiter.take(RateKey::Anonymous(bucket), limits.anonymous_rule(), now))?
+            }
+            (Class::Join, _) => {
+                over(limiter.take(RateKey::Anonymous(bucket), limits.anonymous_rule(), now))?;
+                over(limiter.take(RateKey::Join(bucket), limits.join_rule(), now))?;
             }
         }
 
@@ -249,12 +261,31 @@ impl Cx {
     }
 
     /// Resolves the `Authorization` header with `auth::authenticate` (401 for a bad token; it also
-    /// records the day the device was seen), then applies the per-device request limit.
+    /// records the day the device was seen), then applies the per-device request limit. Every
+    /// handler calls it before it reads the body (RVT2 B1).
+    ///
+    /// A presented token costs the address one request of its 30 a minute *before* the store
+    /// lookup, given back when the token authenticates: concurrent guesses cannot all run their
+    /// lookups before one is counted. When the address has none left, a token that fails gets
+    /// 429; one that authenticates still passes, so a team behind the address of a guesser keeps
+    /// working.
     pub async fn authenticate(&mut self) -> Result<Caller, ApiError> {
         let header = self.auth_header.clone();
         let limits = &self.app.config.limits;
+        let failed_key = RateKey::FailedAuth(bucket_addr(self.ip));
+        let charged = match header {
+            Some(_) => Some(
+                self.app
+                    .limiter
+                    .take(failed_key, limits.anonymous_rule(), self.now),
+            ),
+            None => None,
+        };
         match auth::authenticate(&*self.app.store, header.as_deref(), self.now).await {
             Ok(caller) => {
+                if charged == Some(Ok(())) {
+                    self.app.limiter.refund(failed_key, self.now);
+                }
                 if let Some(d) = caller.device() {
                     self.log.update(|f| f.member = Some(d.member_id));
                     // One token per device: keyed on the device, a rotation keeps the budget.
@@ -266,16 +297,15 @@ impl Cx {
                 Ok(caller)
             }
             Err(e) => {
-                // A failing token costs the address a request of its 30 a minute.
-                if header.is_some() && matches!(e, AuthError::Refused(Refusal::Unauthenticated)) {
-                    self.app
-                        .limiter
-                        .take(
-                            RateKey::FailedAuth(self.ip),
-                            limits.anonymous_rule(),
-                            self.now,
-                        )
-                        .map_err(|s| ApiError::rate_limited(s, None))?;
+                // The failing token keeps the request it was charged; with none left, 429.
+                if let Some(Err(s)) = charged {
+                    if matches!(e, AuthError::Refused(Refusal::Unauthenticated)) {
+                        return Err(ApiError::rate_limited(s, None));
+                    }
+                }
+                if charged == Some(Ok(())) && !matches!(e, AuthError::Refused(_)) {
+                    // A store failure is not the caller's guess.
+                    self.app.limiter.refund(failed_key, self.now);
                 }
                 Err(e.into())
             }
