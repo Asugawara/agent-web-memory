@@ -52,6 +52,15 @@ enum Command {
     Reindex(cli::reindex::Args),
     /// Calibrate matching thresholds
     Calibrate(matching::calibrate::Args),
+    /// Team sync: membership and sharing (not implemented in this build)
+    Team(cli::team::Args),
+    /// Sync with the team server (not implemented in this build)
+    Sync(cli::sync::Args),
+    /// Awm cloud account (not implemented in this build)
+    Cloud(cli::cloud::Args),
+    /// Run the team server (not implemented in this build)
+    #[cfg(feature = "serve")]
+    Serve(cli::serve::Args),
     /// Set up the plugin integration
     Setup(cli::setup::Args),
     /// Remove the plugin integration
@@ -140,6 +149,11 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Export(a) => cli::export::run(a),
         Command::Reindex(a) => cli::reindex::run(a),
         Command::Calibrate(a) => matching::calibrate::run_cli(a),
+        Command::Team(a) => cli::team::run(a),
+        Command::Sync(a) => cli::sync::run(a),
+        Command::Cloud(a) => cli::cloud::run(a),
+        #[cfg(feature = "serve")]
+        Command::Serve(a) => cli::serve::run(a),
         Command::Setup(a) => cli::setup::run(a),
         Command::Uninstall(a) => cli::uninstall::run(a),
         Command::Hook(h) => match h {

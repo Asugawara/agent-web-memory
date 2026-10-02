@@ -185,6 +185,60 @@ fn the_query_deny_keys_set_validate_and_clamp() {
 }
 
 #[test]
+fn team_defaults_parse_set_and_clamp() {
+    use awm::config::AutoApprove;
+    let c = Config::default();
+    assert!(c.team.auto_sync && c.team.show);
+    assert_eq!(c.team.sync_interval_s, 60);
+    assert!(c.team.mute.is_empty() && c.team.exclude_hosts.is_empty());
+    assert!(!c.team.share_all_projects && !c.team.share_stats);
+    assert_eq!(c.team.summary_chars, 1000);
+    assert_eq!(c.team.auto_approve, AutoApprove::Devices);
+    assert_eq!(c.team.push_delay_s, 0);
+    for (key, want) in [
+        ("team.auto_sync", "true"),
+        ("team.sync_interval_s", "60"),
+        ("team.show", "true"),
+        ("team.mute", ""),
+        ("team.share_all_projects", "false"),
+        ("team.exclude_hosts", ""),
+        ("team.summary_chars", "1000"),
+        ("team.share_stats", "false"),
+        ("team.auto_approve", "devices"),
+        ("team.push_delay_s", "0"),
+    ] {
+        assert_eq!(c.get(key).as_deref(), Some(want), "{key}");
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "[team]\nmute = [\"@a\", \"@b\"]\nauto_approve = \"all\"\nsummary_chars = 5000\n",
+    )
+    .unwrap();
+    let loaded = config::load(&path).unwrap();
+    assert_eq!(loaded.team.mute, ["@a", "@b"]);
+    assert_eq!(loaded.team.auto_approve, AutoApprove::All);
+    assert_eq!(loaded.team.summary_chars, 2000);
+    assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+    assert!(loaded.warnings[0].contains("team.summary_chars"));
+    assert!(loaded.team.auto_sync);
+
+    let mut c = Config::default();
+    assert!(c.set("team.summary_chars", "2001").is_err());
+    assert!(c.set("team.auto_approve", "everyone").is_err());
+    assert!(c.set("team.show", "maybe").is_err());
+    assert_eq!(c, Config::default());
+    c.set("team.mute", "@a, @b").unwrap();
+    c.set("team.auto_approve", "all").unwrap();
+    c.set("team.push_delay_s", "900").unwrap();
+    assert_eq!(c.get("team.mute").unwrap(), "@a,@b");
+    assert_eq!(c.get("team.auto_approve").unwrap(), "all");
+    assert_eq!(c.get("team.push_delay_s").unwrap(), "900");
+}
+
+#[test]
 fn quota_defaults_ranges_and_set_errors() {
     let c = Config::default();
     assert!(c.quota.capture);

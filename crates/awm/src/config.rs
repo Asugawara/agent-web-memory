@@ -114,6 +114,47 @@ impl Default for Quota {
     }
 }
 
+/// Team sync settings (`[team]`, plan-v3-team §4.7). Parsing and `config list` only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Team {
+    pub auto_sync: bool,
+    #[serde(deserialize_with = "de_u32")]
+    pub sync_interval_s: u32,
+    pub show: bool,
+    pub mute: Vec<String>,
+    pub share_all_projects: bool,
+    pub exclude_hosts: Vec<String>,
+    #[serde(deserialize_with = "de_u32")]
+    pub summary_chars: u32,
+    pub share_stats: bool,
+    pub auto_approve: AutoApprove,
+    #[serde(deserialize_with = "de_u32")]
+    pub push_delay_s: u32,
+}
+
+string_enum!(
+    /// `team.auto_approve`.
+    AutoApprove { Devices => "devices", All => "all" }
+);
+
+impl Default for Team {
+    fn default() -> Self {
+        Team {
+            auto_sync: true,
+            sync_interval_s: 60,
+            show: true,
+            mute: Vec::new(),
+            share_all_projects: false,
+            exclude_hosts: Vec::new(),
+            summary_chars: 1000,
+            share_stats: false,
+            auto_approve: AutoApprove::Devices,
+            push_delay_s: 0,
+        }
+    }
+}
+
 /// Prices for `awm stats --savings` (`[pricing]`); never used to bill anything.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -158,6 +199,7 @@ pub struct Config {
     pub review: Review,
     pub pricing: Pricing,
     pub quota: Quota,
+    pub team: Team,
     /// Out-of-range values that [`load`] clamped; never written by [`Config::save`].
     #[serde(skip)]
     pub warnings: Vec<String>,
@@ -220,6 +262,7 @@ impl Default for Config {
             review: Review::default(),
             pricing: Pricing::default(),
             quota: Quota::default(),
+            team: Team::default(),
             warnings: Vec::new(),
         }
     }
@@ -254,6 +297,9 @@ fn range(key: &str) -> Option<(u32, u32)> {
         "hooks.deadline_ms" => (100, 2000),
         "review.daily_limit" => (1, 50),
         "quota.retention_days" => (7, 3650),
+        "team.sync_interval_s" => (10, 86400),
+        "team.summary_chars" => (1, 2000),
+        "team.push_delay_s" => (0, 86400),
         _ => return None,
     })
 }
@@ -296,6 +342,13 @@ impl Config {
             &mut self.quota.retention_days,
             &mut w,
         );
+        clamp(
+            "team.sync_interval_s",
+            &mut self.team.sync_interval_s,
+            &mut w,
+        );
+        clamp("team.summary_chars", &mut self.team.summary_chars, &mut w);
+        clamp("team.push_delay_s", &mut self.team.push_delay_s, &mut w);
         self.warnings.extend(w);
     }
 
@@ -341,6 +394,16 @@ impl Config {
             "pricing.main_input_per_mtok" => self.pricing.main_input_per_mtok.to_string(),
             "quota.capture" => self.quota.capture.to_string(),
             "quota.retention_days" => self.quota.retention_days.to_string(),
+            "team.auto_sync" => self.team.auto_sync.to_string(),
+            "team.sync_interval_s" => self.team.sync_interval_s.to_string(),
+            "team.show" => self.team.show.to_string(),
+            "team.mute" => self.team.mute.join(","),
+            "team.share_all_projects" => self.team.share_all_projects.to_string(),
+            "team.exclude_hosts" => self.team.exclude_hosts.join(","),
+            "team.summary_chars" => self.team.summary_chars.to_string(),
+            "team.share_stats" => self.team.share_stats.to_string(),
+            "team.auto_approve" => self.team.auto_approve.as_str().to_string(),
+            "team.push_delay_s" => self.team.push_delay_s.to_string(),
             _ => return None,
         })
     }
@@ -442,6 +505,19 @@ impl Config {
             "pricing.main_input_per_mtok" => self.pricing.main_input_per_mtok = price(key, value)?,
             "quota.capture" => self.quota.capture = flag(key, value)?,
             "quota.retention_days" => self.quota.retention_days = number(key, value)?,
+            "team.auto_sync" => self.team.auto_sync = flag(key, value)?,
+            "team.sync_interval_s" => self.team.sync_interval_s = number(key, value)?,
+            "team.show" => self.team.show = flag(key, value)?,
+            "team.mute" => self.team.mute = list(value),
+            "team.share_all_projects" => self.team.share_all_projects = flag(key, value)?,
+            "team.exclude_hosts" => self.team.exclude_hosts = list(value),
+            "team.summary_chars" => self.team.summary_chars = number(key, value)?,
+            "team.share_stats" => self.team.share_stats = flag(key, value)?,
+            "team.auto_approve" => {
+                self.team.auto_approve =
+                    pick(key, value, AutoApprove::parse(value), "devices, all")?
+            }
+            "team.push_delay_s" => self.team.push_delay_s = number(key, value)?,
             _ => bail!("unknown configuration key: {key}"),
         }
         Ok(())

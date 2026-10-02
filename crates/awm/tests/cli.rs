@@ -1736,6 +1736,35 @@ fn doctor_reports_quota_samples() {
 }
 
 #[test]
+fn config_list_shows_team_keys() {
+    let env = Env::new();
+    let list = env.awm(&["config", "list"]).ok().to_string();
+    for line in [
+        "team.auto_sync = true\n",
+        "team.sync_interval_s = 60\n",
+        "team.show = true\n",
+        "team.mute = \n",
+        "team.share_all_projects = false\n",
+        "team.exclude_hosts = \n",
+        "team.summary_chars = 1000\n",
+        "team.share_stats = false\n",
+        "team.auto_approve = devices\n",
+        "team.push_delay_s = 0\n",
+    ] {
+        assert!(list.contains(line), "{line:?} missing from {list}");
+    }
+}
+
+#[test]
+fn team_sync_and_cloud_are_stubs_that_exit_2() {
+    let env = Env::new();
+    for sub in ["team", "sync", "cloud"] {
+        let out = env.awm(&[sub]);
+        assert_eq!(out.code, Some(2), "{sub}");
+    }
+}
+
+#[test]
 fn config_list_shows_quota_keys() {
     let env = Env::new();
     let list = env.awm(&["config", "list"]).ok().to_string();
