@@ -10,6 +10,7 @@ pub mod review;
 pub mod search;
 pub mod setup;
 pub mod stats;
+pub mod statusline;
 pub mod uninstall;
 pub mod where_;
 

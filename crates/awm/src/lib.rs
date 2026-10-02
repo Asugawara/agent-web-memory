@@ -17,6 +17,7 @@ pub mod matching;
 pub mod normalize;
 pub mod note;
 pub mod paths;
+pub mod quota;
 pub mod record;
 pub mod redact;
 pub mod render;
