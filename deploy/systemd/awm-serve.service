@@ -1,0 +1,77 @@
+# awm server on any Linux host (plan-v3-team §3.9.1 path C, docs/self-host.md).
+#
+#   useradd --system --home-dir /var/lib/awm --shell /usr/sbin/nologin awm
+#   install -m 0755 awm /usr/local/bin/awm
+#   install -d -m 0755 /etc/awm
+#   install -m 0600 /dev/null /etc/awm/serve.env     # then put AWM_DOMAIN=... and AWM_BACKUP=... in it
+#   install -m 0644 awm-serve.service /etc/systemd/system/
+#   install -d -m 0700 -o awm -g awm /var/lib/awm
+#   sudo -u awm awm serve init --data /var/lib/awm   # prints the one-time bootstrap token
+#   systemctl enable --now awm-serve
+#
+# The configuration is read from the environment file (AWM_DOMAIN, AWM_BACKUP, AWM_ACME_EMAIL,
+# AWM_BEHIND_TLS_PROXY, AWM_TRUSTED_PROXY, AWM_ACME_CHALLENGE, ...): `awm serve` reads these
+# variables itself, so an unset one is simply absent instead of an empty flag value. A
+# server.toml in the data directory works as well and is overridden by the variables.
+[Unit]
+Description=awm team sync server (agent-web-memory)
+Documentation=https://github.com/Asugawara/agent-web-memory/blob/main/docs/self-host.md
+After=network-online.target
+Wants=network-online.target
+# Never give up restarting after a crash loop, but slow it down.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=awm
+Group=awm
+EnvironmentFile=/etc/awm/serve.env
+ExecStart=/usr/local/bin/awm serve --data /var/lib/awm
+# SIGTERM is a clean shutdown (exit 0): the backup runner ships one last change set first.
+TimeoutStopSec=30
+Restart=always
+RestartSec=5
+
+# State: /var/lib/awm, mode 0700, owned by awm (the database, acme/ and server.toml inside it).
+StateDirectory=awm
+StateDirectoryMode=0700
+UMask=0077
+
+# The only privilege: binding ports 443 (and 80 for http-01) as a non-root user.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+
+# Filesystem: read-only everywhere except the state directory, no home directories, a private
+# /tmp (backups and restores stage files there) and no device nodes.
+# For a `file://` backup target on another disk add: ReadWritePaths=/mnt/awm-backup
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+
+# Kernel surfaces the server never touches.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+LockPersonality=yes
+# No JIT, no generated code: a write-and-execute mapping is refused.
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# IPv4 and IPv6 for clients and the CA and the backup bucket; unix sockets for the resolver.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

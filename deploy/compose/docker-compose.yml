@@ -1,0 +1,54 @@
+# awm server on any Docker host (plan-v3-team §3.9.1 path D, docs/self-host.md).
+#
+#   cp env.example .env       # then edit AWM_DOMAIN (or AWM_BEHIND_TLS_PROXY) and AWM_BACKUP
+#   docker compose up -d
+#   docker compose exec awm awm serve init
+#   docker compose exec awm awm serve check
+#
+# One container, no proxy: the binary terminates TLS itself and obtains its certificate from
+# Let's Encrypt. Inside the container it listens on 8443 (a non-root process binds no port
+# below 1024), published here as 443.
+services:
+  awm:
+    image: ${AWM_IMAGE:-ghcr.io/asugawara/agent-web-memory:latest}
+    # Build from a checkout instead (run from the repository root's deploy/compose directory):
+    #   docker compose up -d --build
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: awm
+    restart: unless-stopped
+    # AWM_DOMAIN, AWM_BACKUP, AWM_BEHIND_TLS_PROXY, AWM_TRUSTED_PROXY, AWM_ACME_*; see env.example.
+    # Without a .env file the server refuses to start (no domain and no TLS proxy: exit 2).
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # The HTTP-01 challenge listener; empty (ignored) unless .env sets it together with
+      # AWM_ACME_CHALLENGE=http-01. Publish 80:8080 below in that case.
+      AWM_ACME_HTTP_LISTEN: ${AWM_ACME_HTTP_LISTEN:-}
+    ports:
+      - "443:8443"
+      # Only with AWM_ACME_CHALLENGE=http-01 (when something in front of 443 cannot pass
+      # TLS-ALPN-01); with TLS-ALPN-01 keep port 80 closed. Uncomment:
+      # - "80:8080"
+    volumes:
+      # The database, the ACME account and certificate, server.toml. Owned by uid 65532.
+      - awm-data:/data
+    healthcheck:
+      # Same command as the image's HEALTHCHECK; it reads the container's environment.
+      test: ["CMD", "/usr/local/bin/awm", "serve", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+    # Hardening that costs nothing: the process binds only ports above 1024 and needs no
+    # capability. (No read_only root: backups and restores stage files under the temp directory.)
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 30s
+
+volumes:
+  awm-data:
