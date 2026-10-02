@@ -745,6 +745,89 @@ fn review_key_l_stores_label_2_and_the_loop_marker_that_value_counts() {
     assert_eq!(v["loop_labelled"], 1);
 }
 
+/// `awm search` (TM13b, TM30 F5): the relation, origin, member and handle of every row.
+fn seed_search(env: &Env) {
+    env.join_offline(false);
+    let conn = env.conn();
+    conn.execute(
+        "INSERT INTO team_member (member_id, handle, role, active, updated_at) \
+         VALUES (?1, 'alf', 'member', 1, 1)",
+        [ALF],
+    )
+    .unwrap();
+    insert(&conn, &fetch(1, "https://example.org/a", "s0", BASE));
+    let mut t = fetch(10, "https://example.org/b", TEAM_SESSION, BASE);
+    t.origin = "team";
+    t.member = Some(ALF);
+    insert(&conn, &t);
+    let mut o = fetch(11, "https://example.org/c", "team:own", BASE);
+    o.origin = "team";
+    o.member = Some(ME);
+    insert(&conn, &o);
+}
+
+#[test]
+fn search_json_has_origin_member_handle_and_relation() {
+    let env = Env::new();
+    seed_search(&env);
+    let a = env.json(&["search", "--url", "https://example.org/a", "--json"]);
+    assert_eq!(a[0]["origin"], "local");
+    assert_eq!(a[0]["relation"], "own");
+    assert!(a[0]["member"].is_null() && a[0]["handle"].is_null(), "{a}");
+    let b = env.json(&["search", "--url", "https://example.org/b", "--json"]);
+    assert_eq!(b[0]["origin"], "team");
+    assert_eq!(b[0]["member"], ALF);
+    assert_eq!(b[0]["handle"], "alf");
+    assert_eq!(b[0]["relation"], "teammate");
+    assert!(b[0].get("muted").is_none(), "{b}");
+    let c = env.json(&["search", "--url", "https://example.org/c", "--json"]);
+    assert_eq!(c[0]["origin"], "team");
+    assert_eq!(c[0]["member"], ME);
+    assert!(c[0]["handle"].is_null(), "{c}");
+    assert_eq!(c[0]["relation"], "own_device");
+}
+
+#[test]
+fn search_text_shows_the_relation_and_the_team_preamble_only_for_team_notes() {
+    let env = Env::new();
+    seed_search(&env);
+    let b = env.awm(&["search", "--url", "https://example.org/b"]);
+    let b = b.ok();
+    assert!(b.contains("teammate @alf, other repository"), "{b}");
+    assert!(b.contains("your agents and your teammates' agents"), "{b}");
+    let c = env.awm(&["search", "--url", "https://example.org/c"]);
+    let c = c.ok();
+    assert!(c.contains("your other machine"), "{c}");
+    let a = env.awm(&["search", "--url", "https://example.org/a"]);
+    let a = a.ok();
+    assert!(!a.contains("teammate"), "{a}");
+    assert!(a.contains("Earlier web research from this machine"), "{a}");
+}
+
+#[test]
+fn search_marks_a_muted_handle_and_ignores_team_show() {
+    let env = Env::new();
+    seed_search(&env);
+    std::fs::write(
+        env.awm_home().join("config.toml"),
+        "[team]\nshow = false\nmute = [\"@alf\"]\n",
+    )
+    .unwrap();
+    let b = env.awm(&["search", "--url", "https://example.org/b"]);
+    assert!(b.ok().contains("teammate @alf (muted), "), "{}", b.stdout);
+    let j = env.json(&["search", "--url", "https://example.org/b", "--json"]);
+    assert_eq!(j[0]["muted"], true);
+}
+
+#[test]
+fn review_shows_the_handle_of_a_teammate_item() {
+    let env = Env::new();
+    seed(&env);
+    injection(&env.conn(), 5, "s5", BASE + 500_000, 300, &[10]);
+    let out = env.awm_in(&["review", "--origin", "team"], "q\n");
+    assert!(out.ok().contains("from: teammate @alf"), "{}", out.stdout);
+}
+
 /// `--origin team` has no daily cap: 12 notes are all shown, while the default stays at 10.
 #[test]
 fn review_origin_team_shows_every_teammate_note_without_the_daily_cap() {
