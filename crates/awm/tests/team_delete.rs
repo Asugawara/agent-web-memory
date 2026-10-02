@@ -1323,6 +1323,58 @@ fn after_a_restore_any_own_device_deletes_again_what_was_deleted_after_the_backu
     assert!(!srv.holds_blob(&id1) && !srv.holds_blob(&id3));
 }
 
+// B16 (`apply::resend_ids`): the admin's re-send after a restore covers every tombstone it holds
+// except a teammate's record that it deleted on this machine only (`local_only.*`): that deletion
+// was never the admin's to make on the server.
+#[test]
+fn the_admins_re_send_after_a_restore_skips_a_teammates_record_it_deleted_only_here() {
+    let mut srv = Srv::start();
+    let a = create(&srv, "ann");
+    let b = member(&srv, &a, "bob");
+    share(&b);
+    let local = b.capture(
+        1,
+        "https://docs.example.org/local-only",
+        "Deleted on ann's machine.",
+    );
+    let remote = b.capture(
+        2,
+        "https://docs.example.org/remote",
+        "Deleted by bob everywhere.",
+    );
+    b.ok(&["sync"]);
+    a.ok(&["sync"]);
+    let (id_local, id_remote) = (b.sync_id(local), b.sync_id(remote));
+    assert!(a.row_of(&id_local).is_some() && a.row_of(&id_remote).is_some());
+    let snap = srv.snapshot();
+
+    // After the backup point: the admin drops a teammate's record on her machine only; Bob
+    // deletes his other record for everyone.
+    a.ok(&["forget", "https://docs.example.org/local-only", "--yes"]);
+    assert!(a.row_of(&id_local).is_none());
+    assert!(
+        srv.holds_blob(&id_local),
+        "a teammate's record is not deleted on the server"
+    );
+    b.ok(&["forget", "https://docs.example.org/remote", "--yes"]);
+    a.ok(&["sync"]);
+    assert!(a.row_of(&id_remote).is_none());
+
+    srv.restore(&snap);
+    assert!(srv.holds_blob(&id_local) && srv.holds_blob(&id_remote));
+    a.ok(&["sync"]);
+    assert!(
+        !srv.holds_blob(&id_remote),
+        "the admin sends the tombstone it holds for Bob's deletion"
+    );
+    assert!(
+        srv.holds_blob(&id_local),
+        "but not the one for the record it deleted only on its own machine"
+    );
+    assert!(!srv.deleted_ids().contains(&id_local));
+    assert!(a.row_of(&id_local).is_none(), "and it stays gone here");
+}
+
 // ---------------------------------------------------------------------------------------------
 // Your other machine
 

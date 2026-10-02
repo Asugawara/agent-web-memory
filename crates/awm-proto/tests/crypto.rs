@@ -7,8 +7,8 @@
 use std::path::PathBuf;
 
 use awm_proto::crypto::{
-    self, check_structure, envelope_len, open_record, record_key, seal_record, seal_record_with,
-    Error, RecordAd, Rng, ENVELOPE_VERSION, MAX_ENVELOPE, MAX_PLAINTEXT, OVERHEAD, PAD_BUCKET,
+    check_structure, envelope_len, open_record, record_key, seal_record, seal_record_with, Error,
+    RecordAd, Rng, ENVELOPE_VERSION, MAX_ENVELOPE, MAX_PLAINTEXT, OVERHEAD, PAD_BUCKET,
 };
 use awm_proto::keys::{EpochKey, KeyRing};
 use serde_json::{json, Value};
@@ -425,12 +425,4 @@ fn p1_envelope_shows_the_server_nothing_but_its_length() {
     // Two seals of the same plaintext differ (random nonce), so equal records do not show.
     let env2 = seal_record(ring.get(1).unwrap(), &ad, text).unwrap();
     assert_ne!(env, env2);
-}
-
-#[test]
-fn scaffold_seal_and_open_round_trip() {
-    let key = [5u8; 32];
-    let env = crypto::seal(&key, b"ad", b"hello").unwrap();
-    assert_eq!(crypto::open(&key, b"ad", &env).unwrap(), b"hello");
-    assert!(crypto::open(&key, b"other", &env).is_none());
 }

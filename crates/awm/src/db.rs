@@ -28,7 +28,9 @@ pub const MIGRATIONS: &[(u32, &str, &str)] = &[
 /// Who opens the database; decides creation and `busy_timeout`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
-    /// Sync hooks: never create, give up on a lock quickly.
+    /// Sync hooks: never create, give up on a lock quickly. Not read-only: the hooks' post-output
+    /// `injection` / `hook_run` writes and `sync::spawn::maybe_spawn`'s `last_spawn` write go
+    /// through it.
     HookRead,
     /// Async capture hook.
     Capture,

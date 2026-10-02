@@ -35,6 +35,9 @@ use awm_server::store::Store;
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
+mod support;
+use support::{bare, coded, Proxy};
+
 // ---------------------------------------------------------------------------------------------
 // The server
 
@@ -1662,7 +1665,7 @@ fn applying_10000_pulled_rows_loses_no_injection_row_of_200_concurrent_hook_runs
         report.apply_ms.iter().max(),
         during.load(Ordering::SeqCst),
     );
-    assert_eq!(lost, 0, "injection rows lost");
+    assert_eq!(lost, 0, "injection rows lost: {lost} of 200");
     assert!(
         during.load(Ordering::SeqCst) >= 100,
         "the hooks ran while the rows were applied"
@@ -1676,4 +1679,197 @@ fn applying_10000_pulled_rows_loses_no_injection_row_of_200_concurrent_hook_runs
         "at most 25 rows per transaction (RVT3 F18): {}",
         report.max_rows_per_txn
     );
+}
+
+// --- FT5c (VF-B B6, B16) ----------------------------------------------------------------------
+
+/// Points a node at a [`Proxy`].
+fn via(proxy: &Proxy, n: &Node) {
+    let mut team = n.ident().team;
+    team.server_url = format!("http://{}", proxy.addr);
+    team.save(n.path()).unwrap();
+}
+
+// B6 (sync-v1 §2.3): a 426 on the push itself, from a server whose `min_client` the status does not
+// show (a floor raised after the cached info, or one behind a proxy), stops the pushes without
+// failing the run: the outbox stays, the pull went on, and the next run pushes.
+#[test]
+fn a_426_on_the_push_stops_pushes_keeps_the_outbox_and_the_pull_going() {
+    let (srv, a, b) = org_of_two();
+    let proxy = Proxy::start(srv.addr);
+    b.capture_fetch(1, URL_A, "p", "bob's summary of the guide");
+    b.sync();
+    a.capture_fetch(
+        1,
+        "https://docs.example.org/guide/second",
+        "p",
+        "ann's summary",
+    );
+    via(&proxy, &a);
+    proxy.queue(Some(coded("426 Upgrade Required", "client_too_old")));
+    let r = a.sync();
+    assert_eq!(r.pushed, 0, "{r:?}");
+    assert!(
+        r.push_blocked.as_deref().is_some_and(|w| w.contains("426")),
+        "{r:?}"
+    );
+    assert_eq!(a.team_rows(), 1, "bob's record was pulled in the same run");
+    assert_eq!(
+        a.count("SELECT COUNT(*) FROM sync_outbox"),
+        1,
+        "outbox intact"
+    );
+    assert_eq!(
+        a.count("SELECT COUNT(*) FROM event WHERE origin = 'local' AND pushed_at IS NOT NULL"),
+        0
+    );
+    assert_eq!(a.state(state::LAST_ERROR), None, "the run did not fail");
+    assert_eq!(a.state(state::BACKOFF_LEVEL), None);
+    // The server accepts again: the same item goes out and nothing is lost.
+    let r = a.sync();
+    assert_eq!(r.pushed, 1, "{r:?}");
+    assert_eq!(r.push_blocked, None);
+    assert_eq!(a.count("SELECT COUNT(*) FROM sync_outbox"), 0);
+}
+
+// A 426 with no awm error body (a proxy or WAF answering for the server) is no `client_too_old`:
+// the run fails and the outbox stays, as for any other unknown failure.
+#[test]
+fn a_426_without_an_awm_body_fails_the_run_and_keeps_the_outbox() {
+    let (srv, a, _b) = org_of_two();
+    let proxy = Proxy::start(srv.addr);
+    a.capture_fetch(1, URL_A, "p", "ann's summary");
+    via(&proxy, &a);
+    proxy.queue(Some(bare("426 Upgrade Required")));
+    assert!(a.try_sync(&a.opts()).is_err());
+    assert_eq!(a.count("SELECT COUNT(*) FROM sync_outbox"), 1);
+    assert!(a.state(state::LAST_ERROR).is_some());
+}
+
+/// The stored roster record of `node` that is the revoke entry for `member`.
+fn revoke_record_of(node: &Node, member: Id) -> (String, String, i64) {
+    let ring = node.ident().ring().unwrap();
+    for b in roster::blobs(&node.conn()).unwrap() {
+        let ad = RecordAd {
+            org: ring.org(),
+            member: b.member,
+            device: b.device,
+            tag: ROSTER_TAG.to_string(),
+            idx: b.idx,
+            record_id: b.record_id,
+            epoch: b.epoch,
+        };
+        let Ok(plain) = open_record(&ring, &ad, &b.blob) else {
+            continue;
+        };
+        let p: RosterPlaintext = serde_json::from_slice(&plain).unwrap();
+        if matches!(p.entry, RosterEntry::Revoke { member_id, .. } if member_id == *member.as_uuid())
+        {
+            return (
+                Id::from(b.member).to_string(),
+                Id::from(b.device).to_string(),
+                b.idx as i64,
+            );
+        }
+    }
+    panic!("no revoke entry for {member}");
+}
+
+// B16 (`roster.rs` `MIN(active, ..)` / `MAX(revoked, ..)`): a removal, once applied, never goes
+// back, even when a later view of the roster (a stored record lost, a restored backup) says the
+// member or device is active.
+#[test]
+fn a_member_or_device_marked_removed_stays_removed_when_a_later_roster_view_lacks_the_revocation() {
+    let (_srv, a, b) = org_of_two();
+    let bm = b.ident().team.member_id;
+    let bd = b.ident().team.device_id;
+    remove_member(&a, bm);
+    a.sync();
+    assert_eq!(
+        a.count("SELECT COUNT(*) FROM team_member WHERE handle = 'bob' AND active = 0"),
+        1
+    );
+    let revoked_devices =
+        format!("SELECT COUNT(*) FROM team_device WHERE device_id = '{bd}' AND revoked = 1");
+    assert_eq!(a.count(&revoked_devices), 1);
+
+    // The revoke entry vanishes from the stored records: the roster now shows bob as active.
+    let (m, d, idx) = revoke_record_of(&a, bm);
+    a.conn()
+        .execute(
+            "DELETE FROM roster_record WHERE member_id = ?1 AND device_id = ?2 AND idx = ?3",
+            rusqlite::params![m, d, idx],
+        )
+        .unwrap();
+    let ident = a.ident();
+    let ring = ident.ring().unwrap();
+    let (view, _) = roster::verify_and_store(&a.conn(), &ring, now_ms()).unwrap();
+    assert!(
+        !view.member(*bm.as_uuid()).unwrap().revoked,
+        "the view without the entry shows bob active"
+    );
+    assert_eq!(
+        a.count("SELECT COUNT(*) FROM team_member WHERE handle = 'bob' AND active = 0"),
+        1,
+        "MIN(active): a removal is not undone"
+    );
+    assert_eq!(a.count(&revoked_devices), 1, "MAX(revoked): nor a device's");
+}
+
+// B16 (FT3a, the `>=` rule): a revocation dated exactly at the current epoch entry's `created_at`,
+// of a device the entry does not list, rotates; the next run is quiet.
+#[test]
+fn a_revocation_dated_exactly_at_the_epoch_entry_rotates_once() {
+    let (srv, a, b) = org_of_two();
+    let c = add_member(&srv, &a, "carol", "member");
+    c.sync();
+    remove_member_at(&a, c.ident().team.member_id, unix_secs() - 10);
+    assert!(sync_withheld(&srv, &a).rotated);
+    let at = epoch_created_at(&a, 1).expect("the epoch-1 entry");
+    b.sync();
+
+    // Dave is approved after the epoch-1 entry, so it does not list him.
+    let d = add_member(&srv, &a, "dave", "member");
+    d.sync();
+    remove_member_at(&a, d.ident().team.member_id, at);
+    let r = sync_withheld(&srv, &a);
+    assert!(r.rotated, "revoked_at == created_at counts: {r:?}");
+    assert_eq!(a.ident().ring().unwrap().current_epoch(), 2);
+    assert_eq!(
+        epoch_created_at(&a, 2),
+        Some(at.max(unix_secs()).max(at + 1))
+    );
+    assert!(!sync_withheld(&srv, &a).rotated, "the next run is quiet");
+    assert_eq!(a.ident().ring().unwrap().current_epoch(), 2);
+}
+
+// B16 (`track_share_all`): the first run with `team.share_all_projects` on records the time, later
+// runs keep it, a run with the switch off forgets it, and turning it on again starts a new window.
+#[test]
+fn share_all_since_is_written_by_the_first_run_with_the_switch_on_and_removed_when_it_is_off() {
+    let (_srv, mut a, _b) = org_of_two();
+    assert_eq!(a.state(state::SHARE_ALL_SINCE), None, "off by default");
+    a.cfg.team.share_all_projects = true;
+    let before = now_ms();
+    a.sync();
+    let first: i64 = a.state(state::SHARE_ALL_SINCE).unwrap().parse().unwrap();
+    assert!(
+        first >= before - 1_000 && first <= now_ms() + 1_000,
+        "{first}"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    a.sync();
+    assert_eq!(
+        a.state(state::SHARE_ALL_SINCE),
+        Some(first.to_string()),
+        "a later run keeps the window's start"
+    );
+    a.cfg.team.share_all_projects = false;
+    a.sync();
+    assert_eq!(a.state(state::SHARE_ALL_SINCE), None);
+    a.cfg.team.share_all_projects = true;
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    a.sync();
+    let second: i64 = a.state(state::SHARE_ALL_SINCE).unwrap().parse().unwrap();
+    assert!(second > first, "a new window starts: {first} < {second}");
 }

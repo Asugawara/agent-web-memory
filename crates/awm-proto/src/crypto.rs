@@ -357,15 +357,3 @@ pub fn open_record(ring: &KeyRing, ad: &RecordAd, envelope: &[u8]) -> Result<Vec
     let ad_bytes = ad.to_bytes()?;
     open_with_key(&record_key(key), &ad_bytes, envelope)
 }
-
-/// Seals `plaintext` under a raw 32-byte record key with raw associated data.
-///
-/// Kept from the TM1 scaffold; new code calls [`seal_record`].
-pub fn seal(key: &[u8; 32], ad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Error> {
-    seal_with(&mut OsRng, &Secret32::from_bytes(*key), ad, plaintext)
-}
-
-/// Opens an envelope made by [`seal`]; `None` when authentication or parsing fails.
-pub fn open(key: &[u8; 32], ad: &[u8], envelope: &[u8]) -> Option<Vec<u8>> {
-    open_with_key(&Secret32::from_bytes(*key), ad, envelope).ok()
-}

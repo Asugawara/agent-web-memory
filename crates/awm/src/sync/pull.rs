@@ -466,7 +466,8 @@ fn prepare_plain(
             }
             Err(_) => Ok(Action::Advance),
         },
-        // `flag` records of teammates are read by `awm team status`; the engine only advances.
+        // Pulled `flag` records are stored for the admin's audit only; nothing reads them in v1.
+        // The engine only advances.
         _ => Ok(Action::Advance),
     }
 }

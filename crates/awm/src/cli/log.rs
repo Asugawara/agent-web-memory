@@ -35,7 +35,8 @@ pub struct Args {
     /// Only your own records or only teammates' records
     #[arg(long, value_enum)]
     pub origin: Option<Origin>,
-    /// Only your own records that are on the team server (they have a record id)
+    /// Only your own records that reached the team server (queued ones are not listed; without
+    /// this flag they show a `queued` marker)
     #[arg(long)]
     pub shared: bool,
 }
@@ -52,10 +53,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let origin = args.origin.map(Origin::as_str);
     let mut st = conn.prepare(
         "SELECT e.created_at, e.tool, e.agent_id, e.query, e.url, e.status, e.agent, e.origin, \
-                m.handle \
+                m.handle, \
+                e.origin = 'local' AND e.sync_id IS NOT NULL AND e.pushed_at IS NULL \
          FROM event e LEFT JOIN team_member m ON m.member_id = e.member \
          WHERE (?2 IS NULL OR e.origin = ?2) \
-           AND (?3 = 0 OR (e.origin = 'local' AND e.sync_id IS NOT NULL)) \
+           AND (?3 = 0 OR (e.origin = 'local' AND e.pushed_at IS NOT NULL)) \
          ORDER BY e.created_at DESC, e.id DESC LIMIT ?1",
     )?;
     let rows = st.query_map(params![args.limit, origin, args.shared], |r| {
@@ -69,16 +71,20 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             r.get::<_, String>(6)?,
             r.get::<_, String>(7)?,
             r.get::<_, Option<String>>(8)?,
+            r.get::<_, bool>(9)?,
         ))
     })?;
     for row in rows {
-        let (ts, tool, agent, query, url, status, coding_agent, row_origin, handle) = row?;
+        let (ts, tool, agent, query, url, status, coding_agent, row_origin, handle, queued) = row?;
         let agent_kind = if agent.is_some() { "subagent" } else { "main" };
         let target = url.or(query).unwrap_or_default();
         if args.json {
             let mut line = json!({"ts": ts, "tool": tool, "agent": agent_kind, "coding_agent": coding_agent,
                        "target": target, "status": status});
             line["origin"] = Value::from(row_origin.as_str());
+            if queued {
+                line["queued"] = Value::from(true);
+            }
             if row_origin == "team" {
                 line["handle"] = handle.map_or(Value::Null, Value::from);
             }
@@ -92,6 +98,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             };
             if row_origin == "team" {
                 tag.push_str(&format!("@{} ", handle.as_deref().unwrap_or("?")));
+            }
+            if queued {
+                tag.push_str("[queued] ");
             }
             println!(
                 "{}  {tool:<9}  {agent_kind:<8}  {status:<11}  {tag}{}",
