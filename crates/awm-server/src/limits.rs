@@ -94,12 +94,6 @@ impl Limits {
     pub(crate) fn join_rule(&self) -> Rule {
         Rule::per_hour(self.joins_per_hour)
     }
-
-    /// Unused since `POST /v1/delete` goes through `delete::run`, whose bulk limit is durable.
-    #[allow(dead_code)]
-    pub(crate) fn bulk_delete_rule(&self) -> Rule {
-        Rule::per_hour(self.bulk_deletes_per_hour)
-    }
 }
 
 /// What a bucket is keyed on.
@@ -113,8 +107,6 @@ pub enum RateKey {
     Join(IpAddr),
     /// An authenticated device (one token per device, so rotating the token does not reset it).
     Device(Id),
-    /// Bulk deletes, by device.
-    BulkDelete(Id),
 }
 
 /// A token bucket: `capacity` tokens, refilled at `per_s` tokens per second.
@@ -250,7 +242,7 @@ mod tests {
     fn an_hourly_rule_waits_up_to_an_hour() {
         let l = RateLimiter::new();
         let rule = Rule::per_hour(1);
-        let key = RateKey::BulkDelete(Id::new_v4());
+        let key = RateKey::Device(Id::new_v4());
         assert_eq!(l.take(key, rule, 0), Ok(()));
         let wait = l.take(key, rule, 10).unwrap_err();
         assert!((3_590..=3_591).contains(&wait), "{wait}");

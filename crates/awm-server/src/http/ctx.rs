@@ -108,11 +108,12 @@ impl Cx {
             .get::<ConnectInfo<SocketAddr>>()
             .map(|c| c.0.ip())
             .unwrap_or(IpAddr::from([0, 0, 0, 0]));
-        let ip = super::net::client_ip(
-            peer,
-            header_str(&parts.headers, "x-forwarded-for"),
-            &app.config.trusted_proxies,
-        );
+        let forwarded = header_str(&parts.headers, "x-forwarded-for");
+        let ip = if app.config.forwarded_last_entry {
+            super::net::last_forwarded_entry(peer, forwarded)
+        } else {
+            super::net::client_ip(peer, forwarded, &app.config.trusted_proxies)
+        };
         log.update(|f| f.ip = Some(ip));
 
         let limits = &app.config.limits;
