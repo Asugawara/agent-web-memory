@@ -87,7 +87,13 @@ pub fn verify_and_store(
     now_ms: i64,
 ) -> Result<(Roster, usize)> {
     let blobs = blobs(conn)?;
-    let report = Roster::verify(ring, &blobs, &BTreeSet::new());
+    // Members the user confirmed with `awm team members --trust-admin` (TM12); `verify` applies
+    // them only while no verified admin is left (RVT1 M5).
+    let extra: BTreeSet<_> = crate::sync::state::trusted_admins(conn)?
+        .iter()
+        .filter_map(|m| Id::parse(m).ok().map(|id| *id.as_uuid()))
+        .collect();
+    let report = Roster::verify(ring, &blobs, &extra);
     for (id, m) in report.roster.members() {
         conn.execute(
             "INSERT INTO team_member (member_id, handle, role, active, updated_at) \
