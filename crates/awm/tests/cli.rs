@@ -1758,10 +1758,24 @@ fn config_list_shows_team_keys() {
 #[test]
 fn team_sync_and_cloud_are_stubs_that_exit_2() {
     let env = Env::new();
-    for sub in ["team", "sync", "cloud"] {
+    // With the `sync` feature `awm sync` is a real command (see the test below).
+    #[cfg(not(feature = "sync"))]
+    let subs = ["team", "sync", "cloud"];
+    #[cfg(feature = "sync")]
+    let subs = ["team", "cloud"];
+    for sub in subs {
         let out = env.awm(&[sub]);
         assert_eq!(out.code, Some(2), "{sub}");
     }
+}
+
+#[cfg(feature = "sync")]
+#[test]
+fn sync_outside_a_team_exits_1() {
+    let env = Env::new();
+    let out = env.awm(&["sync"]);
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert!(out.stderr.contains("not in a team"), "{}", out.stderr);
 }
 
 #[test]

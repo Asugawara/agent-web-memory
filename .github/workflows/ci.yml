@@ -63,6 +63,12 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends jq sqlite3 curl openssl postgresql-client shellcheck strace
+          # cargo-deny: the pinned release binary (a few seconds) rather than `cargo install`, which
+          # compiles for minutes and is not covered by the cargo cache (it caches no ~/.cargo/bin).
+          # scripts/check.sh fails under CI when cargo-deny is absent (VF-A A2).
+          curl -fsSL https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz |
+            sudo tar -xz --strip-components=1 -C /usr/local/bin --wildcards '*/cargo-deny'
+          cargo-deny --version
 
       - name: Rust toolchain (rust-toolchain.toml)
         run: |
@@ -160,6 +166,15 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+
+      - name: Tools
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-aarch64-apple-darwin.tar.gz |
+            tar -xz --strip-components=1 -C "$HOME/.local/bin" --include '*/cargo-deny'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/cargo-deny" --version
 
       - name: Rust toolchain (rust-toolchain.toml)
         run: |
