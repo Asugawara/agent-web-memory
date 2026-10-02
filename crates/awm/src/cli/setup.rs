@@ -296,7 +296,7 @@ fn statusline_line(exe: &str) -> String {
 
 /// True for `awm statusline` and `<path>/awm statusline` (path as [`exe_for_shell`] writes it),
 /// optionally followed by ` --quiet`.
-fn is_our_statusline(command: &str) -> bool {
+pub(crate) fn is_our_statusline(command: &str) -> bool {
     let c = command.trim();
     let c = c.strip_suffix(" --quiet").unwrap_or(c);
     let Some(exe) = c.strip_suffix(" statusline") else {

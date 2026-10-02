@@ -75,12 +75,35 @@ fn ends_with_newline_or_empty(path: &Path) -> bool {
     f.seek(SeekFrom::Start(len - 1)).is_err() || f.read_exact(&mut b).is_err() || b[0] == b'\n'
 }
 
+/// Creates `dir` itself (0700), never its parents: a data dir that was deleted meanwhile
+/// (`purge --all`, `uninstall`) must not come back through a status line run.
+fn ensure_quota_dir(dir: &Path) -> io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    // The umask can only remove bits; set the mode explicitly so it is exactly 0700.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 /// Appends `s` to its month file unless the newest line of the same session
-/// has equal `h5`, `d7` and `cost`. `dir` is created (0700) when missing; the
+/// has equal `h5`, `d7` and `cost`. `dir` is created (0700, not its parents) when missing; the
 /// file is created 0600 and written with one `write` on an `O_APPEND` handle (led by a
 /// `\n` when the file ends in an unterminated fragment).
 pub fn record(dir: &Path, s: &Sample) -> io::Result<Recorded> {
-    crate::paths::ensure_private_dir(dir).map_err(|e| io::Error::other(e.to_string()))?;
+    ensure_quota_dir(dir)?;
     let path = month_file(dir, s.t);
     if let Some(prev) = last_of_session(&path, &s.sid) {
         if prev.h5 == s.h5 && prev.d7 == s.d7 && prev.cost == s.cost {

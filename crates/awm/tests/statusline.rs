@@ -254,6 +254,34 @@ fn deadline_writes_nothing() {
 }
 
 #[test]
+fn a_data_dir_deleted_meanwhile_is_not_re_created() {
+    let env = Env::new();
+    env.run(&["--help"], b"", &[]);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_awm"));
+    cmd.args(["statusline", "--quiet"])
+        .env("AWM_HOME", env.home())
+        .env("AWM_TEST_NOW_MS", NOW)
+        .env("AWM_TEST_DELAY_MS", "70")
+        .env_remove("AWM_DEBUG")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    let _ = child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(fixture("integer.json").as_bytes());
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::remove_dir_all(env.home()).unwrap();
+    let o = child.wait_with_output().unwrap();
+    assert_eq!(o.status.code(), Some(0));
+    assert!(o.stdout.is_empty(), "{:?}", o.stdout);
+    assert!(o.stderr.is_empty(), "{:?}", o.stderr);
+    assert!(!env.home().exists());
+}
+
+#[test]
 fn skips_an_unchanged_sample_of_the_same_session() {
     let env = Env::new();
     let full = fixture("full.json");
