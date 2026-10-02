@@ -233,7 +233,8 @@ fn team_defaults_parse_set_and_clamp() {
     c.set("team.mute", "@a, @b").unwrap();
     c.set("team.auto_approve", "all").unwrap();
     c.set("team.push_delay_s", "900").unwrap();
-    assert_eq!(c.get("team.mute").unwrap(), "@a,@b");
+    // TM14: `set` stores bare handles (an `@` is accepted and dropped).
+    assert_eq!(c.get("team.mute").unwrap(), "a,b");
     assert_eq!(c.get("team.auto_approve").unwrap(), "all");
     assert_eq!(c.get("team.push_delay_s").unwrap(), "900");
 }

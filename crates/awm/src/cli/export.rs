@@ -12,6 +12,9 @@ pub struct Args {
     /// Write to FILE instead of standard output
     #[arg(long, value_name = "FILE")]
     pub out: Option<PathBuf>,
+    /// Also export the records of teammates (they are teammates' data; off by default)
+    #[arg(long)]
+    pub include_team: bool,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -29,21 +32,31 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 .open(path)
                 .with_context(|| format!("cannot write {}", path.display()))?;
             let mut w = std::io::BufWriter::new(file);
-            let n = write_all(&conn, &mut w)?;
+            let n = write_all_with(&conn, &mut w, args.include_team)?;
             w.flush()?;
             println!("Exported {n} records to {}.", path.display());
         }
         None => {
             let mut w = std::io::BufWriter::new(std::io::stdout().lock());
-            write_all(&conn, &mut w)?;
+            write_all_with(&conn, &mut w, args.include_team)?;
             w.flush()?;
         }
     }
     Ok(())
 }
 
-/// Header line, then one line per event. Returns the number of events.
+/// Header line, then one line per own event. Returns the number of events.
 pub fn write_all(conn: &Connection, w: &mut dyn Write) -> anyhow::Result<usize> {
+    write_all_with(conn, w, false)
+}
+
+/// Header line, then one line per event; teammates' rows (`origin = 'team'`) only when
+/// `include_team`. Returns the number of events.
+pub fn write_all_with(
+    conn: &Connection,
+    w: &mut dyn Write,
+    include_team: bool,
+) -> anyhow::Result<usize> {
     let header = json!({
         "format": "awm-export/0",
         "version": env!("CARGO_PKG_VERSION"),
@@ -56,10 +69,10 @@ pub fn write_all(conn: &Connection, w: &mut dyn Write) -> anyhow::Result<usize> 
     let mut st = conn.prepare(
         "SELECT id, tool_use_id, tool, session_id, agent_id, agent_type, cwd_hash, created_at, \
                 query, url, url_norm, fetch_prompt, http_code, bytes, duration_ms, status, \
-                summary, source, quarantined, quarantine_reason, agent \
-         FROM event ORDER BY id",
+                summary, source, quarantined, quarantine_reason, agent, origin, shareable \
+         FROM event WHERE (?1 = 1 OR origin = 'local') ORDER BY id",
     )?;
-    let mut rows = st.query([])?;
+    let mut rows = st.query([include_team])?;
     let mut n = 0;
     while let Some(r) = rows.next()? {
         let id: i64 = r.get(0)?;
@@ -93,6 +106,8 @@ pub fn write_all(conn: &Connection, w: &mut dyn Write) -> anyhow::Result<usize> 
             "summary": r.get::<_, Option<String>>(16)?,
             "source": r.get::<_, String>(17)?,
             "agent": r.get::<_, String>(20)?,
+            "origin": r.get::<_, String>(21)?,
+            "shareable": r.get::<_, String>(22)?,
             "quarantined": r.get::<_, i64>(18)? != 0,
             "quarantine_reason": r.get::<_, Option<String>>(19)?,
             "results": res,

@@ -68,6 +68,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 }));
             }
         }
+        // The daily `stats` record (TM14, `team.share_stats` only): best effort, queued before the
+        // run so that this run sends it.
+        if !args.dry_run {
+            let _ = super::stats::queue_daily_record(&env);
+        }
         sync::run(&env, &opts)
     })();
     match result {

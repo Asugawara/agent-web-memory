@@ -45,8 +45,79 @@ fn meta_f64(conn: &Connection, key: &str) -> Result<Option<f64>> {
     Ok(meta_get(conn, key)?.and_then(|v| v.parse().ok()))
 }
 
+/// Records of this machine: teammates' rows (`origin = 'team'`) change neither the count nor the
+/// sample (RVT0 M15).
 fn record_count(conn: &Connection) -> Result<i64> {
-    Ok(conn.query_row("SELECT COUNT(*) FROM event", [], |r| r.get(0))?)
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM event WHERE origin = 'local'",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+/// A copy of the database without teammates' rows, for the scores: BM25 weighs a term by how
+/// rare it is among all indexed documents, so teammates' text would move the cutoff even if
+/// their rows could never be a hit. Deleted with its journal files when dropped.
+struct LocalCopy {
+    path: std::path::PathBuf,
+    conn: Connection,
+}
+
+impl LocalCopy {
+    /// `None` when the database holds no teammate row (the scores then use the database itself).
+    fn of(conn: &Connection) -> Result<Option<LocalCopy>> {
+        let team: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM event WHERE origin = 'team' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if team.is_none() {
+            return Ok(None);
+        }
+        let Some(db_path) = conn.path().map(std::path::PathBuf::from) else {
+            return Ok(None);
+        };
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let mut name = db_path.clone().into_os_string();
+        name.push(format!(".calibrate-{}-{nanos}", std::process::id()));
+        let path = std::path::PathBuf::from(name);
+        // An empty private file: `VACUUM INTO` accepts it, and the copy is never world-readable.
+        let mut open = std::fs::OpenOptions::new();
+        open.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open.mode(0o600);
+        }
+        open.open(&path)?;
+        let made = (|| -> Result<Connection> {
+            conn.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])?;
+            let copy = Connection::open(&path)?;
+            copy.execute("DELETE FROM event WHERE origin = 'team'", [])?;
+            Ok(copy)
+        })();
+        match made {
+            Ok(copy) => Ok(Some(LocalCopy { path, conn: copy })),
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                Err(e)
+            }
+        }
+    }
+}
+
+impl Drop for LocalCopy {
+    fn drop(&mut self) {
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let mut name = self.path.clone().into_os_string();
+            name.push(suffix);
+            let _ = std::fs::remove_file(name);
+        }
+    }
 }
 
 fn median(sorted: &[f64]) -> f64 {
@@ -76,13 +147,21 @@ pub fn run(conn: &Connection) -> Result<Calibration> {
     let recent: Vec<(String, String, i64)> = {
         let mut st = conn.prepare(
             "SELECT tool_use_id, COALESCE(query, fetch_prompt), created_at FROM event \
-             WHERE COALESCE(query, fetch_prompt, '') != '' \
+             WHERE COALESCE(query, fetch_prompt, '') != '' AND origin = 'local' \
              ORDER BY created_at DESC, id DESC LIMIT ?1",
         )?;
         let rows = st.query_map([SAMPLE], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         rows.collect::<rusqlite::Result<_>>()?
     };
     let n = recent.len();
+    let copy = if n < MIN_RECORDS {
+        None
+    } else {
+        // A copy that cannot be made (a hook inside a transaction, a full disk) must not fail the
+        // calibration: the scores then come from the live database.
+        LocalCopy::of(conn).unwrap_or(None)
+    };
+    let corpus = copy.as_ref().map_or(conn, |c| &c.conn);
     let cutoff_query = if n < MIN_RECORDS {
         DEFAULT_CUTOFF_QUERY
     } else {
@@ -94,7 +173,7 @@ pub fn run(conn: &Connection) -> Result<Calibration> {
                 limit: 1,
                 ..MatchOpts::default()
             };
-            if let Some(hit) = query_channel(conn, text, f64::NEG_INFINITY, &opts)?.first() {
+            if let Some(hit) = query_channel(corpus, text, f64::NEG_INFINITY, &opts)?.first() {
                 scores.push(hit.score);
             }
         }

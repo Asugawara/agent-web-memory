@@ -8,6 +8,13 @@ use std::path::Path;
 
 use crate::forget::{self, Io, Outcome};
 
+/// Printed first when this machine is in a team (plan-v3-team §4.9).
+const TEAM_OFFER: &str =
+    "This machine is in a team. Run awm team leave first (awm team leave --delete \
+also deletes your shared records from the server); deleting this directory alone leaves your \
+records and this device's token on the server.";
+const TEAM_QUESTION: &str = "Continue and delete the data directory without leaving the team?";
+
 #[derive(clap::Args, Debug, Default)]
 pub struct Args {
     /// Do not ask for confirmation
@@ -28,6 +35,22 @@ pub fn run_with(
     exe: Option<&Path>,
     home: Option<&Path>,
 ) -> anyhow::Result<Outcome> {
+    if io.data_dir.join(super::where_::TEAM_TOML).exists() {
+        writeln!(io.out, "{TEAM_OFFER}")?;
+        if !args.yes && io.terminal {
+            write!(io.out, "{TEAM_QUESTION} [y/N] ")?;
+            io.out.flush()?;
+            let mut answer = String::new();
+            io.input.read_line(&mut answer)?;
+            if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                writeln!(
+                    io.out,
+                    "Nothing changed. Run awm team leave (or awm team leave --delete), then awm uninstall."
+                )?;
+                return Ok(Outcome::Declined);
+            }
+        }
+    }
     let (outcome, _) = forget::purge_all(io, args.yes, "awm uninstall")?;
     if matches!(outcome, Outcome::Done | Outcome::Nothing) {
         writeln!(io.out, "To finish:")?;

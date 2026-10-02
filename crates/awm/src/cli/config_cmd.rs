@@ -85,6 +85,12 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             cfg.warnings.clear();
             cfg.save(&path)?;
             println!("{key} = {}", cfg.get(&key).unwrap_or_default());
+            if key == "team.auto_approve" && value == "all" {
+                println!(
+                    "Note: with all, a member who joins is approved without anyone comparing the \
+                     6-digit code."
+                );
+            }
             if key == "channels.prompt_bm25" && value != "off" {
                 println!(
                     "Note: matching prompts keep their first 200 characters in the local log."

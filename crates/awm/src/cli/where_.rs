@@ -4,6 +4,11 @@ use std::path::Path;
 
 use crate::paths;
 
+/// The team files in the data directory (also `sync::state::TEAM_TOML` and `TEAM_KEY`, which
+/// exist only with the `sync` feature).
+pub const TEAM_TOML: &str = "team.toml";
+pub const TEAM_KEY: &str = "team.key";
+
 #[derive(clap::Args, Debug, Default)]
 pub struct Args {}
 
@@ -29,5 +34,16 @@ pub fn run(_args: Args) -> anyhow::Result<()> {
         size_of(&paths::config_path()?)
     );
     println!("spool:    {} ({spooled} files)", spool.display());
+    // Only a machine in a team has these (plan-v3-team §4.7); the output is unchanged without one.
+    let team_toml = dir.join(TEAM_TOML);
+    if team_toml.exists() {
+        let team_key = dir.join(TEAM_KEY);
+        println!(
+            "team:     {} ({})",
+            team_toml.display(),
+            size_of(&team_toml)
+        );
+        println!("team key: {} ({})", team_key.display(), size_of(&team_key));
+    }
     Ok(())
 }

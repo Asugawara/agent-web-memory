@@ -130,6 +130,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     latency_summary(&conn)?;
     consent(&conn)?;
     quota_samples(&dir);
+    // Only a machine in a team has this section; without `team.toml` the output is unchanged.
+    if dir.join(super::where_::TEAM_TOML).exists() {
+        failed |= team_section(&dir);
+    }
 
     let since = match &args.since {
         Some(d) => Some(super::parse_date(d)?),
@@ -231,6 +235,168 @@ fn quota_samples(dir: &std::path::Path) {
     }
 }
 
+/// The team lines of `awm doctor` (plan-v3-team §4.9). They read `awm team status` rather than
+/// repeating it; `true` when one is a `[fail]`. Nothing printed here holds a token, a key or
+/// record text: the status carries none.
+#[cfg(not(feature = "sync"))]
+fn team_section(_dir: &std::path::Path) -> bool {
+    println!("[warn] team.toml exists, but this build has no team support: nothing is synced");
+    false
+}
+
+#[cfg(feature = "sync")]
+fn team_section(dir: &std::path::Path) -> bool {
+    use serde_json::Value;
+
+    let v = match super::team::status_report(dir) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("[fail] team: {}", e.to_string().replace('\n', " "));
+            return true;
+        }
+    };
+    let text = |k: &str| v[k].as_str().map(str::to_string);
+    let mut failed = false;
+    ok(&format!(
+        "team: @{} ({}) in organisation {} on {}",
+        text("handle").unwrap_or_default(),
+        text("role").unwrap_or_default(),
+        text("org_id").unwrap_or_default(),
+        text("server_url").unwrap_or_default()
+    ));
+    match text("server_error") {
+        None => {
+            ok("team server reachable");
+            ok("team token accepted by the server");
+        }
+        Some(e) if e.contains(" 401") || e.contains("unauthorized") => {
+            println!(
+                "[fail] team token rejected by the server ({e}): ask an admin for a device \
+                 invite (awm team add-device)"
+            );
+            failed = true;
+        }
+        Some(e) => {
+            println!("[warn] team server not reachable: {e}");
+            println!("[warn] team token not checked (the server did not answer)");
+        }
+    }
+    match (&v["info"], text("min_client_block")) {
+        (_, Some(m)) => println!(
+            "[warn] team pushes stopped: this awm is older than the team's minimum {m}: upgrade awm"
+        ),
+        (Value::Object(i), None) => ok(&format!(
+            "team protocol {}, min_client {} (this awm {})",
+            i["protocols"]
+                .as_array()
+                .map(|a| a
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","))
+                .unwrap_or_default(),
+            i["min_client"].as_str().unwrap_or("?"),
+            env!("CARGO_PKG_VERSION")
+        )),
+        _ => ok("team protocol: not fetched yet (run: awm sync)"),
+    }
+    match (v["epoch"].as_u64(), v["server_epoch"].as_u64()) {
+        (None, _) => {
+            println!(
+                "[fail] team key epochs: none present on this device (awm sync; awm team status)"
+            );
+            failed = true;
+        }
+        (Some(e), Some(s)) if s > e => println!(
+            "[warn] team key epochs: this device has up to {e}, the server is at {s}: run awm sync"
+        ),
+        (Some(e), _) => ok(&format!("team key epochs present up to {e}")),
+    }
+    let approval = text("approval").unwrap_or_default();
+    if approval == "approved" {
+        ok("team approval: this device is approved");
+    } else {
+        println!("[warn] team approval: {approval}");
+    }
+    if let Some(p) = text("push_blocked") {
+        println!("[warn] team pushes stopped: {p}");
+    }
+    if v["extra_admins_ignored"] == Value::Bool(true) {
+        ok("team: trusted server admins are ignored while a verified admin exists");
+    }
+    ok(&format!(
+        "team last sync: {}",
+        text("last_ok").unwrap_or_else(|| "never".into())
+    ));
+    if let Some(b) = text("backoff_until") {
+        println!("[warn] team sync backoff until {b}");
+    }
+    let last_error = text("last_error");
+    if let Some(e) = &last_error {
+        println!("[warn] team last error: {e}");
+    }
+    let counts = |k: &str| -> Vec<(String, u64)> {
+        v[k].as_object()
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(r, n)| Some((r.clone(), n.as_u64()?)))
+                    .filter(|(_, n)| *n > 0)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let outbox: u64 = v["outbox"]
+        .as_object()
+        .map(|o| o.values().filter_map(Value::as_u64).sum())
+        .unwrap_or(0);
+    ok(&format!("team outbox: {outbox} item(s) waiting to be sent"));
+    for (title, key) in [
+        ("kept local in the last run", "skipped"),
+        ("dropped from teammates since joining", "dropped"),
+    ] {
+        let c = counts(key);
+        if !c.is_empty() {
+            println!(
+                "[warn] team {title}: {}",
+                c.iter()
+                    .map(|(r, n)| format!("{r} {n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    match v["streams_behind"].as_u64() {
+        Some(0) => ok("team streams: none behind the server"),
+        Some(n) => println!(
+            "[warn] team streams: {n} behind the server; one that stays behind after awm sync has a gap"
+        ),
+        None => {}
+    }
+    if v["newer_schema"] == Value::Bool(true) {
+        println!("[warn] team: a teammate's record needs a newer awm: upgrade awm");
+    }
+    if v["server_restored_before_join"] == Value::Bool(true) {
+        println!(
+            "[warn] team: the server was restored from a backup older than this device's join"
+        );
+    }
+    // The server holds another record at a position of this device's stream: the data directory
+    // was copied to another machine (RVT0 m7).
+    if last_error
+        .as_deref()
+        .is_some_and(|e| e.contains("copied to another machine"))
+    {
+        println!(
+            "[fail] team device id collision: the server holds another record where this device \
+             writes next, so another machine uses this device id (a copied data directory). Take a \
+             new device id through a device invite: on a machine in the team run awm team \
+             add-device, then on this machine use a new data directory and awm team join"
+        );
+        failed = true;
+    }
+    failed
+}
+
 fn since_ok(ts: i64, since: Option<i64>) -> bool {
     since.is_none_or(|s| ts >= s)
 }
@@ -244,12 +410,12 @@ pub fn coverage(
     let sessions: HashSet<String> = conn
         .prepare(
             "SELECT session_id FROM hook_run WHERE session_id IS NOT NULL \
-             UNION SELECT session_id FROM event WHERE source = 'hook'",
+             UNION SELECT session_id FROM event WHERE source = 'hook' AND origin = 'local'",
         )?
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     let captured: HashSet<String> = conn
-        .prepare("SELECT tool_use_id FROM event WHERE source = 'hook'")?
+        .prepare("SELECT tool_use_id FROM event WHERE source = 'hook' AND origin = 'local'")?
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     let mut seen = HashSet::new();
