@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awm.invalid/schemas/v1/restore.complete.request.schema.json",
+  "title": "POST /v1/restore/complete request",
+  "type": "object",
+  "properties": {
+    "generation": {
+      "$ref": "common.schema.json#/$defs/id"
+    }
+  },
+  "required": [
+    "generation"
+  ],
+  "additionalProperties": false
+}

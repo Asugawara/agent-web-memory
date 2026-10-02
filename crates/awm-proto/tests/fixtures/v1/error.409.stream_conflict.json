@@ -1,0 +1,6 @@
+{
+  "error": "stream_conflict",
+  "message": "another id is stored at rec/44",
+  "item": 0,
+  "head": 44
+}

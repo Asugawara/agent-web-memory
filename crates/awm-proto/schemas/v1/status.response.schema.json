@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awm.invalid/schemas/v1/status.response.schema.json",
+  "title": "GET /v1/status response",
+  "type": "object",
+  "properties": {
+    "generation": {
+      "$ref": "common.schema.json#/$defs/id"
+    },
+    "org_id": {
+      "$ref": "common.schema.json#/$defs/id"
+    },
+    "member_id": {
+      "$ref": "common.schema.json#/$defs/id"
+    },
+    "device_id": {
+      "$ref": "common.schema.json#/$defs/id"
+    },
+    "role": {
+      "$ref": "common.schema.json#/$defs/role"
+    },
+    "approved": {
+      "type": "boolean"
+    },
+    "current_epoch": {
+      "$ref": "common.schema.json#/$defs/u32"
+    },
+    "rotation_needed": {
+      "type": "boolean"
+    },
+    "restore_pending": {
+      "type": "boolean"
+    },
+    "settings": {
+      "type": "object",
+      "properties": {
+        "retention_days": {
+          "type": "integer",
+          "minimum": 30,
+          "maximum": 4294967295
+        },
+        "min_client": {
+          "$ref": "common.schema.json#/$defs/version"
+        },
+        "max_members": {
+          "$ref": "common.schema.json#/$defs/u32"
+        },
+        "pending_retention": {
+          "type": "object",
+          "properties": {
+            "retention_days": {
+              "type": "integer",
+              "minimum": 30,
+              "maximum": 4294967295
+            },
+            "effective_at": {
+              "$ref": "common.schema.json#/$defs/time"
+            }
+          },
+          "required": [
+            "effective_at",
+            "retention_days"
+          ]
+        }
+      },
+      "required": [
+        "max_members",
+        "min_client",
+        "retention_days"
+      ]
+    },
+    "streams": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "member": {
+            "$ref": "common.schema.json#/$defs/id"
+          },
+          "device": {
+            "$ref": "common.schema.json#/$defs/id"
+          },
+          "tag": {
+            "$ref": "common.schema.json#/$defs/tag"
+          },
+          "head": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "device",
+          "head",
+          "member",
+          "tag"
+        ]
+      }
+    },
+    "deletions": {
+      "type": "object",
+      "properties": {
+        "head": {
+          "$ref": "common.schema.json#/$defs/head"
+        },
+        "oldest": {
+          "$ref": "common.schema.json#/$defs/idx"
+        }
+      },
+      "required": [
+        "head",
+        "oldest"
+      ]
+    },
+    "pending": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "device_id": {
+            "$ref": "common.schema.json#/$defs/id"
+          },
+          "member_id": {
+            "$ref": "common.schema.json#/$defs/id"
+          },
+          "handle": {
+            "$ref": "common.schema.json#/$defs/handle"
+          },
+          "kind": {
+            "$ref": "common.schema.json#/$defs/invite_kind"
+          },
+          "invite_id": {
+            "$ref": "common.schema.json#/$defs/id"
+          },
+          "device_pubkey": {
+            "$ref": "common.schema.json#/$defs/key32"
+          },
+          "join_mac": {
+            "$ref": "common.schema.json#/$defs/key32"
+          },
+          "joined_at": {
+            "$ref": "common.schema.json#/$defs/hour"
+          }
+        },
+        "required": [
+          "device_id",
+          "device_pubkey",
+          "handle",
+          "invite_id",
+          "join_mac",
+          "joined_at",
+          "kind",
+          "member_id"
+        ]
+      }
+    }
+  },
+  "required": [
+    "approved",
+    "current_epoch",
+    "deletions",
+    "device_id",
+    "generation",
+    "member_id",
+    "org_id",
+    "pending",
+    "restore_pending",
+    "role",
+    "rotation_needed",
+    "settings",
+    "streams"
+  ]
+}

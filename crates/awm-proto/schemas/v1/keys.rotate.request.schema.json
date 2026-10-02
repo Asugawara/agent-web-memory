@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awm.invalid/schemas/v1/keys.rotate.request.schema.json",
+  "title": "POST /v1/keys/rotate request",
+  "type": "object",
+  "properties": {
+    "epoch": {
+      "$ref": "common.schema.json#/$defs/u32"
+    },
+    "wraps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "device_id": {
+            "$ref": "common.schema.json#/$defs/id"
+          },
+          "wrap": {
+            "$ref": "common.schema.json#/$defs/epoch_wrap_bytes"
+          },
+          "auth": {
+            "$ref": "common.schema.json#/$defs/key32"
+          }
+        },
+        "required": [
+          "auth",
+          "device_id",
+          "wrap"
+        ],
+        "additionalProperties": false
+      },
+      "minItems": 1
+    }
+  },
+  "required": [
+    "epoch",
+    "wraps"
+  ],
+  "additionalProperties": false
+}

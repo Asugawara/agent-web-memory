@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awm.invalid/schemas/v1/plaintext.roster.schema.json",
+  "title": "Plaintext of a roster record, schema 1",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1,
+      "description": "a reader skips a higher schema (it decodes as Newer)"
+    },
+    "kind": {
+      "enum": [
+        "approve",
+        "revoke",
+        "epoch"
+      ]
+    },
+    "member_id": {
+      "$ref": "common.schema.json#/$defs/id"
+    },
+    "handle": {
+      "$ref": "common.schema.json#/$defs/handle"
+    },
+    "role": {
+      "$ref": "common.schema.json#/$defs/role"
+    },
+    "device_id": {
+      "$ref": "common.schema.json#/$defs/id"
+    },
+    "device_pubkey": {
+      "$ref": "common.schema.json#/$defs/key32"
+    },
+    "epoch": {
+      "$ref": "common.schema.json#/$defs/u32"
+    },
+    "devices": {
+      "type": "array",
+      "items": {
+        "$ref": "common.schema.json#/$defs/id"
+      }
+    },
+    "at": {
+      "$ref": "common.schema.json#/$defs/time"
+    },
+    "approver_device_id": {
+      "$ref": "common.schema.json#/$defs/id"
+    }
+  },
+  "required": [
+    "approver_device_id",
+    "at",
+    "kind",
+    "member_id",
+    "schema"
+  ]
+}

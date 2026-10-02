@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awm.invalid/schemas/v1/records.query.schema.json",
+  "title": "GET /v1/records query string",
+  "type": "object",
+  "properties": {
+    "member": {
+      "$ref": "common.schema.json#/$defs/id"
+    },
+    "device": {
+      "$ref": "common.schema.json#/$defs/id"
+    },
+    "tag": {
+      "$ref": "common.schema.json#/$defs/tag"
+    },
+    "from": {
+      "$ref": "common.schema.json#/$defs/idx"
+    },
+    "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 500
+    }
+  },
+  "required": [
+    "device",
+    "from",
+    "member",
+    "tag"
+  ],
+  "additionalProperties": false
+}

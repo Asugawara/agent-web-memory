@@ -1,0 +1,42 @@
+{
+  "streams": [
+    {
+      "member": "2b7e4c1a-5d3f-4a6b-8c9d-0e1f2a3b4c5d",
+      "device": "9d8c7b6a-5f4e-4d3c-8b2a-1f0e9d8c7b6a",
+      "tag": "rec",
+      "head": 43,
+      "records": []
+    },
+    {
+      "member": "4a5b6c7d-8e9f-4a0b-9c1d-2e3f4a5b6c7d",
+      "device": "c1d2e3f4-a5b6-4c7d-8e9f-0a1b2c3d4e5f",
+      "tag": "rec",
+      "head": 7,
+      "records": [
+        {
+          "idx": 7,
+          "id": "d6e7f809-1a2b-4c3d-9e4f-5a6b7c8d9eaf",
+          "epoch": 1,
+          "blob": "AQQhPlt4lbLP7AkmQ2B9mrfU8Q4rSGWCnwwXIi04Q05ZZG96hZCbprG8x9Ld6PP-CRQfKjVAS1ZhbHeCjZijrrnEz9rl8PsGERwnMj1IU15pdH-KlaCrtsHM1-Lt-AMOGSQvOkVQW2ZxfIeSnaizvsnU3-r1AAsWISw3Qk1YY255hI-apbC7xtHc5_L9CBMeKTQ_SlVga3aBjJeirbjDztnk7_oFEBsmMTxHUl1oc36JlJ-qtcDL1uHs9wINGCMuOURPWmVwe4aRnKeyvcjT3un0_woVICs2QUxXYm14g46ZpK-6xdDb5vH8BxIdKDM-SVRfanWAi5ahrLfCzdjj7vkEDxolMDtGUVxncn2Ik56ptL_K1eDr9gEMFyItOENOWWRveoWQm6axvMfS3ejz_gkUHyo1QEtWYWx3go2Yo665xM_a5fD7BhEcJzI9SFNeaXR_ipWgq7bBzNfi7fgDDhkkLzpFUFtmcXyHkp2os77J1N_q9QALFiEsN0JNWGNueYSPmqWwu8bR3Ofy_QgTHik0P0pVYGt2gYyXoq24w87Z5O_6BRAbJjE8R1JdaHN-iZSfqrXAy9bh7PcCDRgjLjlET1plcHuGkZynsr3I097p9P8KFSArNkFMV2JteIOOmaSvusXQ2-bx_AcSHSgzPklUX2p1gIuWoay3ws3Y4-75BA8aJTA7RlFcZ3J9iJOeqbS_ytXg6_YBDBciLThDTllkb3qFkJumsQ",
+          "received_at": 1790910000
+        }
+      ]
+    },
+    {
+      "member": "4a5b6c7d-8e9f-4a0b-9c1d-2e3f4a5b6c7d",
+      "device": "c1d2e3f4-a5b6-4c7d-8e9f-0a1b2c3d4e5f",
+      "tag": "flag",
+      "head": 0,
+      "records": [
+        {
+          "idx": 0,
+          "id": "1a2b3c4d-5e6f-4a7b-8c9d-aebfc0d1e2f3",
+          "epoch": 1,
+          "blob": "AQUiP1x5lrPQ7QonRGF-m7jV8g8sSWaDoA8aJTA7RlFcZ3J9iJOeqbS_ytXg6_YBDBciLThDTllkb3qFkJumsbzH0t3o8_4JFB8qNUBLVmFsd4KNmKOuucTP2uXw-wYRHCcyPUhTXml0f4qVoKu2wczX4u34Aw4ZJC86RVBbZnF8h5KdqLO-ydTf6vUACxYhLDdCTVhjbnmEj5qlsLvG0dzn8v0IEx4pND9KVWBrdoGMl6KtuMPO2eTv-gUQGyYxPEdSXWhzfomUn6q1wMvW4ez3Ag0YIy45RE9aZXB7hpGcp7K9yNPe6fT_ChUgKzZBTFdibXiDjpmkr7rF0Nvm8fwHEh0oMz5JVF9qdYCLlqGst8LN2OPu-QQPGiUwO0ZRXGdyfYiTnqm0",
+          "received_at": 1790906400
+        }
+      ]
+    }
+  ],
+  "more": false
+}

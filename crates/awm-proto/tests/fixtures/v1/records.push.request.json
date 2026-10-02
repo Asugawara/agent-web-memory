@@ -1,0 +1,24 @@
+{
+  "records": [
+    {
+      "tag": "rec",
+      "idx": 44,
+      "id": "7e6d5c4b-3a29-4180-9f7e-6d5c4b3a2918",
+      "epoch": 1,
+      "blob": "AQEeO1h1kq_M6QYjQF16l7TR7gsoRWJ_nAMOGSQvOkVQW2ZxfIeSnaizvsnU3-r1AAsWISw3Qk1YY255hI-apbC7xtHc5_L9CBMeKTQ_SlVga3aBjJeirbjDztnk7_oFEBsmMTxHUl1oc36JlJ-qtcDL1uHs9wINGCMuOURPWmVwe4aRnKeyvcjT3un0_woVICs2QUxXYm14g46ZpK-6xdDb5vH8BxIdKDM-SVRfanWAi5ahrLfCzdjj7vkEDxolMDtGUVxncn2Ik56ptL_K1eDr9gEMFyItOENOWWRveoWQm6axvMfS3ejz_gkUHyo1QEtWYWx3go2Yo665xM_a5fD7BhEcJzI9SFNeaXR_ipWgq7bBzNfi7fgDDhkkLzpFUFtmcXyHkp2o"
+    },
+    {
+      "tag": "rec",
+      "idx": 45,
+      "id": "0f1e2d3c-4b5a-4968-8776-655443322110",
+      "deleted": true
+    },
+    {
+      "tag": "roster",
+      "idx": 3,
+      "id": "1a2b3c4d-5e6f-4a7b-8c9d-aebfc0d1e2f3",
+      "epoch": 1,
+      "blob": "AQIfPFl2k7DN6gckQV57mLXS7wwpRmOAnQYRHCcyPUhTXml0f4qVoKu2wczX4u34Aw4ZJC86RVBbZnF8h5KdqLO-ydTf6vUACxYhLDdCTVhjbnmEj5qlsLvG0dzn8v0IEx4pND9KVWBrdoGMl6KtuMPO2eTv-gUQGyYxPEdSXWhzfomUn6q1wMvW4ez3Ag0YIy45RE9aZXB7hpGcp7K9yNPe6fT_ChUgKzZBTFdibXiDjpmkr7rF0Nvm8fwHEh0oMz5JVF9qdYCLlqGst8LN2OPu-QQPGiUwO0ZRXGdyfYiTnqm0v8rV4Ov2AQwXIi04Q05ZZG96hZCbprG8x9Ld6PP-CRQfKjVAS1ZhbHeCjZijrrnEz9rl8PsGERwnMj1IU15pdH-KlaCr"
+    }
+  ]
+}

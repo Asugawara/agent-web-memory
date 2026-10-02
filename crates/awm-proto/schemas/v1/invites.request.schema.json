@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awm.invalid/schemas/v1/invites.request.schema.json",
+  "title": "POST /v1/invites request",
+  "type": "object",
+  "properties": {
+    "kind": {
+      "$ref": "common.schema.json#/$defs/invite_kind"
+    },
+    "handle": {
+      "$ref": "common.schema.json#/$defs/handle"
+    },
+    "role": {
+      "$ref": "common.schema.json#/$defs/role"
+    },
+    "expires_days": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 30
+    }
+  },
+  "required": [
+    "handle",
+    "kind"
+  ],
+  "additionalProperties": false
+}

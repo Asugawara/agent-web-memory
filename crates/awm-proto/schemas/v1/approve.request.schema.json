@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awm.invalid/schemas/v1/approve.request.schema.json",
+  "title": "POST /v1/devices/{id}/approve request",
+  "type": "object",
+  "properties": {
+    "wraps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "epoch": {
+            "$ref": "common.schema.json#/$defs/u32"
+          },
+          "wrap": {
+            "$ref": "common.schema.json#/$defs/epoch_wrap_bytes"
+          },
+          "auth": {
+            "$ref": "common.schema.json#/$defs/key32"
+          }
+        },
+        "required": [
+          "auth",
+          "epoch",
+          "wrap"
+        ],
+        "additionalProperties": false
+      },
+      "minItems": 1
+    }
+  },
+  "required": [
+    "wraps"
+  ],
+  "additionalProperties": false
+}

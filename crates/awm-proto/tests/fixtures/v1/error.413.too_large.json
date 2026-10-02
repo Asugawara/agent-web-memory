@@ -1,0 +1,6 @@
+{
+  "error": "too_large",
+  "message": "batch above 1.5 MiB",
+  "limit": "batch_bytes",
+  "max": 1572864
+}

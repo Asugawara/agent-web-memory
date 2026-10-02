@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awm.invalid/schemas/v1/settings.put.request.schema.json",
+  "title": "PUT /v1/org/settings request",
+  "type": "object",
+  "properties": {
+    "retention_days": {
+      "type": "integer",
+      "minimum": 30,
+      "maximum": 4294967295
+    },
+    "min_client": {
+      "$ref": "common.schema.json#/$defs/version"
+    },
+    "max_members": {
+      "$ref": "common.schema.json#/$defs/u32"
+    },
+    "cancel_pending_retention": {
+      "type": "boolean"
+    }
+  },
+  "required": [],
+  "additionalProperties": false
+}

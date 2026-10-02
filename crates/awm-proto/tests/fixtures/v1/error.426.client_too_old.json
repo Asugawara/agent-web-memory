@@ -1,0 +1,5 @@
+{
+  "error": "client_too_old",
+  "message": "awm 0.2.0 is below min_client 0.2.1",
+  "min_client": "0.2.1"
+}

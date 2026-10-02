@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awm.invalid/schemas/v1/pull.response.schema.json",
+  "title": "POST /v1/pull response",
+  "type": "object",
+  "properties": {
+    "streams": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "member": {
+            "$ref": "common.schema.json#/$defs/id"
+          },
+          "device": {
+            "$ref": "common.schema.json#/$defs/id"
+          },
+          "tag": {
+            "$ref": "common.schema.json#/$defs/tag"
+          },
+          "head": {
+            "$ref": "common.schema.json#/$defs/head"
+          },
+          "records": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "idx": {
+                      "$ref": "common.schema.json#/$defs/idx"
+                    },
+                    "id": {
+                      "$ref": "common.schema.json#/$defs/id"
+                    },
+                    "epoch": {
+                      "$ref": "common.schema.json#/$defs/u32"
+                    },
+                    "blob": {
+                      "$ref": "common.schema.json#/$defs/blob"
+                    },
+                    "received_at": {
+                      "$ref": "common.schema.json#/$defs/hour"
+                    },
+                    "deleted": false
+                  },
+                  "required": [
+                    "blob",
+                    "epoch",
+                    "id",
+                    "idx",
+                    "received_at"
+                  ],
+                  "description": "a record"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "idx": {
+                      "$ref": "common.schema.json#/$defs/idx"
+                    },
+                    "id": {
+                      "$ref": "common.schema.json#/$defs/id"
+                    },
+                    "deleted": {
+                      "const": true
+                    },
+                    "epoch": false,
+                    "blob": false,
+                    "received_at": false
+                  },
+                  "required": [
+                    "deleted",
+                    "id",
+                    "idx"
+                  ],
+                  "description": "a deletion marker"
+                }
+              ]
+            },
+            "maxItems": 500
+          }
+        },
+        "required": [
+          "device",
+          "head",
+          "member",
+          "records",
+          "tag"
+        ]
+      },
+      "maxItems": 1000
+    },
+    "more": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "more",
+    "streams"
+  ]
+}

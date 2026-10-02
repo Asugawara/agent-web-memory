@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awm.invalid/schemas/v1/bootstrap.response.schema.json",
+  "title": "POST /v1/bootstrap response",
+  "type": "object",
+  "properties": {
+    "org_id": {
+      "$ref": "common.schema.json#/$defs/id"
+    },
+    "member_id": {
+      "$ref": "common.schema.json#/$defs/id"
+    },
+    "device_id": {
+      "$ref": "common.schema.json#/$defs/id"
+    },
+    "device_token": {
+      "$ref": "common.schema.json#/$defs/device_token"
+    },
+    "role": {
+      "$ref": "common.schema.json#/$defs/role"
+    }
+  },
+  "required": [
+    "device_id",
+    "device_token",
+    "member_id",
+    "org_id",
+    "role"
+  ]
+}

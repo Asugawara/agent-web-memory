@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awm.invalid/schemas/v1/plaintext.policy.schema.json",
+  "title": "Plaintext of a policy record, schema 1",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1,
+      "description": "a reader skips a higher schema (it decodes as Newer)"
+    },
+    "version": {
+      "$ref": "common.schema.json#/$defs/count"
+    },
+    "deny_hosts": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 253
+      }
+    },
+    "link_hosts": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 253
+      }
+    },
+    "terms": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 200
+      }
+    },
+    "credential_params": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 64
+      }
+    },
+    "summary_chars": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2000
+    }
+  },
+  "required": [
+    "credential_params",
+    "deny_hosts",
+    "link_hosts",
+    "schema",
+    "terms",
+    "version"
+  ]
+}

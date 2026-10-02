@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awm.invalid/schemas/v1/token.rotate.response.schema.json",
+  "title": "POST /v1/token/rotate response",
+  "type": "object",
+  "properties": {
+    "device_token": {
+      "$ref": "common.schema.json#/$defs/device_token"
+    }
+  },
+  "required": [
+    "device_token"
+  ]
+}

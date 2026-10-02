@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "tool": "WebSearch",
+  "query": "tokio spawn_blocking pool size",
+  "status": "ok",
+  "summary": "spawn_blocking runs on a separate pool capped at 512 threads by default.",
+  "results": [
+    {
+      "rank": 1,
+      "url": "https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html",
+      "title": "spawn_blocking in tokio::task - Rust"
+    },
+    {
+      "rank": 2,
+      "url": "https://tokio.rs/tokio/topics/bridging"
+    }
+  ],
+  "agent": "claude",
+  "source": "hook",
+  "created_at": 1790906400,
+  "repo_key": "0123456789abcdef0123456789abcdef",
+  "share": "full"
+}

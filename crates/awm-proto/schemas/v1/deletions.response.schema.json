@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awm.invalid/schemas/v1/deletions.response.schema.json",
+  "title": "GET /v1/deletions response",
+  "type": "object",
+  "properties": {
+    "head": {
+      "$ref": "common.schema.json#/$defs/head"
+    },
+    "oldest": {
+      "$ref": "common.schema.json#/$defs/idx"
+    },
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "idx": {
+            "$ref": "common.schema.json#/$defs/idx"
+          },
+          "record_id": {
+            "$ref": "common.schema.json#/$defs/id"
+          }
+        },
+        "required": [
+          "idx",
+          "record_id"
+        ]
+      },
+      "maxItems": 5000
+    }
+  },
+  "required": [
+    "entries",
+    "head",
+    "oldest"
+  ]
+}

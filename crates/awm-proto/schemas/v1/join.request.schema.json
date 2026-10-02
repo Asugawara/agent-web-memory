@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awm.invalid/schemas/v1/join.request.schema.json",
+  "title": "POST /v1/join request",
+  "type": "object",
+  "properties": {
+    "invite_id": {
+      "$ref": "common.schema.json#/$defs/id"
+    },
+    "invite_token": {
+      "$ref": "common.schema.json#/$defs/invite_token"
+    },
+    "handle": {
+      "$ref": "common.schema.json#/$defs/handle"
+    },
+    "device_id": {
+      "$ref": "common.schema.json#/$defs/id"
+    },
+    "device_pubkey": {
+      "$ref": "common.schema.json#/$defs/key32"
+    },
+    "join_mac": {
+      "$ref": "common.schema.json#/$defs/key32"
+    }
+  },
+  "required": [
+    "device_id",
+    "device_pubkey",
+    "handle",
+    "invite_id",
+    "invite_token",
+    "join_mac"
+  ],
+  "additionalProperties": false
+}

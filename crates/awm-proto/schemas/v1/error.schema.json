@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awm.invalid/schemas/v1/error.schema.json",
+  "title": "Error body of every non-2xx response",
+  "type": "object",
+  "properties": {
+    "error": {
+      "enum": [
+        "malformed",
+        "unknown_field",
+        "invalid_value",
+        "bad_client_header",
+        "unauthenticated",
+        "payment_required",
+        "forbidden",
+        "not_approved",
+        "not_found",
+        "stream_conflict",
+        "id_conflict",
+        "stale_epoch",
+        "epoch_conflict",
+        "device_conflict",
+        "last_admin",
+        "deleted",
+        "invite_gone",
+        "too_large",
+        "bad_envelope",
+        "client_too_old",
+        "rate_limited",
+        "maintenance",
+        "restore_pending"
+      ]
+    },
+    "message": {
+      "type": "string",
+      "maxLength": 1024
+    },
+    "field": {
+      "type": "string",
+      "maxLength": 256
+    },
+    "item": {
+      "$ref": "common.schema.json#/$defs/u32"
+    },
+    "head": {
+      "$ref": "common.schema.json#/$defs/head"
+    },
+    "current_epoch": {
+      "$ref": "common.schema.json#/$defs/u32"
+    },
+    "ids": {
+      "type": "array",
+      "items": {
+        "$ref": "common.schema.json#/$defs/id"
+      },
+      "maxItems": 100
+    },
+    "limit": {
+      "enum": [
+        "blob",
+        "batch_records",
+        "batch_bytes",
+        "body",
+        "records_per_day",
+        "pull_cursors",
+        "delete_ids"
+      ]
+    },
+    "max": {
+      "$ref": "common.schema.json#/$defs/count"
+    },
+    "min_client": {
+      "$ref": "common.schema.json#/$defs/version"
+    },
+    "retry_after_s": {
+      "$ref": "common.schema.json#/$defs/u32"
+    },
+    "state": {
+      "type": "string",
+      "maxLength": 64
+    },
+    "billing_url": {
+      "type": "string",
+      "maxLength": 2048
+    },
+    "generation": {
+      "$ref": "common.schema.json#/$defs/id"
+    }
+  },
+  "required": [
+    "error",
+    "message"
+  ]
+}

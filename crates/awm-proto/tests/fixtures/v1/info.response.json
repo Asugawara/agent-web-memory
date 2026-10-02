@@ -1,0 +1,24 @@
+{
+  "protocols": [
+    1
+  ],
+  "server": "0.2.0",
+  "cloud": false,
+  "generation": "5e8a1f3c-2b4d-4e6f-a7b9-c0d1e2f3a4b5",
+  "min_client": "0.2.0",
+  "limits": {
+    "blob_bytes": 16384,
+    "batch_records": 100,
+    "batch_bytes": 1572864,
+    "body_bytes": 2097152,
+    "pull_records": 500,
+    "pull_cursors": 1000,
+    "pull_response_bytes": 8388608,
+    "deletions_page": 5000,
+    "delete_ids": 1000,
+    "records_per_day": 5000,
+    "requests_per_minute": 60,
+    "request_burst": 120
+  },
+  "features": []
+}

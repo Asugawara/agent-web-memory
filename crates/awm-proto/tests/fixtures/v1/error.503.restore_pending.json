@@ -1,0 +1,6 @@
+{
+  "error": "restore_pending",
+  "message": "restored from a backup; an admin must sync",
+  "generation": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+  "retry_after_s": 300
+}

@@ -1,0 +1,6 @@
+{
+  "error": "stale_epoch",
+  "message": "epoch 1 is not current",
+  "item": 0,
+  "current_epoch": 2
+}

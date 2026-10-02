@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awm.invalid/schemas/v1/plaintext.stats.schema.json",
+  "title": "Plaintext of a stats record, schema 1",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1,
+      "description": "a reader skips a higher schema (it decodes as Newer)"
+    },
+    "day": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    },
+    "shown": {
+      "$ref": "common.schema.json#/$defs/count"
+    },
+    "avoided": {
+      "$ref": "common.schema.json#/$defs/count"
+    },
+    "est_minutes": {
+      "$ref": "common.schema.json#/$defs/count"
+    },
+    "est_tokens": {
+      "$ref": "common.schema.json#/$defs/count"
+    }
+  },
+  "required": [
+    "avoided",
+    "day",
+    "est_minutes",
+    "est_tokens",
+    "schema",
+    "shown"
+  ]
+}

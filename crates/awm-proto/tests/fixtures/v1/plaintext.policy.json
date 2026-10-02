@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "version": 3,
+  "deny_hosts": [
+    "intranet.example.com"
+  ],
+  "link_hosts": [
+    "example.atlassian.net"
+  ],
+  "terms": [
+    "Project Kestrel"
+  ],
+  "credential_params": [
+    "ticket"
+  ],
+  "summary_chars": 800
+}

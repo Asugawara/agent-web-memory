@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awm.invalid/schemas/v1/records.push.request.schema.json",
+  "title": "POST /v1/records request",
+  "type": "object",
+  "properties": {
+    "records": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "tag": {
+                "$ref": "common.schema.json#/$defs/tag"
+              },
+              "idx": {
+                "$ref": "common.schema.json#/$defs/idx"
+              },
+              "id": {
+                "$ref": "common.schema.json#/$defs/id"
+              },
+              "epoch": {
+                "$ref": "common.schema.json#/$defs/u32"
+              },
+              "blob": {
+                "$ref": "common.schema.json#/$defs/blob"
+              }
+            },
+            "required": [
+              "blob",
+              "epoch",
+              "id",
+              "idx",
+              "tag"
+            ],
+            "additionalProperties": false,
+            "description": "a record"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "tag": {
+                "$ref": "common.schema.json#/$defs/tag"
+              },
+              "idx": {
+                "$ref": "common.schema.json#/$defs/idx"
+              },
+              "id": {
+                "$ref": "common.schema.json#/$defs/id"
+              },
+              "deleted": {
+                "const": true
+              }
+            },
+            "required": [
+              "deleted",
+              "id",
+              "idx",
+              "tag"
+            ],
+            "additionalProperties": false,
+            "description": "a deletion marker"
+          }
+        ]
+      },
+      "minItems": 1,
+      "maxItems": 100
+    }
+  },
+  "required": [
+    "records"
+  ],
+  "additionalProperties": false
+}

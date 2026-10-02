@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awm.invalid/schemas/v1/members.role.request.schema.json",
+  "title": "POST /v1/members/{id}/role request",
+  "type": "object",
+  "properties": {
+    "role": {
+      "$ref": "common.schema.json#/$defs/role"
+    }
+  },
+  "required": [
+    "role"
+  ],
+  "additionalProperties": false
+}
