@@ -15,6 +15,18 @@
 //!
 //! `forget <url>` and `purge --before` select their records again inside the
 //! deleting transaction, so a record stored while the question waited goes too.
+//!
+//! In a team (`team.toml` exists; plan-v3-team §3.6, TM11) the commands take
+//! `sync.lock` first (waiting up to 10 s, then refusing) and, inside the same
+//! transaction, record the remote side of every deleted row that has a
+//! `sync_id`, pushed or not (`sync::apply::own_deletion`): the member's own rows,
+//! including copies of the member's other machines' records, are deleted on the
+//! server; teammates' rows are deleted on this machine only. The deletions are
+//! sent in the foreground after the commit and stay queued in `sync_outbox` when
+//! the server does not answer. `purge` deletes remotely first and refuses
+//! offline unless `--local-only`; `purge --all` runs `awm team leave --delete`
+//! first. A build without the `sync` feature queues the deletions and refuses
+//! `purge` without `--local-only`.
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, IsTerminal, Write};
@@ -68,6 +80,9 @@ pub struct PurgeArgs {
     /// Delete the whole data directory
     #[arg(long)]
     pub all: bool,
+    /// In a team: delete on this machine only; your shared records stay on the server
+    #[arg(long)]
+    pub local_only: bool,
     /// Do not ask for confirmation
     #[arg(long)]
     pub yes: bool,
@@ -133,6 +148,26 @@ pub struct Deleted {
     pub spool_files: usize,
     /// `wal_checkpoint(TRUNCATE)` could not finish because another connection was reading.
     pub wal_busy: bool,
+    /// In a team: the remote side (§3.6).
+    pub remote: Option<Remote>,
+    /// Record ids whose remote deletion this command recorded (not printed).
+    pub own_ids: Vec<String>,
+}
+
+/// The remote side of a deletion in a team, as printed afterwards (plan-v3-team §4.9).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Remote {
+    /// Own shared records deleted on the server by this command.
+    pub sent: usize,
+    /// Deletions left in `sync_outbox` for the next `awm sync` (the server did not answer).
+    pub queued: usize,
+    /// `--local-only`: own shared records that stay on the server.
+    pub kept: Option<usize>,
+    /// Own shared records rewritten by `forget <url>`: deleted on the server, shared again
+    /// (under a new record id) by the next `awm sync`.
+    pub superseded: usize,
+    /// Teammates' records deleted on this machine only.
+    pub teammates: usize,
 }
 
 /// Runs `f` with the process stdin, stdout and data dir.
@@ -410,6 +445,293 @@ fn select_url(conn: &Connection, arg: &str, norm: &str) -> anyhow::Result<(Vec<R
 }
 
 // ---------------------------------------------------------------------------
+// Team side (plan-v3-team §3.6; TM11)
+
+/// The member id in `team.toml`, read without the `sync` feature; `None` outside a team.
+fn team_member(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join(crate::cli::where_::TEAM_TOML)).ok()?;
+    let table = text.parse::<toml::Table>().ok()?;
+    table.get("member_id")?.as_str().map(str::to_string)
+}
+
+/// The member's shared records this machine knows of: own captures the server accepted and
+/// copies of the member's other machines' records.
+fn own_shared(conn: &Connection, member: &str) -> anyhow::Result<usize> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM event WHERE sync_id IS NOT NULL \
+           AND ((origin = 'local' AND pushed_at IS NOT NULL) OR (origin = 'team' AND member = ?1))",
+        [member],
+        |r| r.get(0),
+    )?;
+    Ok(usize::try_from(n).unwrap_or(0))
+}
+
+/// This machine in a team, while a command that deletes runs.
+struct Team {
+    member: String,
+    #[cfg_attr(not(feature = "sync"), allow(dead_code))]
+    dir: PathBuf,
+    /// `purge --local-only`: nothing is sent or queued.
+    local_only: bool,
+    /// `sync.lock`, held until the command ends (§3.6).
+    _lock: std::fs::File,
+}
+
+impl Team {
+    /// `None` outside a team; in one, takes `sync.lock` (waiting up to 10 s, then refusing).
+    fn join(dir: &Path, local_only: bool) -> anyhow::Result<Option<Team>> {
+        let Some(member) = team_member(dir) else {
+            return Ok(None);
+        };
+        let lock = crate::sync::apply::lock_sync(dir)?;
+        Ok(Some(Team {
+            member,
+            dir: dir.to_path_buf(),
+            local_only,
+            _lock: lock,
+        }))
+    }
+
+    /// `POST /v1/delete {ids}` now, before anything local is deleted (`purge`). `Err` inside
+    /// `Ok` says why the server could not be asked (offline, 5xx, 429, no team key).
+    #[cfg(feature = "sync")]
+    fn delete_now(&self, ids: &[String]) -> anyhow::Result<Result<(), String>> {
+        use awm_proto::wire::{limits, DeleteRequest, Id};
+        let ident = match crate::sync::state::Identity::load(&self.dir) {
+            Ok(i) => i,
+            Err(e) => return Ok(Err(e.to_string())),
+        };
+        let ca = ident.team.ca_file.as_deref().map(Path::new);
+        let client = crate::sync::http::Client::new(
+            &ident.team.server_url,
+            Some(&ident.key.device_token),
+            ca,
+        )?;
+        let ids: Vec<Id> = ids.iter().filter_map(|i| Id::parse(i).ok()).collect();
+        for chunk in ids.chunks(limits::DELETE_IDS) {
+            match client.delete(&DeleteRequest::Ids(chunk.to_vec())) {
+                Ok(_) => {}
+                Err(e) if e.transient() => return Ok(Err(e.to_string())),
+                Err(e) => bail!(
+                    "the server refused the deletion ({e}): nothing was deleted on this machine"
+                ),
+            }
+        }
+        Ok(Ok(()))
+    }
+
+    #[cfg(not(feature = "sync"))]
+    fn delete_now(&self, _ids: &[String]) -> anyhow::Result<Result<(), String>> {
+        Ok(Err("this awm was built without team sync".to_string()))
+    }
+
+    /// After the commit: sends the queued deletions in the foreground (§3.3) and counts what
+    /// went and what stays queued for the next `awm sync`.
+    fn send(&self, conn: &Connection, d: &mut Deleted) -> anyhow::Result<()> {
+        if self.local_only || d.own_ids.is_empty() {
+            return Ok(());
+        }
+        // A failure (no network, 5xx, 429) leaves the rows queued; they are counted below.
+        #[cfg(feature = "sync")]
+        let _ = crate::sync::apply::send_queued(&self.dir);
+        let mut st =
+            conn.prepare("SELECT 1 FROM sync_outbox WHERE kind = 'delete' AND ref = ?1")?;
+        let mut queued = 0;
+        for id in &d.own_ids {
+            if st.exists([id])? {
+                queued += 1;
+            }
+        }
+        let total = d.own_ids.len();
+        if let Some(r) = d.remote.as_mut() {
+            r.queued = queued;
+            r.sent = total - queued;
+        }
+        Ok(())
+    }
+}
+
+/// One row with a `sync_id`, read before it is deleted or rewritten.
+struct TeamRow {
+    event: i64,
+    sync_id: String,
+    team_copy: bool,
+    pushed: bool,
+}
+
+/// The remote side of a deletion, read inside the deleting transaction (§3.6): rows of the
+/// member (own captures and copies of the member's other machines' records, §3.5) are deleted
+/// on the server; teammates' rows on this machine only.
+struct TeamSide {
+    local_only: bool,
+    own: Vec<TeamRow>,
+    teammates: Vec<String>,
+    /// Own rows that `forget <url>` rewrites (they mention the URL).
+    rewritten: Vec<TeamRow>,
+}
+
+impl TeamSide {
+    fn read(
+        conn: &Connection,
+        team: &Team,
+        deleted: &[i64],
+        rewritten: &BTreeSet<i64>,
+    ) -> anyhow::Result<TeamSide> {
+        let mut st = conn.prepare(
+            "SELECT origin, member, sync_id, pushed_at IS NOT NULL FROM event \
+             WHERE id = ?1 AND sync_id IS NOT NULL",
+        )?;
+        let mut read = |id: i64| -> anyhow::Result<Option<(bool, TeamRow)>> {
+            let row = st
+                .query_row([id], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, bool>(3)?,
+                    ))
+                })
+                .optional()?;
+            Ok(row.map(|(origin, member, sync_id, pushed)| {
+                let team_copy = origin == "team";
+                let own = !team_copy || member.as_deref() == Some(team.member.as_str());
+                let row = TeamRow {
+                    event: id,
+                    sync_id,
+                    team_copy,
+                    pushed,
+                };
+                (own, row)
+            }))
+        };
+        let mut side = TeamSide {
+            local_only: team.local_only,
+            own: Vec::new(),
+            teammates: Vec::new(),
+            rewritten: Vec::new(),
+        };
+        for id in deleted {
+            match read(*id)? {
+                Some((true, row)) => side.own.push(row),
+                Some((false, row)) => side.teammates.push(row.sync_id),
+                None => {}
+            }
+        }
+        for id in rewritten {
+            if let Some((true, row)) = read(*id)? {
+                side.rewritten.push(row);
+            }
+        }
+        Ok(side)
+    }
+
+    /// Sync ids of the member's deleted rows.
+    fn own_ids(&self) -> Vec<String> {
+        self.own.iter().map(|r| r.sync_id.clone()).collect()
+    }
+
+    /// Writes the remote side in the deleting transaction; ids in `sent` are deleted on the
+    /// server already and get no outbox row.
+    fn write(
+        self,
+        tx: &Connection,
+        now_ms: i64,
+        sent: &BTreeSet<String>,
+        d: &mut Deleted,
+    ) -> anyhow::Result<()> {
+        use crate::sync::apply;
+        let mut r = Remote {
+            teammates: self.teammates.len(),
+            ..Remote::default()
+        };
+        for id in &self.teammates {
+            apply::local_only(tx, id, now_ms)?;
+        }
+        if self.local_only {
+            r.kept = Some(self.own.iter().filter(|o| o.team_copy || o.pushed).count());
+            // The member's other machines' copies keep their server records: a re-seed must
+            // not delete them either.
+            for o in self.own.iter().filter(|o| o.team_copy) {
+                apply::local_only(tx, &o.sync_id, now_ms)?;
+            }
+            d.remote = Some(r);
+            return Ok(());
+        }
+        for o in &self.own {
+            apply::own_deletion(tx, &o.sync_id, now_ms, !sent.contains(&o.sync_id))?;
+            d.own_ids.push(o.sync_id.clone());
+        }
+        // Supersede (§3.6): the shared copy of a rewritten record is deleted and the cleaned
+        // record is pushed again under a new id by the next `awm sync`.
+        for o in &self.rewritten {
+            apply::own_deletion(tx, &o.sync_id, now_ms, true)?;
+            d.own_ids.push(o.sync_id.clone());
+            if !o.team_copy {
+                tx.execute(
+                    "UPDATE event SET sync_id = NULL, sync_idx = NULL, pushed_at = NULL, \
+                       shareable = CASE WHEN shareable = 'never' THEN 'never' ELSE 'no' END \
+                     WHERE id = ?1",
+                    [o.event],
+                )?;
+                r.superseded += 1;
+            }
+        }
+        d.remote = Some(r);
+        Ok(())
+    }
+
+    /// `quarantine`: the member's quarantined shared records are deleted on the server; a
+    /// teammate's copy is quarantined here only (its author or an admin deletes it).
+    fn write_quarantine(self, tx: &Connection, now_ms: i64, d: &mut Deleted) -> anyhow::Result<()> {
+        for o in &self.own {
+            crate::sync::apply::own_deletion(tx, &o.sync_id, now_ms, true)?;
+            d.own_ids.push(o.sync_id.clone());
+        }
+        d.remote = Some(Remote {
+            teammates: self.teammates.len(),
+            ..Remote::default()
+        });
+        Ok(())
+    }
+}
+
+fn print_remote(out: &mut dyn Write, r: &Remote, verb: &str) -> anyhow::Result<()> {
+    if let Some(kept) = r.kept {
+        writeln!(
+            out,
+            "--local-only: {kept} shared record(s) of yours stay on the server; awm team \
+             delete-mine deletes all of your shared records there."
+        )?;
+    } else {
+        writeln!(out, "Deleted {} shared record(s) on the server.", r.sent)?;
+        if r.queued > 0 {
+            writeln!(
+                out,
+                "{} deletion(s) queued for the next awm sync (the server did not answer).",
+                r.queued
+            )?;
+        }
+    }
+    if r.superseded > 0 {
+        writeln!(
+            out,
+            "Superseded {} shared record(s): the server copy is deleted, and the next awm sync \
+             shares the cleaned record again.",
+            r.superseded
+        )?;
+    }
+    if r.teammates > 0 {
+        writeln!(
+            out,
+            "{} teammate record(s) {verb} on this machine only; their server copies stay with \
+             their authors.",
+            r.teammates
+        )?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // forget
 
 pub fn run_forget(args: &Args, io: &mut Io<'_>) -> anyhow::Result<Outcome> {
@@ -441,10 +763,15 @@ pub fn run_forget(args: &Args, io: &mut Io<'_>) -> anyhow::Result<Outcome> {
     } else {
         let target = args.target.as_deref().unwrap_or_default();
         if target == "last" {
+            // Your newest record: a local capture or, in a team, a copy of a record of your
+            // other machine (plan-v3-team §3.5).
+            let own = team_member(&io.data_dir).unwrap_or_default();
             let rows = rows(
                 &conn,
-                "id = (SELECT id FROM event WHERE origin = 'local' ORDER BY created_at DESC, id DESC LIMIT 1)",
-                [],
+                "id = (SELECT id FROM event WHERE origin = 'local' \
+                         OR (origin = 'team' AND member = ?1) \
+                       ORDER BY created_at DESC, id DESC LIMIT 1)",
+                [own],
             )?;
             (rows, None, "awm forget last".to_string(), None)
         } else {
@@ -498,7 +825,11 @@ pub fn run_forget(args: &Args, io: &mut Io<'_>) -> anyhow::Result<Outcome> {
     if let Some(o) = confirm(io, args.yes, &question, &rerun)? {
         return Ok(o);
     }
-    let deleted = apply(&mut conn, &sel, io.now_ms)?;
+    let team = Team::join(&io.data_dir, false)?;
+    let mut deleted = apply(&mut conn, &sel, io.now_ms, team.as_ref(), &BTreeSet::new())?;
+    if let Some(t) = &team {
+        t.send(&conn, &mut deleted)?;
+    }
     finish_deletion(io, conn, deleted, again.as_deref())
 }
 
@@ -623,8 +954,16 @@ fn count(conn: &Connection, table: &str) -> anyhow::Result<usize> {
 }
 
 /// Steps 1-4 of §6.4 in one transaction. `forget <url>` and `purge --before`
-/// select again inside it ([`Selection::reselect`]).
-fn apply(conn: &mut Connection, sel: &Selection, now_ms: i64) -> anyhow::Result<Deleted> {
+/// select again inside it ([`Selection::reselect`]). In a team the remote side
+/// of every deleted or rewritten row is recorded in the same transaction
+/// ([`TeamSide`]); ids in `sent` were deleted on the server already (`purge`).
+fn apply(
+    conn: &mut Connection,
+    sel: &Selection,
+    now_ms: i64,
+    team: Option<&Team>,
+    sent: &BTreeSet<String>,
+) -> anyhow::Result<Deleted> {
     let mut d = Deleted::default();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let fresh = sel.reselect(&tx)?;
@@ -632,6 +971,10 @@ fn apply(conn: &mut Connection, sel: &Selection, now_ms: i64) -> anyhow::Result<
     let affected = match &sel.url {
         Some(u) => affected_events(&tx, u, &sel.event_ids)?,
         None => Affected::default(),
+    };
+    let side = match team {
+        Some(t) => Some(TeamSide::read(&tx, t, &sel.event_ids, &affected.all())?),
+        None => None,
     };
     let injections = injections_of(&tx, sel, &affected)?;
     let (results_before, injections_before) = (count(&tx, "result")?, count(&tx, "injection")?);
@@ -682,6 +1025,9 @@ fn apply(conn: &mut Connection, sel: &Selection, now_ms: i64) -> anyhow::Result<
             ins.execute(params!["url_hash", sha256_hex(&u.norm), now_ms])?;
             d.tombstoned_url = true;
         }
+    }
+    if let Some(side) = side {
+        side.write(&tx, now_ms, sent, &mut d)?;
     }
     d.results = results_before - count(&tx, "result")?;
     d.injections = injections_before - count(&tx, "injection")?;
@@ -866,6 +1212,9 @@ fn print_deleted(out: &mut dyn Write, d: &Deleted, again: Option<&str>) -> anyho
     if d.updated > 0 {
         writeln!(out, "Removed the URL from {} kept record(s).", d.updated)?;
     }
+    if let Some(r) = &d.remote {
+        print_remote(out, r, "deleted")?;
+    }
     writeln!(
         out,
         "Tombstoned {} tool_use id(s){}.",
@@ -918,7 +1267,12 @@ fn print_deleted(out: &mut dyn Write, d: &Deleted, again: Option<&str>) -> anyho
 
 pub fn run_purge_with(args: &PurgeArgs, io: &mut Io<'_>) -> anyhow::Result<Outcome> {
     if args.all {
-        return purge_all(io, args.yes, "awm purge --all").map(|(o, _)| o);
+        let (step, rerun) = if args.local_only {
+            (TeamStep::LocalOnly, "awm purge --all --local-only")
+        } else {
+            (TeamStep::Leave, "awm purge --all")
+        };
+        return purge_all_with(io, args.yes, rerun, step).map(|(o, _)| o);
     }
     let date = args.before.as_deref().unwrap_or_default();
     let before = parse_date(date)?;
@@ -951,11 +1305,38 @@ pub fn run_purge_with(args: &PurgeArgs, io: &mut Io<'_>) -> anyhow::Result<Outco
     )?;
     let question = format!("Delete {} record(s) permanently?", rows.len());
     // `date` passed `parse_date`, so it needs no quoting.
-    let rerun = format!("awm purge --before {date}");
+    let rerun = format!(
+        "awm purge --before {date}{}",
+        if args.local_only { " --local-only" } else { "" }
+    );
     if let Some(o) = confirm(io, args.yes, &question, &rerun)? {
         return Ok(o);
     }
-    let deleted = apply(&mut conn, &sel, io.now_ms)?;
+    let team = Team::join(&io.data_dir, args.local_only)?;
+    // Remote first (§3.6): the member's shared records in the range are deleted on the server
+    // before anything here; offline, nothing is deleted unless --local-only.
+    let mut sent = BTreeSet::new();
+    if let Some(t) = team.as_ref().filter(|t| !t.local_only) {
+        let own = TeamSide::read(&conn, t, &sel.event_ids, &BTreeSet::new())?.own_ids();
+        if !own.is_empty() {
+            if let Err(why) = t.delete_now(&own)? {
+                writeln!(
+                    io.out,
+                    "The server cannot be reached ({why}), and awm purge deletes your shared \
+                     records on the server first: nothing was deleted. To delete on this machine \
+                     only: awm purge --before {date} --local-only ({} shared record(s) would stay \
+                     on the server).",
+                    own.len()
+                )?;
+                return Ok(Outcome::Refused);
+            }
+            sent.extend(own);
+        }
+    }
+    let mut deleted = apply(&mut conn, &sel, io.now_ms, team.as_ref(), &sent)?;
+    if let Some(t) = &team {
+        t.send(&conn, &mut deleted)?;
+    }
     finish_deletion(io, conn, deleted, Some(&rerun))
 }
 
@@ -967,8 +1348,9 @@ pub struct DirSummary {
     pub records: Option<i64>,
 }
 
-/// File names in the data dir that awm creates (plan-v2 §5.7, §6.2); `spool/`
-/// and `config.toml` are checked by [`foreign_entries`].
+/// File names in the data dir that awm creates (plan-v2 §5.7, §6.2; the team
+/// files of plan-v3-team §4.7 and §4.4); `spool/` and `config.toml` are checked
+/// by [`foreign_entries`].
 fn ours(name: &str) -> bool {
     let db = paths::DB_FILE;
     name == db
@@ -977,6 +1359,10 @@ fn ours(name: &str) -> bool {
         || name == format!("{db}-journal")
         || name.starts_with(&format!("{db}.bak-v"))
         || name == ".DS_Store"
+        || name == crate::cli::where_::TEAM_TOML
+        || name == crate::cli::where_::TEAM_KEY
+        || name == crate::team::TEAM_REPO
+        || name == crate::sync::apply::SYNC_LOCK
 }
 
 /// Whether `path` reads as an awm configuration: TOML whose top-level keys
@@ -1116,10 +1502,82 @@ fn describe(s: &DirSummary) -> String {
 /// and the outcome is [`Outcome::Foreign`] (exit code 2). The check runs
 /// before the question and again after it.
 /// Returns `(Outcome::Nothing, None)` when the directory does not exist.
+/// `awm uninstall` calls this after its own team question; `awm purge --all`
+/// calls [`purge_all_with`], which leaves the team first.
 pub fn purge_all(
     io: &mut Io<'_>,
     yes: bool,
     rerun: &str,
+) -> anyhow::Result<(Outcome, Option<DirSummary>)> {
+    purge_all_with(io, yes, rerun, TeamStep::None)
+}
+
+/// What `purge --all` does about a team before it deletes the directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TeamStep {
+    /// Nothing (`awm uninstall` asked its own question).
+    None,
+    /// `awm team leave --delete` first (§3.6); its failure deletes nothing.
+    Leave,
+    /// `--local-only`: the shared records stay on the server, and the output says so.
+    LocalOnly,
+}
+
+/// Printed by `purge --all` after the remote deletion (`docs/sync-v1.md` §10.2, TM2).
+const ALL_MINE_GAP: &str = "Not covered: records that another of your devices captured \
+     earlier and pushes after this deletion (it was offline). Run awm purge or awm team \
+     delete-mine on that device too.";
+
+/// The team step of `purge --all`; `Some` ends the command with that outcome.
+fn team_step(io: &mut Io<'_>, dir: &Path, step: TeamStep) -> anyhow::Result<Option<Outcome>> {
+    if step == TeamStep::None || team_member(dir).is_none() {
+        return Ok(None);
+    }
+    if step == TeamStep::LocalOnly {
+        let member = team_member(dir).unwrap_or_default();
+        let kept = open_db(dir).map_or(0, |c| own_shared(&c, &member).unwrap_or(0));
+        writeln!(
+            io.out,
+            "--local-only: {kept} shared record(s) of yours stay on the server, and this \
+             device's token stays valid until an admin removes the device (awm team remove \
+             @HANDLE --delete-records also deletes the records)."
+        )?;
+        return Ok(None);
+    }
+    io.out.flush()?;
+    match leave_with_delete(dir) {
+        Ok(()) => {
+            writeln!(io.out, "{ALL_MINE_GAP}")?;
+            Ok(None)
+        }
+        Err(e) => {
+            writeln!(
+                io.out,
+                "awm team leave --delete did not finish ({e}): nothing was deleted on this \
+                 machine. Run awm purge --all again later, or awm purge --all --local-only to \
+                 delete only this machine's data."
+            )?;
+            Ok(Some(Outcome::Refused))
+        }
+    }
+}
+
+#[cfg(feature = "sync")]
+fn leave_with_delete(dir: &Path) -> anyhow::Result<()> {
+    crate::cli::team::leave_delete(dir)
+}
+
+#[cfg(not(feature = "sync"))]
+fn leave_with_delete(_dir: &Path) -> anyhow::Result<()> {
+    bail!("this awm was built without team sync, so it cannot delete your shared records")
+}
+
+/// `purge --all` with the team step of `step` between the question and the deletion.
+fn purge_all_with(
+    io: &mut Io<'_>,
+    yes: bool,
+    rerun: &str,
+    step: TeamStep,
 ) -> anyhow::Result<(Outcome, Option<DirSummary>)> {
     let dir = io.data_dir.clone();
     if !dir.is_dir() {
@@ -1151,6 +1609,16 @@ pub fn purge_all(
     let foreign = foreign_entries(&dir)?;
     if !foreign.is_empty() {
         return Ok((refuse_foreign(io, &dir, &foreign)?, Some(summary)));
+    }
+    if let Some(o) = team_step(io, &dir, step)? {
+        return Ok((o, Some(summary)));
+    }
+    if step != TeamStep::None {
+        // Leaving wrote and removed files; check once more before deleting everything.
+        let foreign = foreign_entries(&dir)?;
+        if !foreign.is_empty() {
+            return Ok((refuse_foreign(io, &dir, &foreign)?, Some(summary)));
+        }
     }
     // Only awm's entries are left: files and symlinks (removed as links, never
     // followed), a real `spool/` holding only `*.json` files and a real
@@ -1227,7 +1695,7 @@ pub fn run_quarantine_with(
     on: bool,
     io: &mut Io<'_>,
 ) -> anyhow::Result<Outcome> {
-    let conn = open_db(&io.data_dir)?;
+    let mut conn = open_db(&io.data_dir)?;
     let target = args.target.trim();
     let flag = if on { 0 } else { 1 };
     let rows = if let Ok(id) = target.parse::<i64>() {
@@ -1268,8 +1736,21 @@ pub fn run_quarantine_with(
     if let Some(o) = confirm(io, args.yes, &question, &rerun)? {
         return Ok(o);
     }
+    let mut d = Deleted::default();
     let n = if on {
-        quarantine_events(&conn, &ids, "awm quarantine")?
+        // In a team a quarantined shared record of yours is deleted on the server too (§4.9).
+        let team = Team::join(&io.data_dir, false)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let n = quarantine_events(&tx, &ids, "awm quarantine")?;
+        if let Some(t) = &team {
+            TeamSide::read(&tx, t, &ids, &BTreeSet::new())?
+                .write_quarantine(&tx, io.now_ms, &mut d)?;
+        }
+        tx.commit()?;
+        if let Some(t) = &team {
+            t.send(&conn, &mut d)?;
+        }
+        n
     } else {
         unquarantine_events(&conn, &ids)?
     };
@@ -1282,6 +1763,9 @@ pub fn run_quarantine_with(
             "Lifted the quarantine on"
         }
     )?;
+    if let Some(r) = &d.remote {
+        print_remote(io.out, r, "quarantined")?;
+    }
     Ok(Outcome::Done)
 }
 

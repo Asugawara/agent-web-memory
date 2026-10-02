@@ -207,21 +207,16 @@ fn admin_steps(s: &mut Session<'_>, status: &StatusResponse) -> Result<()> {
 
 /// Step 3: `POST /v1/delete` for the `team:` tombstones of the last `retention_days` + 30 days.
 /// A member may delete only their own records, so a member sends the ids of records they
-/// pushed; an admin sends all of them. A refused batch is not an error.
+/// pushed or deleted from another of their machines; an admin sends all of them except
+/// teammates' records deleted on this machine only (`apply::resend_ids`, TM11). A refused
+/// batch is not an error.
 fn resend_tombstones(s: &mut Session<'_>, status: &StatusResponse) -> Result<()> {
     let cutoff = s.now_ms() - (i64::from(status.settings.retention_days) + 30) * 86_400_000;
     let admin = roster::own_member_is_admin(&s.roster, &s.ident);
-    let mut st = s.conn.prepare(
-        "SELECT substr(value, 6) FROM tombstone \
-         WHERE kind = 'tool_use_id' AND value LIKE 'team:%' AND created_at >= ?1 \
-           AND (?2 = 1 OR substr(value, 6) IN (SELECT record_id FROM sync_own))",
-    )?;
-    let ids: Vec<Id> = st
-        .query_map(params![cutoff, i64::from(admin)], |r| r.get::<_, String>(0))?
-        .filter_map(|r| r.ok())
-        .filter_map(|v| Id::parse(&v).ok())
+    let ids: Vec<Id> = crate::sync::apply::resend_ids(&s.conn, cutoff, admin)?
+        .iter()
+        .filter_map(|v| Id::parse(v).ok())
         .collect();
-    drop(st);
     for chunk in ids.chunks(awm_proto::wire::limits::DELETE_IDS) {
         match s.client.delete(&DeleteRequest::Ids(chunk.to_vec())) {
             Ok(_) => {}

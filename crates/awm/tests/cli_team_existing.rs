@@ -1080,15 +1080,17 @@ fn uninstall_offers_team_leave_first_and_shows_the_prompt() {
     );
     assert!(text.contains("Nothing changed."), "{text}");
     assert!(env.awm_home().join("team.toml").exists());
-    // `--yes` still prints the offer, then goes on. (Whether the purge then removes `team.toml`
-    // and `team.key` is TM11's `forget::ours()`: today it refuses them as foreign entries.)
-    let (_, text) = run(false, "", true);
-    assert!(text.contains("This machine is in a team."), "{text}");
     // Without a terminal and without --yes nothing is asked and nothing changes.
     let (outcome, text) = run(false, "", false);
     assert_ne!(outcome, Outcome::Done, "{text}");
     assert!(text.starts_with("This machine is in a team."), "{text}");
     assert!(env.awm_home().join("awm.db").exists());
+    // `--yes` still prints the offer, then goes on: `forget::ours()` knows the team files
+    // (TM11), so the directory is deleted with them.
+    let (outcome, text) = run(false, "", true);
+    assert!(text.contains("This machine is in a team."), "{text}");
+    assert_eq!(outcome, Outcome::Done, "{text}");
+    assert!(!env.awm_home().exists(), "{text}");
 }
 
 #[test]

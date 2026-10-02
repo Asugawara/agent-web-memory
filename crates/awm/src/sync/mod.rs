@@ -131,6 +131,9 @@ mod engine {
         pub skipped: BTreeMap<String, u64>,
         /// Milliseconds of every pull write transaction.
         pub apply_ms: Vec<u64>,
+        /// Rows of every transaction that applied deletion entries or dropped team rows
+        /// (retention, reconcile): at most `apply::CHUNK_ROWS` each (TM11).
+        pub delete_tx_rows: Vec<usize>,
         pub pull_ms: u64,
     }
 
@@ -393,8 +396,12 @@ mod engine {
             s.report.reconciled = true;
             pull::run(s)?;
         }
-        pull::prune_retention(s)?;
+        let expired = pull::prune_retention(s)?;
+        // Backups at schema 3+ go after a remote deletion; FTS optimize at most once a day (TM11).
+        let deleted = s.report.deletions_applied + expired + usize::from(s.report.reconciled);
+        let days = s.status.as_ref().map(|st| st.settings.retention_days);
         let now = s.now_ms();
+        crate::sync::apply::after_deletions(&s.conn, &s.env.data_dir, deleted, days, now)?;
         s.roster = roster::verify_and_store(&s.conn, &s.ring, now)?.0;
 
         let decide: ApproveFn = s.opts.approve.unwrap_or(crate::team::auto_approve);

@@ -28,7 +28,7 @@ use crate::sync::payload::{
     MAX_URL_CHARS,
 };
 use crate::sync::state;
-use crate::sync::{push, roster, Session};
+use crate::sync::{apply, push, roster, Session};
 
 /// Rows per write transaction (plan-v3-team §4.6 step 6).
 pub const CHUNK_ROWS: usize = 25;
@@ -741,8 +741,9 @@ pub fn run(s: &mut Session<'_>) -> Result<usize> {
 /// team row goes. A full reconcile (the entries the client has not seen are gone from the
 /// server) drops every team row and re-pulls every stream, at most once in 24 hours.
 ///
-/// Entries that name this member's own `origin = 'local'` rows are left alone and counted
-/// (`dropped.own_deleted`); TM11 decides (sync-v1 §5.2 row (e)).
+/// The entries are applied by `apply::deletions` in transactions of at most `apply::CHUNK_ROWS`
+/// (TM11): entries that name this device's own `origin = 'local'` rows keep the row, never
+/// shared again, and are counted (`dropped.own_deleted`; sync-v1 §5.2).
 pub fn apply_deletions(s: &mut Session<'_>) -> Result<usize> {
     let Some(status) = s.status.clone() else {
         return Ok(0);
@@ -764,29 +765,27 @@ pub fn apply_deletions(s: &mut Session<'_>) -> Result<usize> {
         if page.entries.is_empty() {
             break;
         }
-        for chunk in page.entries.chunks(CHUNK_ROWS) {
+        let chunks = page.entries.chunks(apply::CHUNK_ROWS);
+        let last = chunks.len();
+        for (n, chunk) in chunks.enumerate() {
             let tx = s
                 .conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let ids: Vec<String> = chunk.iter().map(|e| e.record_id.to_string()).collect();
+            let a = apply::deletions(&tx, &ids, now)?;
+            if a.own_kept > 0 {
+                state::bump(&tx, "dropped.own_deleted", a.own_kept as i64)?;
+            }
+            applied += a.team_rows;
             for e in chunk {
-                let id = e.record_id.to_string();
-                let own: bool = tx
-                    .query_row(
-                        "SELECT 1 FROM event WHERE sync_id = ?1 AND origin = 'local'",
-                        [&id],
-                        |_| Ok(()),
-                    )
-                    .is_ok();
-                if own {
-                    state::bump(&tx, "dropped.own_deleted", 1)?;
-                } else {
-                    // The tombstone is written whether or not the row exists (sync-v1 §8.5).
-                    applied += forget_team_record(&tx, &id, now)?;
-                }
                 head = head.max(e.idx as i64);
             }
             state::set(&tx, state::DELETION_HEAD, &head.to_string())?;
             tx.commit()?;
+            s.report.delete_tx_rows.push(chunk.len());
+            if n + 1 < last {
+                std::thread::sleep(Duration::from_millis(15));
+            }
         }
         if page.entries.len() < 5_000 {
             break;
@@ -799,20 +798,7 @@ pub fn apply_deletions(s: &mut Session<'_>) -> Result<usize> {
 /// Drops every team row in 25-row transactions and sets every other device's stream heads back
 /// to -1, so the next pull reads them again from 0.
 fn reconcile(s: &mut Session<'_>) -> Result<()> {
-    loop {
-        let tx = s
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let n = tx.execute(
-            "DELETE FROM event WHERE id IN (SELECT id FROM event WHERE origin = 'team' LIMIT 25)",
-            [],
-        )?;
-        tx.commit()?;
-        if n == 0 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(15));
-    }
+    apply::drop_team_rows(&mut s.conn, None, &mut s.report.delete_tx_rows)?;
     s.conn.execute(
         "UPDATE sync_stream SET head_idx = -1 WHERE device_id <> ?1 AND tag <> 'roster'",
         [s.ident.team.device_id.to_string()],
@@ -821,16 +807,14 @@ fn reconcile(s: &mut Session<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Removes teammates' rows older than the organisation's `retention_days` (plan-v3-team §3.7).
+/// Removes teammates' rows older than the organisation's `retention_days` (plan-v3-team §3.7),
+/// in transactions of at most `apply::CHUNK_ROWS` rows (TM11).
 pub fn prune_retention(s: &mut Session<'_>) -> Result<usize> {
     let Some(status) = s.status.as_ref() else {
         return Ok(0);
     };
     let cutoff = s.now_ms() - i64::from(status.settings.retention_days) * 86_400_000;
-    Ok(s.conn.execute(
-        "DELETE FROM event WHERE origin = 'team' AND created_at < ?1",
-        [cutoff],
-    )?)
+    apply::drop_team_rows(&mut s.conn, Some(cutoff), &mut s.report.delete_tx_rows)
 }
 
 /// A count of teammates' rows by author, for the report and the tests.

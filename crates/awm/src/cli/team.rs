@@ -219,6 +219,12 @@ pub fn status_report(dir: &std::path::Path) -> anyhow::Result<serde_json::Value>
     imp::status_value(dir)
 }
 
+/// `awm team leave --delete` on `dir`, the first step of `awm purge --all` (TM11, §3.6).
+#[cfg(feature = "sync")]
+pub fn leave_delete(dir: &std::path::Path) -> anyhow::Result<()> {
+    imp::leave_delete(dir)
+}
+
 #[cfg(feature = "sync")]
 mod imp {
     use std::collections::{BTreeMap, BTreeSet};
@@ -423,6 +429,15 @@ mod imp {
     ) -> Result<R> {
         let _ = ready(ctx)?;
         let _lock = lock(ctx.dir())?;
+        with_session_held(ctx, fresh, f)
+    }
+
+    /// [`with_session`] for a caller that already holds `sync.lock` (TM11: `leave`).
+    fn with_session_held<R>(
+        ctx: &Ctx,
+        fresh: bool,
+        f: impl FnOnce(&mut Session<'_>) -> Result<R>,
+    ) -> Result<R> {
         let ident = Identity::load(ctx.dir())?;
         let conn = open_db(ctx.dir(), DbRole::Sync)?;
         let ring = ident.ring()?;
@@ -1293,18 +1308,7 @@ mod imp {
             let now = now_ms();
             let tx = s.conn.transaction()?;
             for id in ids {
-                tx.execute(
-                    "UPDATE sync_own SET deleted = 1, blob = NULL, epoch = NULL WHERE record_id = ?1",
-                    [id],
-                )?;
-                tx.execute(
-                    "INSERT OR IGNORE INTO tombstone (kind, value, created_at) VALUES ('tool_use_id', ?1, ?2)",
-                    params![format!("team:{id}"), now],
-                )?;
-                tx.execute(
-                    "INSERT INTO sync_outbox (kind, ref, created_at) VALUES ('delete', ?1, ?2)",
-                    params![id, now],
-                )?;
+                sync::apply::own_deletion(&tx, id, now, true)?;
                 if never {
                     tx.execute(
                         "UPDATE event SET shareable = 'never' WHERE sync_id = ?1 AND origin = 'local'",
@@ -1778,6 +1782,9 @@ mod imp {
         if !state::configured(dir) {
             bail!(NOT_IN_TEAM);
         }
+        // sync.lock for the whole command (§3.6), so no run pushes between the deletion and the
+        // token revocation (TM11).
+        let _lock = lock(dir)?;
         let ident = Identity::load(dir)?;
         let client = client_of(&ident)?;
         if delete {
@@ -1792,14 +1799,16 @@ mod imp {
                      changed. Leave without --delete and ask an admin to delete your records"
                 ),
                 Err(e) if e.status() == Some(429) => bail!(
-                    "the server allows one bulk deletion an hour: try again later (nothing was changed)"
+                    "the server allows one bulk deletion an hour: try again in {} min (nothing \
+                     was changed)",
+                    e.retry_after().unwrap_or(3_600).div_ceil(60)
                 ),
                 Err(e) => bail!("the server refused the deletion ({e}): nothing was changed"),
             }
         }
         // The roster revocation of this device goes out while its token still works.
         if !ident.key.epoch_keys.is_empty() {
-            let queued = with_session(ctx, false, |s| {
+            let queued = with_session_held(ctx, false, |s| {
                 let now = now_ms();
                 push::queue_roster_entry(
                     &mut s.conn,
@@ -1819,7 +1828,6 @@ mod imp {
                 eprintln!("awm: the roster could not be told that this device left");
             }
         }
-        let _lock = lock(dir)?;
         match client.revoke_device(ident.team.device_id) {
             Ok(()) => println!("this device's token is revoked"),
             Err(e) => eprintln!(
@@ -1830,6 +1838,18 @@ mod imp {
         wipe_local(dir)?;
         println!("left the organisation; teammates' records and the team keys are gone from this machine");
         Ok(())
+    }
+
+    pub fn leave_delete(dir: &Path) -> Result<()> {
+        let config = crate::config::load(&dir.join(paths::CONFIG_FILE))?;
+        let ctx = Ctx {
+            env: Env {
+                data_dir: dir.to_path_buf(),
+                config,
+                now_ms: None,
+            },
+        };
+        leave(&ctx, true)
     }
 
     fn delete_mine(ctx: &Ctx) -> Result<()> {
