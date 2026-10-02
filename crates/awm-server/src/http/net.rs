@@ -97,6 +97,17 @@ pub fn client_ip(peer: IpAddr, forwarded_for: Option<&str>, trusted: &[IpNet]) -
     leftmost.unwrap_or(peer)
 }
 
+/// The `--trusted-proxy cloud-run` preset (plan-v3-team §4.8.1): the container is reachable only
+/// through Google's front end, which appends the address it saw as the last `X-Forwarded-For`
+/// entry, so that entry is the client and anything to its left is client-supplied. A missing
+/// header or an unparsable last entry leaves the socket's peer.
+pub fn last_forwarded_entry(peer: IpAddr, forwarded_for: Option<&str>) -> IpAddr {
+    forwarded_for
+        .and_then(|h| h.rsplit(',').next())
+        .and_then(|e| e.trim().parse::<IpAddr>().ok())
+        .unwrap_or(peer)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

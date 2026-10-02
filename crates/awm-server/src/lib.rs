@@ -13,6 +13,7 @@ pub mod delete;
 pub mod http;
 pub mod limits;
 pub mod retention;
+#[cfg(feature = "sqlite")]
+pub mod serve;
 pub mod store;
-#[cfg(feature = "acme")]
 pub mod tls;

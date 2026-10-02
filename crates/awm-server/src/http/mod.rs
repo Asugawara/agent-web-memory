@@ -40,7 +40,7 @@ mod records;
 
 pub use ctx::{Cx, LogCell};
 pub use error::{parse_json, ApiError};
-pub use net::{client_ip, IpNet};
+pub use net::{client_ip, last_forwarded_entry, IpNet};
 
 // ---------------------------------------------------------------------------------------------
 // State
@@ -92,6 +92,9 @@ pub struct ServerConfig {
     pub org_defaults: OrgDefaults,
     /// Proxies whose `X-Forwarded-For` is believed (`server.toml` `trusted_proxies`).
     pub trusted_proxies: Vec<IpNet>,
+    /// `--trusted-proxy cloud-run`: the client is the last `X-Forwarded-For` entry, whoever the
+    /// peer is ([`net::last_forwarded_entry`]).
+    pub forwarded_last_entry: bool,
     /// `Strict-Transport-Security` on every response, when this binary or the cloud terminates TLS.
     pub hsts: bool,
     /// Where `GET /v1/export` writes its temporary file.
@@ -103,6 +106,8 @@ pub struct ServerConfig {
     /// `Retry-After` of a 503 `restore_pending`, in seconds.
     pub restore_retry_after_s: u32,
     pub limits: Limits,
+    /// A request that takes longer is answered 408 (plan-v3-team §5.2: "tower timeouts").
+    pub request_timeout: Duration,
 }
 
 impl ServerConfig {
@@ -118,12 +123,14 @@ impl ServerConfig {
             release_floor,
             cloud: false,
             trusted_proxies: Vec::new(),
+            forwarded_last_entry: false,
             hsts: false,
             export_dir: std::env::temp_dir(),
             retention: RetentionMode::Off,
             internal_token_hash: None,
             restore_retry_after_s: 60,
             limits,
+            request_timeout: REQUEST_TIMEOUT,
         }
     }
 }
@@ -263,6 +270,15 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/export", get(export))
         .fallback(not_found)
         .method_not_allowed_fallback(not_found)
+        .layer(
+            tower::ServiceBuilder::new()
+                .layer(axum::error_handling::HandleErrorLayer::new(
+                    |_: tower::BoxError| async { StatusCode::REQUEST_TIMEOUT },
+                ))
+                .layer(tower::timeout::TimeoutLayer::new(
+                    state.config.request_timeout,
+                )),
+        )
         .layer(axum::middleware::from_fn_with_state(state.clone(), observe))
         .with_state(state)
 }
@@ -326,6 +342,9 @@ async fn observe(
 
 // ---------------------------------------------------------------------------------------------
 // Serving
+
+/// The default [`ServerConfig::request_timeout`].
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long [`serve`] lets in-flight requests finish after the shutdown signal.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
