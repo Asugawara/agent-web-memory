@@ -16,7 +16,7 @@ use super::{json, reply, AppState};
 use crate::authz::{self, Action};
 use crate::delete;
 use crate::quota::{self, Quota};
-use crate::store::PushBatch;
+use crate::store::{AuditEntry, PushBatch};
 
 /// Indexes stay below 2^53 (`docs/sync-v1.md` §1).
 const MAX_IDX: u64 = 1 << 53;
@@ -101,6 +101,17 @@ async fn push_inner(app: &AppState, req: Request) -> Result<Response, ApiError> 
         }
     }
 
+    // The stream indexes of the batch's policy items (the version is inside the ciphertext, so
+    // the audit row carries the position only, `docs/plan-v3-team.md` §5.5).
+    let policy_idx = items
+        .iter()
+        .filter(|i| i.tag().known() == Some(KnownTag::Policy))
+        .map(PushItem::idx)
+        .fold(None, |r: Option<(u64, u64)>, i| match r {
+            None => Some((i, i)),
+            Some((a, b)) => Some((a.min(i), b.max(i))),
+        });
+
     // Steps 5 and 6.
     let resp = app
         .store
@@ -111,6 +122,17 @@ async fn push_inner(app: &AppState, req: Request) -> Result<Response, ApiError> 
             now: cx.now,
         })
         .await?;
+    if let (Some((a, b)), true) = (policy_idx, resp.accepted > 0) {
+        app.store
+            .append_audit(AuditEntry {
+                at: cx.now,
+                actor: Some(actor.member_id),
+                action: "push.policy".into(),
+                target: Some(actor.device_id.to_string()),
+                detail: Some(format!("idx {a}..{b}")),
+            })
+            .await?;
+    }
     json(&resp)
 }
 

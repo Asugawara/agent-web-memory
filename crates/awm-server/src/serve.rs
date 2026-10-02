@@ -281,20 +281,35 @@ fn create_new_private_dir(dir: &Path) -> Result<(), StartError> {
 }
 
 /// Takes `{data}/server.lock` for a server's lifetime: exit 2 while another server or a restore
-/// holds it.
-fn lock_data(data: &Path) -> Result<DataLock, StartError> {
-    lockfile::try_lock(data).map_err(|e| match e {
-        LockError::Held(p) => start_err(
-            2,
-            format!(
-                "{} is held: another awm serve or a restore uses {}; stop it first",
-                p.display(),
-                data.display()
-            ),
-        ),
-        LockError::Io(m) => start_err(1, m),
-    })
+/// holds it for longer than a second. A start that races a short-lived holder (a forked child
+/// that inherited the descriptor before `exec`, a `stop` whose lock drop is still in flight)
+/// retries 10 times, 100 ms apart; `restore` does not (a running server must not be raced).
+async fn lock_data(data: &Path) -> Result<DataLock, StartError> {
+    let mut tries = 0;
+    loop {
+        match lockfile::try_lock(data) {
+            Ok(l) => return Ok(l),
+            Err(LockError::Held(_)) if tries < LOCK_RETRIES => {
+                tries += 1;
+                tokio::time::sleep(LOCK_RETRY_WAIT).await;
+            }
+            Err(LockError::Held(p)) => {
+                return Err(start_err(
+                    2,
+                    format!(
+                        "{} is held: another awm serve or a restore uses {}; stop it first",
+                        p.display(),
+                        data.display()
+                    ),
+                ))
+            }
+            Err(LockError::Io(m)) => return Err(start_err(1, m)),
+        }
+    }
 }
+
+const LOCK_RETRIES: u32 = 10;
+const LOCK_RETRY_WAIT: Duration = Duration::from_millis(100);
 
 /// Installs `AWM_BOOTSTRAP_SHA256` / `AWM_BOOTSTRAP_EXPIRES` (path A) while no admin exists.
 async fn install_bootstrap_env(
@@ -339,13 +354,13 @@ pub async fn start(r: &Resolved, s: &Settings) -> Result<Server, StartError> {
     // taken before the store opens (a migration writes), or right after it created a new
     // directory, which no other process can hold yet.
     let early = match r.data_dir() {
-        Some(d) if d.is_dir() => Some(lock_data(d)?),
+        Some(d) if d.is_dir() => Some(lock_data(d).await?),
         _ => None,
     };
     let store = open_store(r).await?;
     let lock = match (early, r.data_dir()) {
         (Some(l), _) => Some(l),
-        (None, Some(d)) => Some(lock_data(d)?),
+        (None, Some(d)) => Some(lock_data(d).await?),
         (None, None) => {
             s.log(
                 "PgStore: no server.lock (a restore into PgStore refuses a database that holds \

@@ -1492,6 +1492,61 @@ async fn permissions_come_from_authz_through_every_endpoint() {
 }
 
 #[tokio::test]
+async fn a_policy_push_is_audited_once_with_its_index_range_and_nothing_else_is() {
+    // Plan §5.5: the audit table records policy pushes (the version is inside the ciphertext).
+    let srv = Srv::new();
+    let admin = srv.bootstrap().await;
+    let roy = srv.add_member(&admin, "roy", "member").await;
+    let count = |action: &'static str| {
+        let store = srv.store.clone();
+        async move {
+            store
+                .audit(0, 100_000)
+                .await
+                .unwrap()
+                .rows
+                .into_iter()
+                .filter(|r| r.action == action)
+                .collect::<Vec<_>>()
+        }
+    };
+    // A `rec` push adds no row.
+    assert_eq!(
+        srv.push(&admin, vec![item("rec", 0, Id::new_v4(), 0, SMALL, 1)])
+            .await
+            .status,
+        200
+    );
+    assert!(count("push.policy").await.is_empty());
+    // A refused policy push adds only the refusal row.
+    let refused_before = srv.refusals_of(&roy).await;
+    srv.push(&roy, vec![item("policy", 0, Id::new_v4(), 0, SMALL, 5)])
+        .await
+        .expect_err(403, ErrorCode::Forbidden);
+    assert!(count("push.policy").await.is_empty());
+    assert_eq!(srv.refusals_of(&roy).await, refused_before + 1);
+    // An admin's policy push adds exactly one row, with the stored index range and no content.
+    assert_eq!(
+        srv.push(
+            &admin,
+            vec![
+                item("policy", 0, Id::new_v4(), 0, SMALL, 5),
+                item("policy", 1, Id::new_v4(), 0, SMALL, 6),
+                item("rec", 1, Id::new_v4(), 0, SMALL, 7),
+            ],
+        )
+        .await
+        .status,
+        200
+    );
+    let rows = count("push.policy").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].actor, Some(admin.member));
+    assert_eq!(rows[0].target.as_deref(), Some(&*admin.device.to_string()));
+    assert_eq!(rows[0].detail.as_deref(), Some("idx 0..1"));
+}
+
+#[tokio::test]
 async fn an_authenticated_request_records_the_day_the_device_was_seen() {
     let srv = Srv::new();
     let admin = srv.bootstrap().await;
@@ -2050,6 +2105,26 @@ async fn unauthenticated_requests_are_30_a_minute_per_address_and_joins_10_an_ho
             .status,
         200
     );
+    // 30 valid-token requests refund their charge, so a team behind one address keeps its
+    // anonymous budget: a tokenless request is 200 and a mistyped token is 401, not 429.
+    for i in 0..30 {
+        assert_eq!(
+            srv.send(R::get("/v1/status").auth(&admin).from("203.0.113.5"))
+                .await
+                .status,
+            200,
+            "{i}"
+        );
+    }
+    assert_eq!(
+        srv.send(R::get("/v1/info").no_client().from("203.0.113.5"))
+            .await
+            .status,
+        200
+    );
+    srv.send(R::get("/v1/status").bearer("awm_t_x").from("203.0.113.5"))
+        .await
+        .expect_err(401, ErrorCode::Unauthenticated);
     // A minute later the address has its 30 again.
     srv.advance(60);
     assert_eq!(

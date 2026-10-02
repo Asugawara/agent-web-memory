@@ -319,7 +319,7 @@ On Postgres (path A) the lines `files` and the integrity pragma are skipped, ope
 | a lost bootstrap token, no admin yet | `awm serve init` again; it replaces the unused one |
 | the admin account is lost | `awm serve promote HANDLE` on the server (a recovery path, run on the host: `sudo -u awm awm serve promote HANDLE --data /var/lib/awm`, `docker compose exec awm awm serve promote HANDLE`); clients then need `awm team members --trust-admin @HANDLE` |
 | the TLS certificate | automatic; nothing to do. To force a re-issue, stop the server and delete `{data}/acme/cert.pem`, mind the rate limit. |
-| the retention period | `awm team policy set retention_days=N` (a server setting) |
+| the retention period | `awm team policy set retention_days=N` (a server setting; at least 30, and a `retention_days` below 30 in `server.toml` is refused at start with exit 2) |
 | the backup target changes | change `AWM_BACKUP`, restart. A new prefix starts with a full snapshot. Do not point two servers at one prefix. |
 
 ## Identity-Aware Proxy: a later option

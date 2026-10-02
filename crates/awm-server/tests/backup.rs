@@ -1618,6 +1618,103 @@ async fn retention_leaves_foreign_objects_and_keeps_the_newest_snapshot() {
     }
 }
 
+/// §6.2 and §13 TM27: retention runs over the whole generation lineage, read from the store's
+/// `meta` by the server itself. A restored server (new generation, the old one in
+/// `backup_lineage`) prunes its predecessor's objects once they are older than the oldest kept
+/// full snapshot, and a blob deleted before the restore is in no object after 8 days.
+#[tokio::test]
+async fn a_restored_server_prunes_its_predecessors_generation() {
+    let root = TempDir::new("lineage");
+    for (name, bucket) in buckets(root.path()) {
+        let (s, org) = server(root.path(), &format!("live-{name}"), &bucket).await;
+        let a = org.admin;
+        let gone = push_n(&*s.store, &a, 1).await[0];
+        push_n(&*s.store, &a, 1).await;
+        let old = full_of(&s.backup.tick().await.unwrap().step).generation;
+        s.store
+            .delete(DeleteRequest::Ids(vec![gone]), a, T0 + 7_300)
+            .await
+            .unwrap();
+        s.store.checkpoint().await.unwrap();
+        s.clock.advance(60);
+        incr(&s.backup.tick().await.unwrap().step);
+        let needle = blob(&gone.to_string(), 1).0[1..49].to_vec();
+        let old_prefix = format!("/{old}/");
+        let holding = |objects: &[(String, Vec<u8>)]| -> Vec<String> {
+            objects
+                .iter()
+                .filter(|(_, b)| contains(b, &needle))
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+        let objects_of = || async {
+            let mut v = Vec::new();
+            for key in all_keys(&*bucket).await {
+                let bytes = bucket.get(key.clone()).await.unwrap().unwrap();
+                v.push((key, bytes));
+            }
+            v
+        };
+        let before = objects_of().await;
+        assert!(
+            holding(&before).iter().all(|k| k.contains(&old_prefix))
+                && !holding(&before).is_empty(),
+            "the deleted blob is in the old generation's start snapshot"
+        );
+
+        // Restore into a new directory: a new generation, the old one in the lineage.
+        let restored_dir = root.path().join(format!("restored-{name}"));
+        restore_to(&bucket, &restored_dir, None, false, s.clock.now())
+            .await
+            .unwrap();
+        let r: Arc<dyn Store> = Arc::new(SqliteStore::open(&restored_dir).unwrap());
+        let new = r.restore_state().await.unwrap().generation;
+        assert_ne!(new, old);
+        let rb = runner(&r, &bucket, &s.clock, &restored_dir, None);
+        s.clock.advance(60);
+        let up = full_of(&rb.tick().await.unwrap().step).clone();
+        assert_eq!((up.origin, up.generation), (Origin::Restore, new));
+
+        // The restored server runs for more than a week: daily snapshots, retention after each.
+        let mut deleted_old = 0;
+        for _ in 0..8 {
+            s.clock.advance(DAY);
+            push_n(&*r, &a, 1).await;
+            let t = rb.tick().await.unwrap();
+            assert_eq!(full_of(&t.step).origin, Origin::Daily);
+            deleted_old += t
+                .retention
+                .unwrap()
+                .deleted
+                .iter()
+                .filter(|k| k.contains(&old_prefix))
+                .count();
+        }
+        let after = objects_of().await;
+        let left: Vec<&String> = after
+            .iter()
+            .map(|(k, _)| k)
+            .filter(|k| k.contains(&old_prefix))
+            .collect();
+        assert!(
+            left.is_empty(),
+            "{name}: the predecessor's objects are older than the oldest kept full: {left:?}"
+        );
+        assert!(
+            deleted_old > 0,
+            "{name}: this server's retention deleted them"
+        );
+        let hits = holding(&after);
+        assert!(hits.is_empty(), "{name}: deleted bytes in {hits:?}");
+        // What remains restores to the live database.
+        let dir = root.path().join(format!("after-{name}"));
+        let rr = restore_to(&bucket, &dir, None, false, s.clock.now())
+            .await
+            .unwrap();
+        assert_eq!(rr.digest, Some(r.dump().await.unwrap().digest()));
+    }
+}
+
 /// `PgStore`'s daily canonical export (run here over a `SqliteStore` behind `dyn Store`), and
 /// over `PgStore` itself when `AWM_TEST_PG_URL` is set.
 #[tokio::test]

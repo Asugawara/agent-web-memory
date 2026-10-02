@@ -340,6 +340,7 @@ All sizes are bytes. Body limits are measured on the encoded JSON body as receiv
 | requests per token | 60 per minute, burst 120 | 429 |
 | `delete` by `all_mine` or `member` | 1 per hour per token, audited | 429 |
 | unauthenticated requests per IP (an IPv6 address counts as its /64) | 30 per minute, failed tokens included; joins 10 per hour | 429 |
+| request duration | ≤ 30 s from the first byte to the response; a slower request gets a bodyless answer (§13) | 408 |
 | `Awm-Client` | ≤ 256 | 400 `bad_client_header` |
 | handle | 1-24 characters of `[a-z0-9_-]` | 400 `invalid_value` |
 | members per organisation | `max_members` (self-hosted default 100; cloud by plan) | 403 `forbidden`; cloud 402 |
@@ -364,6 +365,7 @@ Every non-2xx response has the body `{"error": code, "message": text, ...}` (`er
 | 403 | `forbidden` | | role or stream not allowed; also `max_members` reached |
 | 403 | `not_approved` | | wait for approval |
 | 404 | `not_found` | | |
+| 408 | (no body) | | no body; the request took longer than 30 s; retry |
 | 409 | `stream_conflict` | `item`, `head` | §9.3 |
 | 409 | `id_conflict` | `item` | take a new record id for that item and retry (a fresh UUIDv4 collides only through a bug or a pre-deletion by another member) |
 | 409 | `stale_epoch` | `item`, `current_epoch` | re-encrypt under the current epoch (§9.3) |
