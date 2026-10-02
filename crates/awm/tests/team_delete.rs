@@ -119,10 +119,19 @@ impl Srv {
         }
     }
 
-    /// Starts the stopped server again on the same address, with a daily record quota.
+    /// Starts the stopped server again on the same address, with a daily record quota. The
+    /// address can stay busy for a moment after `stop()` under load, so binding is retried up
+    /// to 20 times, 100 ms apart.
     fn resume_with(&mut self, quota: u32) {
-        let emb =
-            embedded::spawn_on(self.addr, Srv::state(&self.store, &self.logs, quota)).unwrap();
+        let mut attempt = 0;
+        let emb = loop {
+            attempt += 1;
+            match embedded::spawn_on(self.addr, Srv::state(&self.store, &self.logs, quota)) {
+                Ok(emb) => break emb,
+                Err(e) if attempt >= 20 => panic!("cannot bind {} again: {e}", self.addr),
+                Err(_) => std::thread::sleep(Duration::from_millis(100)),
+            }
+        };
         self.emb = Some(emb);
     }
 
