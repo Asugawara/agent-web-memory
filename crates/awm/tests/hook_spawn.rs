@@ -258,9 +258,59 @@ fn rust_files(path: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// An allow-list (RVT3 F16): in the hook-side sources the only `sync::` path is the detached
-/// spawn (`sync::spawn::maybe_spawn` and `sync::spawn` module paths). The sync engine, the team
-/// code, the CLI and the HTTP client are out of reach.
+/// What in `text` reaches past `sync::spawn` (RVT3 F16, RVT3v V4; `scripts/check.sh` `modules`
+/// holds the same rule): every `sync::`, `team::` or `cli::` path outside `std::` and `core::`
+/// must be `sync::spawn::...` or `sync::spawn` ending a `use` (`;` or `}`), and no alias
+/// (`use crate::sync as s;`, `use crate::{team as t}`) may hide one of the three names.
+fn reaches_past_spawn(text: &str) -> Vec<String> {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut found = Vec::new();
+    let text = text.replace("std::sync::", "").replace("core::sync::", "");
+    let excerpt = |at: usize| {
+        text[at..(at + 32).min(text.len())]
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    };
+    for name in ["sync", "team", "cli"] {
+        let path = format!("{name}::");
+        for (at, _) in text.match_indices(&path) {
+            if text[..at].ends_with(ident) {
+                continue;
+            }
+            let rest = &text[at + path.len()..];
+            let spawn_end = rest
+                .strip_prefix("spawn")
+                .is_some_and(|r| r.starts_with("::") || r.starts_with(';') || r.starts_with('}'));
+            if !(name == "sync" && spawn_end) {
+                found.push(format!("`{}`", excerpt(at)));
+            }
+        }
+    }
+    // An alias: `use crate::sync as s;` or a name `as` another inside `use crate::{ ... }`.
+    for (at, _) in text.match_indices("crate::") {
+        let rest = &text[at + "crate::".len()..];
+        let group = match rest.strip_prefix('{') {
+            Some(g) => &g[..g.find('}').unwrap_or(g.len())],
+            None => rest.split(';').next().unwrap_or(""),
+        };
+        for item in group.split(',') {
+            let mut words = item.split_whitespace();
+            let (first, as_, _) = (words.next(), words.next(), words.next());
+            if first.is_some_and(|w| ["sync", "team", "cli"].contains(&w)) && as_ == Some("as") {
+                found.push(format!("alias `{}`", item.trim()));
+            }
+        }
+    }
+    for forbidden in ["ureq", "crate::team", "cli::sync"] {
+        if text.contains(forbidden) {
+            found.push(format!("`{forbidden}`"));
+        }
+    }
+    found
+}
+
 #[test]
 fn no_hook_source_reaches_the_network_modules() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -271,31 +321,42 @@ fn no_hook_source_reaches_the_network_modules() {
     assert!(files.len() > 5, "the walk found {} files", files.len());
     for path in files {
         let text = std::fs::read_to_string(&path).unwrap();
-        for forbidden in ["ureq", "crate::team", "cli::sync"] {
-            assert!(
-                !text.contains(forbidden),
-                "{} must not mention `{forbidden}`",
-                path.display()
-            );
-        }
-        for (at, _) in text.match_indices("sync::") {
-            // `std::sync::...` is the standard library, not ours.
-            if text[..at].ends_with("std::") || text[..at].ends_with("core::") {
-                continue;
-            }
-            assert!(
-                text[at + "sync::".len()..].starts_with("spawn"),
-                "{}: only `sync::spawn` may be used here, found `{}`",
-                path.display(),
-                text[at..(at + 24).min(text.len())]
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-            );
-        }
+        let found = reaches_past_spawn(&text);
+        assert!(
+            found.is_empty(),
+            "{}: only `sync::spawn` may be used here, found {found:?}",
+            path.display()
+        );
     }
     let text = std::fs::read_to_string(src.join("sync/spawn.rs")).unwrap();
     assert!(!text.contains("sync::http") && !text.contains("ureq"));
+}
+
+#[test]
+fn the_shape_rule_accepts_the_spawn_paths_and_rejects_the_rest() {
+    for ok in [
+        "use crate::sync;",
+        "use crate::{config, paths, sync};",
+        "use crate::sync::spawn;",
+        "use crate::{sync::spawn};",
+        "sync::spawn::maybe_spawn(a, b);",
+        "use std::sync::OnceLock;",
+    ] {
+        assert!(reaches_past_spawn(ok).is_empty(), "{ok}");
+    }
+    for bad in [
+        "use crate::sync::run as _x;",
+        "use crate::cli::team::print_status as _y;",
+        "use crate::{team::finish_join as _z};",
+        "use crate::sync as s;",
+        "use crate::{config,\n sync as s};",
+        "use crate::sync::spawner;",
+        "use crate::sync::spawn_x;",
+        "use crate::sync::spawn as sp;",
+        "use crate::{cli};\ncli::run();",
+    ] {
+        assert!(!reaches_past_spawn(bad).is_empty(), "{bad}");
+    }
 }
 
 // ---- the binary: a detached child that outlives its hook ----
@@ -310,11 +371,27 @@ mod binary {
 
     use serde_json::{json, Value};
 
+    /// Runs `awm --version` once (RVT3v V7): the first exec of the `awm` binary in a test process
+    /// took about 0.9 s on macOS whatever the hook, and must not count against the hook's bound.
+    fn warm_awm(home: &Home) {
+        let start = Instant::now();
+        assert!(Command::new(env!("CARGO_BIN_EXE_awm"))
+            .arg("--version")
+            .env("AWM_HOME", home.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success());
+        eprintln!("awm --version (warm-up): {:?}", start.elapsed());
+    }
+
     /// A stand-in for `awm sync --once --quiet`: records its arguments at once and a marker five
     /// seconds later, and keeps nothing of its parent's stdio. It is run once with `--warm`
     /// before it is returned: the first exec of a freshly written script can take a second on
     /// macOS, which must not count against the hook's bound.
     fn stand_in(home: &Home) -> PathBuf {
+        warm_awm(home);
         let path = home.path().join("fake-sync.sh");
         let marker = home.path().join("marker");
         let script = format!(

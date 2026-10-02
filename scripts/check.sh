@@ -79,35 +79,52 @@ if grep -rnE 'sync::(http|push|pull)|ureq|reqwest|hyper|tokio|awm_server|object_
   echo "modules: FAILED (network code in a hook, matching or render module)"
   exit 1
 fi
-# RVT3 F16: an allow-list. In the hook-side sources the only `sync::` path is the detached spawn
-# (`sync::spawn::maybe_spawn` and `sync::spawn` module paths); the sync engine, the team code and
-# the HTTP client are out of reach.
+# RVT3 F16, RVT3v V4: an allow-list by shape. In the hook-side sources every `sync::`, `team::` or
+# `cli::` path (outside `std::` and `core::`) is `sync::spawn::...`, or `sync::spawn` ending a
+# `use` (`;` or `}`); and no `use crate::sync as x`, `use crate::{.. team as x ..}` alias hides a
+# name. The sync engine, the team code, the CLI and the HTTP client are out of reach.
+# `hook_spawn::no_hook_source_reaches_the_network_modules` holds the same rule.
 hook_side=(crates/awm/src/hook crates/awm/src/matching crates/awm/src/render.rs crates/awm/src/note.rs crates/awm/src/db.rs)
-if grep -rnE 'sync::|ureq|crate::team|cli::sync' "${hook_side[@]}" \
-  | sed -E 's/(std|core)::sync:://g; s/sync::spawn//g' \
-  | grep -E 'sync::|ureq|crate::team|cli::sync'; then
-  echo "modules: FAILED (a hook-side source reaches past sync::spawn: sync::, ureq, crate::team or cli::sync)"
-  exit 1
-fi
+while IFS= read -r f; do
+  flat="$(tr '\n' ' ' <"$f")"
+  paths="$(printf '%s' "$flat" | sed -E 's/(std|core)::sync:://g; s/sync::spawn(::|;|\})//g')"
+  if printf '%s' "$paths" | grep -qE '(sync|team|cli)::|ureq|crate::team|cli::sync' ||
+    printf '%s' "$flat" | grep -qE 'crate::(sync|team|cli)[[:space:]]+as[[:space:]]|crate::\{[^}]*(sync|team|cli)[[:space:]]+as[[:space:]]'; then
+    echo "modules: FAILED ($f reaches past sync::spawn: a sync::, team:: or cli:: path, an alias of one, or ureq)"
+    exit 1
+  fi
+done < <(find "${hook_side[@]}" -name '*.rs')
 echo "modules: ok"
 
-# RVT3 F1: every AWM_* name the operator-facing text mentions is read by the server, the image or
-# the compose file. Names of other tools are allow-listed.
+# RVT3 F1, RVT3v V5: every AWM_* name the operator-facing text mentions is read by the server, set
+# by the image or keyed in the compose file. Only the read sites count, not a comment that names
+# a variable: the quoted names in `cli/serve.rs` outside `//` lines (`env("AWM_X")`,
+# `from_env(.., "AWM_X")`), `ENV AWM_X=` in the Dockerfile (continuation lines joined) and
+# `AWM_X:` keys in the compose file. A documented name that ends in `_` (`AWM_ACME_*`) is a
+# prefix of a read name. Names of other tools are allow-listed.
 echo "step: docs-env"
-doc_names="$(grep -rhoE 'AWM_[A-Z_]+' docs/self-host.md deploy README.md | sort -u)"
-known_in="crates/awm/src/cli/serve.rs Dockerfile deploy/compose/docker-compose.yml"
+doc_names="$(grep -rhoE 'AWM_[A-Z0-9_]+' docs/self-host.md deploy README.md | sort -u)"
+read_names="$(
+  {
+    grep -vE '^[[:space:]]*//' crates/awm/src/cli/serve.rs | grep -oE '"AWM_[A-Z0-9_]+"' | tr -d '"' || true
+    awk '/^[[:space:]]*#/ { next } { line = cont ? line $0 : $0; if (sub(/\\$/, "", line)) { cont = 1 } else { print line; cont = 0 } }' Dockerfile |
+      grep -E '^[[:space:]]*ENV[[:space:]]' | grep -oE 'AWM_[A-Z0-9_]+=' | tr -d '=' || true
+    grep -vE '^[[:space:]]*#' deploy/compose/docker-compose.yml |
+      grep -oE '^[[:space:]]*(-[[:space:]]*)?AWM_[A-Z0-9_]+[:=]' | grep -oE 'AWM_[A-Z0-9_]+' || true
+  } | sort -u
+)"
 unknown=""
 for name in $doc_names; do
   case "$name" in
     AWM_HOME | AWM_SMOKE_* | AWM_IMAGE | AWM_BIN) continue ;;
+    *_) if printf '%s\n' "$read_names" | grep -q "^$name"; then continue; fi ;;
   esac
-  # shellcheck disable=SC2086
-  if ! grep -qw -- "$name" $known_in; then
+  if ! printf '%s\n' "$read_names" | grep -qx -- "$name"; then
     unknown="$unknown $name"
   fi
 done
 if [ -n "$unknown" ]; then
-  echo "docs-env: FAILED (documented but not read by serve.rs, Dockerfile or the compose file:$unknown)"
+  echo "docs-env: FAILED (documented but not read by serve.rs, set by the Dockerfile or keyed in the compose file:$unknown)"
   exit 1
 fi
 echo "docs-env: ok"

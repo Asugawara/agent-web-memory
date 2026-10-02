@@ -2,7 +2,7 @@
 //! [--backfill --since DATE --project P [--dry-run]]` (plan-v3-team §4.6, §4.8; TM10).
 //!
 //! `--push-only` and `--pull-only` skip the other phase of the run (both still take
-//! `sync.lock`); `--status` prints what `awm team status` prints and does not sync (RVT3 F5).
+//! `sync.lock`; only a full run writes `last_ok`, RVT3v V9); `--status` prints what `awm team status` prints and does not sync (RVT3 F5).
 //!
 //! Exit codes: 0 when the run finished, when another run holds the lock, when a hook-started run
 //! waits out a backoff, and when the database is not at this build's schema in a `--quiet` run;
@@ -17,10 +17,12 @@ pub struct Args {
     /// Print nothing; a failure is only the exit status and `sync_state`
     #[arg(long)]
     pub quiet: bool,
-    /// Send only: skip the pull, the deletion stream and retention
+    /// Send only: skip the pull, the deletion stream and retention (a rotation runs on the last
+    /// stored roster, not a fresh one; the run does not count as the last successful sync)
     #[arg(long, conflicts_with = "pull_only")]
     pub push_only: bool,
-    /// Receive only: skip approvals, the key rotation and the push
+    /// Receive only: skip approvals, the key rotation and the push (the run does not count as the
+    /// last successful sync)
     #[arg(long)]
     pub pull_only: bool,
     /// Print what `awm team status` prints and do not sync

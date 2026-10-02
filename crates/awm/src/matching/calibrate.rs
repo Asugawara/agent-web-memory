@@ -115,7 +115,8 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 /// Deletes the stale calibration copies in `{data_dir}/tmp/`: those whose process no longer
-/// runs, those older than an hour, and names that do not parse. Returns the deleted paths. A
+/// runs, those older than an hour, and names that do not parse. Returns the paths this call
+/// deleted (a copy another sweeper removed first is not an error and not listed). A
 /// missing directory, or a `tmp` that is not a real directory, deletes nothing.
 pub fn sweep_stale_copies(data_dir: &Path) -> Result<Vec<PathBuf>> {
     let dir = data_dir.join(paths::TMP_DIR);
@@ -140,8 +141,12 @@ pub fn sweep_stale_copies(data_dir: &Path) -> Result<Vec<PathBuf>> {
             None => true,
         };
         if stale {
-            std::fs::remove_file(e.path())?;
-            gone.push(e.path());
+            // Another sweeper may have removed it first (RVT3v V8): not an error, not ours.
+            match std::fs::remove_file(e.path()) {
+                Ok(()) => gone.push(e.path()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
         }
     }
     gone.sort();
@@ -338,4 +343,21 @@ pub fn run_cli(_args: Args) -> Result<()> {
         println!("fewer than {MIN_RECORDS} records: defaults in use");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_sweeps_over_one_stale_copy_are_both_ok_and_only_the_first_lists_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join(paths::TMP_DIR);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // A name that does not parse is stale at once.
+        let copy = tmp.join(format!("{COPY_PREFIX}junk"));
+        std::fs::write(&copy, "x").unwrap();
+        assert_eq!(sweep_stale_copies(dir.path()).unwrap(), vec![copy]);
+        assert!(sweep_stale_copies(dir.path()).unwrap().is_empty());
+    }
 }
