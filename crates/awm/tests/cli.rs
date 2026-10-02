@@ -2003,13 +2003,21 @@ fn seed_quota_savings(env: &Env) {
         [],
     )
     .unwrap();
+    // RVQ2 M1: the deny item is labelled 2 as well; it must still count once.
     label(&conn, 2, 1, "2");
+    label(&conn, 1, 1, "2");
 }
 
-/// Five valid windows of one account-week on three days (k = 60 / 500 = 0.12) and three finished
-/// sessions of $100 with $45 of cache reads (σ = 0.45).
+/// Five valid windows of one account-week on three days, with ratios (Δp / $) of 0.12, 0.06
+/// (window 1: $200), 0.18 (window 2: Δp 18), 0.15 (window 3: Δp 15) and 0.12:
+/// k = 69 / 600 = 0.115, spread p25 = 0.12 and p75 = 0.15 (nearest rank 2 and 4 of 5).
+/// Three finished sessions of $100 with $45 of cache reads (σ = 0.45).
 fn seed_quota_ready(env: &Env, projects: &Path) {
     let mut s = quota_windows(QD7, QR, 5, "s");
+    s[3].cost = Some(200.0);
+    for (i, p) in [(5, 28.0), (7, 25.0)] {
+        s[i].h5.as_mut().unwrap().p = p;
+    }
     s.push(quota_anchor());
     write_quota_samples(env, &s);
     for i in 0..3 {
@@ -2022,16 +2030,17 @@ fn stats_savings_quota_ready_matches_hand_computed_numbers() {
     let env = Env::new();
     seed_quota_savings(&env);
     seed_quota_ready(&env, &env.home().join(".claude/projects"));
-    // k5 = 0.12 %/$ at w = 1, w0 = 0.12 / 0.55, w10 = 0.12 / 5.05.
-    // estimated 32.002: 3.84024 (w1), 6.98225 (w0), 0.76044 (w10);
-    // proven 30.0015: 3.60018, 6.54578, 0.71291. 1 / 0.12 = $8.33.
+    // k5 = 0.115 %/$ at w = 1, w0 = 0.115 / 0.55, w10 = 0.115 / 5.05.
+    // estimated 32.002: 3.68023 (w1), 6.69133 (w0), 0.72876 (w10);
+    // proven 30.0015: 3.45017, 6.27304, 0.68320. 1 / 0.115 = $8.70; the windows run from
+    // 1 / 0.15 = $6.67 to 1 / 0.12 = $8.33.
     let text = env.awm(&["stats", "--savings"]).ok().to_string();
     let want = "
   quota: share of your Claude usage limits (11 status line samples from 6 sessions)
-  7d reset 2096-10-02, 5 windows on 3 days: 1% of a 5h window = $8.33 (windows $8.33-$8.33)
-    5h: estimated 3.84% of one window in total (0.76%-6.98%), proven 3.60% (0.71%-6.55%)
+  7d reset 2096-10-02, 5 windows on 3 days: 1% of a 5h window = $8.70 (windows $6.67-$8.33)
+    5h: estimated 3.68% of one window in total (0.73%-6.69%), proven 3.45% (0.68%-6.27%)
     7d: collecting (0 of 10 points of 7-day use in these windows)
-  note: 1 Codex injections are not counted (Codex has its own limits).
+  note: 1 Codex injection is not counted (Codex has its own limits).
   estimated: an upper bound; it assumes every avoided note replaced a call, and the fetch summariser
 ";
     assert!(
@@ -2052,16 +2061,19 @@ fn stats_savings_quota_ready_matches_hand_computed_numbers() {
     assert_eq!(q["codex_injections_excluded"], 1);
     let r = &q["rates"][0];
     assert_eq!(r["selection"], "recent");
-    near(&r["k5"]["w1"], 0.12);
-    near(&r["k5"]["w0"], 0.12 / 0.55);
-    near(&r["k5"]["w10"], 0.12 / 5.05);
+    near(&r["k5"]["w1"], 0.115);
+    near(&r["k5"]["w0"], 0.115 / 0.55);
+    near(&r["k5"]["w10"], 0.115 / 5.05);
+    near(&r["spread5"]["p25"], 0.12);
+    near(&r["spread5"]["p75"], 0.15);
+    assert_eq!(q["rates_cover_all_savings"], true);
     near(&r["cache_read_share"], 0.45);
     assert!(r["k7"].is_null() && r["seven_day_pct"].is_null());
     for (kind, saved) in [("estimated", 32.002), ("proven", 30.0015)] {
         let p = &r["five_hour_pct"][kind];
-        near(&p["w1"], saved * 0.12);
-        near(&p["w0"], saved * 0.12 / 0.55);
-        near(&p["w10"], saved * 0.12 / 5.05);
+        near(&p["w1"], saved * 0.115);
+        near(&p["w0"], saved * 0.115 / 0.55);
+        near(&p["w10"], saved * 0.115 / 5.05);
     }
 }
 
@@ -2085,6 +2097,81 @@ fn stats_savings_quota_one_line_per_recent_account_week() {
     let q = quota_json(&env, &[]);
     assert_eq!(q["rates"].as_array().unwrap().len(), 2);
     assert_eq!(q["groups"].as_array().unwrap().len(), 2);
+}
+
+const NOTE_ACCOUNTS: &str =
+    "  note: savings from all accounts are priced at this account-week's rate\n";
+
+#[test]
+fn stats_savings_quota_note_when_another_account_week_has_windows() {
+    // RVQ2 M2: week A qualifies (5 windows on 3 days); week B has one valid window.
+    let env = Env::new();
+    let mut s = quota_windows(QD7, QR, 5, "a");
+    s.extend(quota_windows(QD7 + 604_800, QR + 5 * 86_400, 1, "b"));
+    s.push(quota_anchor());
+    write_quota_samples(&env, &s);
+    let text = env.awm(&["stats", "--savings"]).ok().to_string();
+    assert_eq!(text.matches("  7d reset ").count(), 1, "{text}");
+    assert!(text.contains(NOTE_ACCOUNTS), "{text}");
+    // Directly under the rate block.
+    assert!(
+        text.contains(&format!(
+            "7d: collecting (0 of 10 points of 7-day use in these windows)\n{NOTE_ACCOUNTS}"
+        )),
+        "{text}"
+    );
+    assert_eq!(quota_json(&env, &[])["rates_cover_all_savings"], false);
+}
+
+#[test]
+fn stats_savings_quota_no_account_note_with_one_account() {
+    let env = Env::new();
+    let mut s = quota_windows(QD7, QR, 5, "a");
+    s.push(quota_anchor());
+    write_quota_samples(&env, &s);
+    let text = env.awm(&["stats", "--savings"]).ok().to_string();
+    assert!(!text.contains("all accounts"), "{text}");
+    assert_eq!(quota_json(&env, &[])["rates_cover_all_savings"], true);
+}
+
+#[test]
+fn stats_savings_quota_codex_note_is_plural_for_two() {
+    let env = Env::new();
+    seed_quota_savings(&env);
+    seed_quota_ready(&env, &env.home().join(".claude/projects"));
+    let conn = env.conn();
+    injection(&conn, 4, "inject", "url", "i4", BASE + 400_000, &[(4, 1.0)]);
+    conn.execute(
+        "UPDATE injection SET transcript_path = '/h/.codex/sessions/r.jsonl' WHERE id = 4",
+        [],
+    )
+    .unwrap();
+    let text = env.awm(&["stats", "--savings"]).ok().to_string();
+    assert!(
+        text.contains("  note: 2 Codex injections are not counted (Codex has its own limits).\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn stats_savings_quota_explains_a_proven_zero() {
+    // No deny-mode injection and no label: proven is 0.
+    let env = Env::new();
+    seed_quota_savings(&env);
+    seed_quota_ready(&env, &env.home().join(".claude/projects"));
+    let conn = env.conn();
+    conn.execute("DELETE FROM outcome", []).unwrap();
+    conn.execute("UPDATE injection SET mode = 'inject'", [])
+        .unwrap();
+    let text = env.awm(&["stats", "--savings"]).ok().to_string();
+    // The line wraps at 100 columns; compare with the wrapping removed.
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("proven 0.00% (no denied calls or labelled items yet) 7d: collecting"),
+        "{text}"
+    );
+    assert!(!flat.contains("proven 3."), "{text}");
+    assert!(text.contains("    labelled items yet)\n"), "{text}");
 }
 
 #[test]
@@ -2127,7 +2214,7 @@ fn stats_savings_quota_reads_totals_from_projects_flag() {
         .ok()
         .to_string();
     assert!(!with.contains("(range pending)"), "{with}");
-    assert!(with.contains("(0.76%-6.98%)"), "{with}");
+    assert!(with.contains("(0.73%-6.69%)"), "{with}");
     let q = quota_json(&env, &["--projects", dir]);
     near(&q["rates"][0]["cache_read_share"], 0.45);
     assert_eq!(q["rates"][0]["sessions_with_totals"], 3);
@@ -2149,6 +2236,7 @@ fn stats_savings_json_quota_shape() {
     assert!(q["first_sample_ms"].is_null());
     near(&q["saved_usd"]["estimated"], 0.0);
     assert_eq!(q["codex_injections_excluded"], 0);
+    assert_eq!(q["rates_cover_all_savings"], true);
 
     seed_quota_savings(&env);
     seed_quota_ready(&env, &env.home().join(".claude/projects"));
@@ -2160,6 +2248,7 @@ fn stats_savings_json_quota_shape() {
             "first_sample_ms",
             "groups",
             "rates",
+            "rates_cover_all_savings",
             "samples",
             "saved_usd",
             "sessions",

@@ -240,15 +240,22 @@ pub fn calibrate(
     }
 
     // One window per key; a sample is used only inside [T0, h5.r).
+    // A sample without `seven_day` joins the first non-zero `d7.r` seen for its `h5.r`.
+    let in_use = |s: &Sample| -> Option<i64> {
+        let r0 = minute(s.h5?.r);
+        (s.t >= (r0 - WINDOW_S) * 1000 && s.t < s.h5?.r * 1000).then_some(r0)
+    };
+    let mut first_d7: HashMap<i64, i64> = HashMap::new();
+    for s in &order {
+        if let (Some(r0), Some(w)) = (in_use(s), s.d7) {
+            first_d7.entry(r0).or_insert_with(|| minute(w.r));
+        }
+    }
     let mut by_key: BTreeMap<(i64, i64), Vec<usize>> = BTreeMap::new();
     for (i, s) in order.iter().enumerate() {
-        let Some(h5) = s.h5 else { continue };
-        let r0 = minute(h5.r);
-        let t0 = (r0 - WINDOW_S) * 1000;
-        if s.t < t0 || s.t >= h5.r * 1000 {
-            continue;
-        }
-        let d7 = s.d7.map_or(0, |w| minute(w.r));
+        let Some(r0) = in_use(s) else { continue };
+        let d7 =
+            s.d7.map_or_else(|| first_d7.get(&r0).copied().unwrap_or(0), |w| minute(w.r));
         by_key.entry((r0, d7)).or_default().push(i);
     }
 

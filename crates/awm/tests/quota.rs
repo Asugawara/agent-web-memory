@@ -396,6 +396,43 @@ fn d7_only_samples_start_no_window() {
 }
 
 #[test]
+fn samples_without_d7_stay_in_the_window() {
+    // RVQ2 M4: one window and one session; the 7-day window is absent from the first and the
+    // last sample. They join the key of the one sample that has it: one window, Δp 12, C $100.
+    let b = base();
+    let v = with_anchor(vec![
+        smp("s", b + HOUR, 10.0, R, None, Some(0.0)),
+        smp(
+            "s",
+            b + HOUR + 1_800_000,
+            16.0,
+            R,
+            Some((50.0, D7)),
+            Some(40.0),
+        ),
+        smp("s", b + 2 * HOUR, 22.0, R, None, Some(100.0)),
+    ]);
+    let cal = run(&v);
+    assert_eq!(cal.windows.seen, 1);
+    assert_eq!(cal.windows.list.len(), 1);
+    let w = &cal.windows.list[0];
+    assert_eq!((w.dp5, w.cost_usd, w.d7_reset), (12.0, 100.0, D7));
+    assert_eq!(w.verdict, Verdict::Valid);
+}
+
+#[test]
+fn window_without_any_d7_keeps_key_zero() {
+    let b = base();
+    let v = with_anchor(vec![
+        smp("s", b + HOUR, 10.0, R, None, Some(0.0)),
+        smp("s", b + 2 * HOUR, 22.0, R, None, Some(100.0)),
+    ]);
+    let cal = run(&v);
+    assert_eq!(cal.windows.list.len(), 1);
+    assert_eq!(cal.windows.list[0].d7_reset, 0);
+}
+
+#[test]
 fn second_account_in_the_same_hour() {
     // Same h5.r, different d7.r, interleaved: account A p 10 → 22 ($100), account B p 5 → 15
     // ($80). Pooled by h5.r alone they would fall (10 → 5) and be mixed.

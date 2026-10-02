@@ -1117,6 +1117,18 @@ fn quota_section(
     }
     v["saved_usd"] = json!({"estimated": estimated, "proven": proven});
     v["codex_injections_excluded"] = json!(codex);
+    // One rate prices all of the savings; false when a valid window lies outside every
+    // rate's group (another account-week), or when several rates price them differently.
+    let covered = |rate: &calibrate::Rate| {
+        rate.d7_reset.is_none()
+            || cal
+                .windows
+                .list
+                .iter()
+                .filter(|w| w.verdict == calibrate::Verdict::Valid)
+                .all(|w| Some(w.d7_reset) == rate.d7_reset)
+    };
+    v["rates_cover_all_savings"] = json!(cal.rates.len() < 2 && cal.rates.iter().all(covered));
     v
 }
 
@@ -1219,7 +1231,10 @@ fn quota_text(v: &Value) -> String {
                 (pct(x), range)
             };
             let (est, est_range) = part("estimated", true);
-            let (proven, proven_range) = part("proven", false);
+            let (proven, mut proven_range) = part("proven", false);
+            if n(&["saved_usd", "proven"]) <= 0.0 {
+                proven_range = " (no denied calls or labelled items yet)".to_string();
+            }
             format!(
                 "{name}: estimated {est} of one window in total{est_range}, proven {proven}{proven_range}"
             )
@@ -1240,6 +1255,8 @@ fn quota_text(v: &Value) -> String {
             "savings are not split by account; each line prices all of them at its own rate."
                 .to_string(),
         );
+    } else if v["rates_cover_all_savings"] == json!(false) {
+        notes.push("savings from all accounts are priced at this account-week's rate".to_string());
     }
     for r in &rates {
         let weeks = int_of(r, "account_weeks");
@@ -1264,7 +1281,12 @@ fn quota_text(v: &Value) -> String {
     let codex = int(&["codex_injections_excluded"]);
     if codex > 0 {
         notes.push(format!(
-            "{codex} Codex injections are not counted (Codex has its own limits)."
+            "{codex} Codex {} not counted (Codex has its own limits).",
+            if codex == 1 {
+                "injection is"
+            } else {
+                "injections are"
+            }
         ));
     }
     for note in notes {
