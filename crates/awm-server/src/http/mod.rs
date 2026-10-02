@@ -29,6 +29,7 @@ use crate::store::{OrgDefaults, Store, StoreError};
 
 mod admin;
 mod ctx;
+pub mod embedded;
 mod entry;
 mod error;
 mod health;
