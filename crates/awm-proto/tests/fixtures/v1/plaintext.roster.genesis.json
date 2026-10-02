@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "entry": {
+    "type": "genesis",
+    "member_id": "2b7e4c1a-5d3f-4a6b-8c9d-0e1f2a3b4c5d",
+    "handle": "alf",
+    "device_id": "9d8c7b6a-5f4e-4d3c-8b2a-1f0e9d8c7b6a",
+    "device_pub": "NOQtSvXvlKB6OoQgG4idTNGnQ8snsRtqEEOKj-uOWEc",
+    "org_nonce": "YGFiY2RlZmdoaWprbG1ubw",
+    "created_at": 1790902800
+  }
+}

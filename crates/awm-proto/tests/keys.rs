@@ -2,17 +2,18 @@
 //! roster (RV8-team X1), rotation, removal, recovery (M6) and the P1-P5 outcomes.
 //!
 //! Set `AWM_WRITE_VECTORS=1` to rewrite `tests/vectors/v1/keys.json` after an intended
-//! format change (there should be none within v1).
+//! format change. Nothing has shipped yet (FT1 regenerated them for RVT1 B1); from the first
+//! release on there must be none within v1.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use awm_proto::crypto::{open_record, seal_record, Error, RecordAd, Rng, Secret32};
 use awm_proto::keys::{
-    accept_join, approve, approve_with, fingerprint, plan_rotation, rotate, rotate_with,
+    accept_join, approve, approve_with, fingerprint, org_id, plan_rotation, rotate, rotate_with,
     seal_roster, seal_roster_with, ApprovalInfo, ApprovalKind, DeviceKeys, DeviceStatus, EpochKey,
     Invite, JoinRequest, KeyRing, ListedDevice, Role, Roster, RosterBlob, RosterEntry, RosterSlot,
-    Wrap, ROSTER_TAG,
+    Wrap, ORG_NONCE_LEN, ROSTER_TAG,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -99,32 +100,50 @@ struct Org {
     next_idx: BTreeMap<Uuid, u64>,
     /// Every byte string the server receives or stores, for the P1 test.
     server_saw: Vec<Vec<u8>>,
+    /// The genesis entry's nonce (the server never sees it; tests that give it to an
+    /// attacker do so on purpose).
+    org_nonce: [u8; ORG_NONCE_LEN],
 }
 
 impl Org {
-    /// `awm team create`: `K_0`, the organisation id and the genesis roster record.
+    /// `awm team create`: device key, then `K_0` and the organisation id, then the genesis
+    /// roster record.
     fn create(handle: &str) -> (Org, Dev) {
-        let ring = KeyRing::create().unwrap();
+        let keys = DeviceKeys::generate().unwrap();
+        let device = Uuid::new_v4();
+        let (ring, org_nonce) = KeyRing::create(device, &keys.public).unwrap();
         let admin = Dev {
             member: Uuid::new_v4(),
-            device: Uuid::new_v4(),
-            keys: DeviceKeys::generate().unwrap(),
+            device,
+            keys,
             ring,
         };
         let mut org = Org {
             roster: Vec::new(),
             next_idx: BTreeMap::new(),
             server_saw: Vec::new(),
+            org_nonce,
         };
         let entry = RosterEntry::Genesis {
             member_id: admin.member,
             handle: handle.into(),
             device_id: admin.device,
             device_pub: admin.keys.public,
+            org_nonce,
             created_at: 1_790_000_000,
         };
         org.append_roster(&admin, &entry);
         (org, admin)
+    }
+
+    /// A copy of the server's roster records, for a test that appends forged ones.
+    fn fork(&self) -> Org {
+        Org {
+            roster: self.roster.clone(),
+            next_idx: self.next_idx.clone(),
+            server_saw: Vec::new(),
+            org_nonce: self.org_nonce,
+        }
     }
 
     fn append_roster(&mut self, writer: &Dev, entry: &RosterEntry) {
@@ -174,6 +193,7 @@ impl Org {
         };
         let approval = approve(
             &approver.ring,
+            &self.verified(&approver.ring),
             &invite,
             &verified,
             ApprovalInfo {
@@ -228,12 +248,24 @@ fn rec_ad(ring: &KeyRing, dev: &Dev, idx: u64) -> RecordAd {
 
 #[test]
 fn vectors_v1_keys_known_answer() {
-    let org = Uuid::parse_str("6f1c2a9e-3b4d-4e5f-8a7b-0c1d2e3f4a5b").unwrap();
     let approver = Uuid::parse_str("2c3d4e5f-6a7b-4c8d-9e0f-1a2b3c4d5e6f").unwrap();
     let joiner = Uuid::parse_str("9d8c7b6a-5f4e-4d3c-8b2a-1f0e9d8c7b6a").unwrap();
     let joiner_member = Uuid::parse_str("1a2b3c4d-5e6f-4a1b-9c2d-3e4f5a6b7c8d").unwrap();
     let k0: [u8; 32] = bytes(0x10, 32).try_into().unwrap();
-    let ring = KeyRing::from_keys(org, vec![EpochKey::from_bytes(0, k0)]).unwrap();
+    // `awm team create`: the first admin's device key, then 16 bytes of org nonce and K_0.
+    let admin_keys = DeviceKeys::from_secret_bytes(bytes(0x30, 32).try_into().unwrap());
+    let org_nonce: [u8; ORG_NONCE_LEN] = bytes(0x60, 16).try_into().unwrap();
+    let (ring, nonce_out) = KeyRing::create_with(
+        &mut FixedRng([org_nonce.to_vec(), k0.to_vec()].concat()),
+        approver,
+        &admin_keys.public,
+    )
+    .unwrap();
+    assert_eq!(nonce_out, org_nonce);
+    assert_eq!(ring.current().expose_secret(), &k0);
+    let org = ring.org();
+    assert_eq!(org, org_id(approver, &admin_keys.public, &org_nonce));
+    assert_eq!(org.get_version_num(), 4);
     let s: [u8; 32] = bytes(0x50, 32).try_into().unwrap();
     let invite = Invite::from_parts(
         org,
@@ -253,6 +285,7 @@ fn vectors_v1_keys_known_answer() {
     let approval = approve_with(
         &mut FixedRng(approval_rng.clone()),
         &ring,
+        &Roster::default(),
         &invite,
         &verified,
         ApprovalInfo {
@@ -287,7 +320,6 @@ fn vectors_v1_keys_known_answer() {
     let rotation_rng = [bytes(0x20, 32), bytes(0xa0, 32), bytes(0xd0, 24)].concat();
     let fake_roster = {
         // A minimal verified roster holding the joiner, built through the public API.
-        let admin_keys = DeviceKeys::from_secret_bytes(bytes(0x30, 32).try_into().unwrap());
         let admin_member = Uuid::nil();
         let genesis = seal_roster_with(
             &mut FixedRng(bytes(0xe0, 24)),
@@ -304,14 +336,20 @@ fn vectors_v1_keys_known_answer() {
                 handle: "admin".into(),
                 device_id: approver,
                 device_pub: admin_keys.public,
+                org_nonce,
                 created_at: 1_790_000_000,
             },
         )
         .unwrap();
-        let report = Roster::verify(&ring, &[genesis, roster_blob.clone()], &BTreeSet::new());
+        let report = Roster::verify(
+            &ring,
+            &[genesis.clone(), roster_blob.clone()],
+            &BTreeSet::new(),
+        );
         assert!(report.rejected.is_empty(), "{:?}", report.rejected);
-        report.roster
+        (report.roster, genesis)
     };
+    let (fake_roster, genesis) = fake_roster;
     let listed = [ListedDevice {
         member_id: joiner_member,
         device_id: joiner,
@@ -330,6 +368,19 @@ fn vectors_v1_keys_known_answer() {
 
     let computed = json!({
         "org": org,
+        "org_derivation": {
+            "genesis_device": approver, "genesis_secret": hex(admin_keys.secret_bytes()),
+            "genesis_pub": hex(&admin_keys.public), "org_nonce": hex(&org_nonce),
+        },
+        "genesis_record": {
+            "writer_member": Uuid::nil(), "writer_device": approver, "idx": 0,
+            "record_id": Uuid::nil(), "epoch": 0, "nonce": hex(&bytes(0xe0, 24)),
+            "entry": serde_json::to_value(RosterEntry::Genesis {
+                member_id: Uuid::nil(), handle: "admin".into(), device_id: approver,
+                device_pub: admin_keys.public, org_nonce, created_at: 1_790_000_000,
+            }).unwrap(),
+            "envelope": hex(&genesis.blob),
+        },
         "k0": hex(&k0),
         "k_repo_of_k0": ring.repo_key().encode(),
         "repo_key": {"remote": "github.com/owner/repo", "value": ring.repo_key().repo_key("github.com/owner/repo")},
@@ -393,6 +444,45 @@ fn vectors_v1_keys_known_answer() {
     let imported = KeyRing::import_recovery(stored["recovery_export"].as_str().unwrap()).unwrap();
     assert_eq!(imported.org(), org);
     assert_eq!(imported.current_epoch(), 1);
+    // The stored organisation id is the hash of the stored genesis fields, and the stored
+    // genesis and approval records verify under it.
+    let d = &stored["org_derivation"];
+    let field = |v: &Value| unhex(v.as_str().unwrap());
+    let stored_org = org_id(
+        Uuid::parse_str(d["genesis_device"].as_str().unwrap()).unwrap(),
+        &field(&d["genesis_pub"]).try_into().unwrap(),
+        &field(&d["org_nonce"]).try_into().unwrap(),
+    );
+    assert_eq!(stored_org.to_string(), stored["org"].as_str().unwrap());
+    let stored_ring = KeyRing::from_keys(
+        stored_org,
+        vec![EpochKey::from_bytes(
+            0,
+            field(&stored["k0"]).try_into().unwrap(),
+        )],
+    )
+    .unwrap();
+    let blob = |rec: &Value| RosterBlob {
+        member: Uuid::parse_str(rec["writer_member"].as_str().unwrap()).unwrap(),
+        device: Uuid::parse_str(rec["writer_device"].as_str().unwrap()).unwrap(),
+        idx: rec["idx"].as_u64().unwrap(),
+        record_id: Uuid::parse_str(rec["record_id"].as_str().unwrap()).unwrap(),
+        epoch: 0,
+        blob: field(&rec["envelope"]),
+    };
+    let report = Roster::verify(
+        &stored_ring,
+        &[
+            blob(&stored["genesis_record"]),
+            blob(&stored["roster_record"]),
+        ],
+        &BTreeSet::new(),
+    );
+    assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+    assert_eq!(
+        report.roster.device(joiner).unwrap().member_id,
+        joiner_member
+    );
 }
 
 // ---------------------------------------------------------------------------------------
@@ -411,6 +501,7 @@ fn a_wrap_for_one_device_does_not_open_for_another() {
         .unwrap();
     let approval = approve(
         &admin.ring,
+        &org.verified(&admin.ring),
         &invite,
         &verified,
         ApprovalInfo {
@@ -433,7 +524,8 @@ fn a_wrap_for_one_device_does_not_open_for_another() {
 
 #[test]
 fn a_join_with_a_wrong_mac_is_rejected() {
-    let ring = KeyRing::create().unwrap();
+    let (_org, admin) = Org::create("admin");
+    let ring = admin.ring;
     let invite = Invite::create(ring.org(), "inv", "tok", "alice").unwrap();
     let keys = DeviceKeys::generate().unwrap();
     let device = Uuid::new_v4();
@@ -478,7 +570,7 @@ fn a_join_with_a_wrong_mac_is_rejected() {
 /// a key the server chose.
 #[test]
 fn p2_a_wrap_not_authenticated_with_s_is_rejected() {
-    let (_org, admin) = Org::create("admin");
+    let (org, admin) = Org::create("admin");
     let invite = Invite::create(admin.ring.org(), "inv", "tok", "alice").unwrap();
     let theirs = Invite::parse(&invite.encode()).unwrap();
     let keys = DeviceKeys::generate().unwrap();
@@ -498,14 +590,28 @@ fn p2_a_wrap_not_authenticated_with_s_is_rejected() {
     let server_ring =
         KeyRing::from_keys(admin.ring.org(), vec![EpochKey::generate(0).unwrap()]).unwrap();
     let server_invite = Invite::create(admin.ring.org(), "inv", "tok", "alice").unwrap();
-    let forged = approve(&server_ring, &server_invite, &verified, info).unwrap();
+    let forged = approve(
+        &server_ring,
+        &Roster::default(),
+        &server_invite,
+        &verified,
+        info,
+    )
+    .unwrap();
     assert_eq!(
         accept_join(&theirs, device, &keys, &forged.wraps).unwrap_err(),
         Error::BadMac
     );
     // A genuine wrap with a modified authenticator, or a genuine authenticator over another
     // blob, is rejected too.
-    let genuine = approve(&admin.ring, &invite, &verified, info).unwrap();
+    let genuine = approve(
+        &admin.ring,
+        &org.verified(&admin.ring),
+        &invite,
+        &verified,
+        info,
+    )
+    .unwrap();
     let mut bad_auth = genuine.wraps.clone();
     bad_auth[0].auth[31] ^= 1;
     assert_eq!(
@@ -537,8 +643,8 @@ fn p2_a_wrap_not_authenticated_with_s_is_rejected() {
 fn p2_a_rotation_wrap_forged_by_the_server_is_rejected() {
     let (mut org, admin) = Org::create("admin");
     let mut alice = org.join(&admin, "alice", None, Role::Member);
-    // The server knows alice's public key and device id; it wraps its own key and signs the
-    // wrap with a key ring of its own.
+    // The server knows alice's public key and device id, and (worst case) the admin's genesis
+    // fields; it wraps its own key and signs the wrap with a key ring of its own.
     let server_ring =
         KeyRing::from_keys(admin.ring.org(), vec![EpochKey::generate(0).unwrap()]).unwrap();
     let server_roster = {
@@ -546,6 +652,7 @@ fn p2_a_rotation_wrap_forged_by_the_server_is_rejected() {
             roster: Vec::new(),
             next_idx: BTreeMap::new(),
             server_saw: Vec::new(),
+            org_nonce: org.org_nonce,
         };
         let fake_admin = Dev {
             member: admin.member,
@@ -559,7 +666,8 @@ fn p2_a_rotation_wrap_forged_by_the_server_is_rejected() {
                 member_id: admin.member,
                 handle: "admin".into(),
                 device_id: admin.device,
-                device_pub: fake_admin.keys.public,
+                device_pub: admin.keys.public,
+                org_nonce: org.org_nonce,
                 created_at: 0,
             },
         );
@@ -738,11 +846,7 @@ fn roster_order_does_not_matter_and_authority_is_checked() {
     );
 
     // Alice (a member) cannot approve a new member, nor a device of another member.
-    let mut bad = Org {
-        roster: org.roster.clone(),
-        next_idx: org.next_idx.clone(),
-        server_saw: Vec::new(),
-    };
+    let mut bad = org.fork();
     let stranger = DeviceKeys::generate().unwrap();
     bad.append_roster(
         &alice,
@@ -1100,11 +1204,7 @@ fn a_recovery_export_restores_an_admins_ability_to_rotate() {
     assert_eq!(alice.accept_rotation(&rotation.wraps), Ok(1));
 
     // A member (not an admin) cannot self-enrol with a Recover entry.
-    let mut m = Org {
-        roster: org.roster.clone(),
-        next_idx: org.next_idx.clone(),
-        server_saw: Vec::new(),
-    };
+    let mut m = org.fork();
     let alice_new = Dev {
         member: alice.member,
         device: Uuid::new_v4(),
@@ -1131,7 +1231,8 @@ fn a_recovery_export_restores_an_admins_ability_to_rotate() {
 
 #[test]
 fn a_recovery_export_rejects_typos_and_gaps() {
-    let ring = KeyRing::create().unwrap();
+    let (_org, admin) = Org::create("admin");
+    let ring = admin.ring;
     let export = ring.export_recovery();
     assert!(export.starts_with("awmk1_"));
     let back = KeyRing::import_recovery(&export).unwrap();
@@ -1268,4 +1369,475 @@ fn secret_material_is_zeroized_on_drop() {
     assert_eq!(format!("{s:?}"), "Secret32(..)");
     let k = EpochKey::from_bytes(3, [0xbb; 32]);
     assert!(!format!("{k:?}").contains("bb"));
+}
+
+// ---------------------------------------------------------------------------------------
+// RVT1: self-certifying genesis (B1), extra admins (M5), own approval and approvals (M2),
+// the one roster plaintext (M1), suspect approvers (m6)
+
+/// B1: an ordinary member writes a genesis of their own, earlier than the admin's, in their
+/// own stream. It does not hash to the organisation id, so it is rejected; the admin stays
+/// the trust root and the member's "new member" approval does not verify.
+#[test]
+fn a_genesis_written_by_a_member_is_rejected() {
+    let (mut org, alf) = Org::create("alf");
+    let roy = org.join(&alf, "roy", None, Role::Member);
+    assert!(
+        !org.next_idx.contains_key(&roy.device),
+        "roy's roster stream is empty"
+    );
+
+    // (1) roy's own key and a nonce of roy's choosing; (2) alf's genuine key and nonce copied
+    // into roy's stream. Both claim created_at 0.
+    let forged_own = RosterEntry::Genesis {
+        member_id: roy.member,
+        handle: "roy".into(),
+        device_id: roy.device,
+        device_pub: roy.keys.public,
+        org_nonce: [7; ORG_NONCE_LEN],
+        created_at: 0,
+    };
+    let forged_copy = RosterEntry::Genesis {
+        member_id: roy.member,
+        handle: "roy".into(),
+        device_id: roy.device,
+        device_pub: alf.keys.public,
+        org_nonce: org.org_nonce,
+        created_at: 0,
+    };
+    for forged in [forged_own, forged_copy] {
+        let mut bad = org.fork();
+        bad.append_roster(&roy, &forged);
+        // roy then enrols a device X it controls as a new admin "member".
+        let x_keys = DeviceKeys::generate().unwrap();
+        let x = Dev {
+            member: Uuid::new_v4(),
+            device: Uuid::new_v4(),
+            keys: x_keys.clone(),
+            ring: roy.ring.clone(),
+        };
+        bad.append_roster(
+            &roy,
+            &RosterEntry::Approve {
+                member_id: x.member,
+                handle: "xavier".into(),
+                role: Role::Admin,
+                kind: ApprovalKind::Member,
+                device_id: x.device,
+                device_pub: x_keys.public,
+                approved_at: 1,
+                approver_device_id: roy.device,
+            },
+        );
+        let report = Roster::verify(&alf.ring, &bad.roster, &BTreeSet::new());
+        let reasons: Vec<&str> = report.rejected.iter().map(|r| r.reason).collect();
+        assert_eq!(
+            reasons,
+            vec![
+                "genesis does not hash to the organisation id",
+                "only an admin approves a new member"
+            ]
+        );
+        let roster = &report.roster;
+        assert!(roster.member(alf.member).unwrap().admin);
+        assert!(!roster.member(roy.member).unwrap().admin);
+        assert_eq!(roster.status(&alf.listed()), DeviceStatus::Verified);
+        assert_eq!(roster.status(&roy.listed()), DeviceStatus::Verified);
+        assert_eq!(roster.status(&x.listed()), DeviceStatus::Unverified);
+
+        // After roy's removal the rotation wraps to alf's device, not to X nor to roy.
+        bad.remove(&alf, roy.member);
+        let roster = bad.verified(&alf.ring);
+        let plan = plan_rotation(
+            &alf.ring,
+            &roster,
+            &[alf.listed(), roy.listed(), x.listed()],
+            &BTreeSet::from([roy.member]),
+        );
+        let targets: Vec<Uuid> = plan.wrap_to().iter().map(|d| d.device_id).collect();
+        assert_eq!(targets, vec![alf.device]);
+        assert_eq!(plan.unverified(), &[x.device]);
+        assert_eq!(plan.removed(), &[roy.device]);
+    }
+}
+
+/// B1: the genesis rule. Only the stream of the device the organisation id was derived from
+/// can hold a genesis that counts; moving fields or index, or two passing geneses, fail closed.
+#[test]
+fn only_a_genesis_that_hashes_to_the_organisation_id_counts() {
+    let (org, alf) = Org::create("alf");
+    let genesis = |device_pub: [u8; 32], org_nonce: [u8; ORG_NONCE_LEN]| RosterEntry::Genesis {
+        member_id: alf.member,
+        handle: "alf".into(),
+        device_id: alf.device,
+        device_pub,
+        org_nonce,
+        created_at: 1,
+    };
+    // The genuine one verifies alone.
+    assert!(org.verified(&alf.ring).member(alf.member).unwrap().admin);
+    // Another nonce or another key in the right stream does not hash to the id.
+    for entry in [
+        genesis(alf.keys.public, [0; ORG_NONCE_LEN]),
+        genesis(DeviceKeys::generate().unwrap().public, org.org_nonce),
+    ] {
+        let mut o = Org {
+            roster: Vec::new(),
+            next_idx: BTreeMap::new(),
+            server_saw: Vec::new(),
+            org_nonce: org.org_nonce,
+        };
+        o.append_roster(&alf, &entry);
+        let report = Roster::verify(&alf.ring, &o.roster, &BTreeSet::new());
+        assert_eq!(
+            report.rejected[0].reason,
+            "genesis does not hash to the organisation id"
+        );
+        assert_eq!(report.roster.members().count(), 0);
+    }
+    // The genuine entry at index 1 is not a genesis.
+    let mut o = org.fork();
+    o.append_roster(&alf, &genesis(alf.keys.public, org.org_nonce));
+    let report = Roster::verify(&alf.ring, &o.roster[1..], &BTreeSet::new());
+    assert_eq!(
+        report.rejected[0].reason,
+        "genesis not at index 0 under epoch 0"
+    );
+    // Two passing geneses (here: a colluding server lets a second member's stream reuse the
+    // genesis device id) are both rejected: nothing is trusted.
+    let twin = Uuid::new_v4();
+    let mut two = org.roster.clone();
+    two.push(
+        seal_roster(
+            alf.ring.org(),
+            alf.ring.current(),
+            RosterSlot {
+                member: twin,
+                device: alf.device,
+                idx: 0,
+                record_id: Uuid::new_v4(),
+            },
+            &RosterEntry::Genesis {
+                member_id: twin,
+                handle: "twin".into(),
+                device_id: alf.device,
+                device_pub: alf.keys.public,
+                org_nonce: org.org_nonce,
+                created_at: 0,
+            },
+        )
+        .unwrap(),
+    );
+    let report = Roster::verify(&alf.ring, &two, &BTreeSet::new());
+    let reasons: Vec<&str> = report.rejected.iter().map(|r| r.reason).collect();
+    assert_eq!(
+        reasons,
+        vec!["more than one genesis", "more than one genesis"]
+    );
+    assert_eq!(report.roster.devices().count(), 0);
+    // The same record served twice counts once.
+    let mut doubled = org.roster.clone();
+    doubled.push(org.roster[0].clone());
+    assert!(Roster::verify(&alf.ring, &doubled, &BTreeSet::new())
+        .rejected
+        .is_empty());
+}
+
+#[test]
+fn the_organisation_id_is_derived_from_the_genesis_device() {
+    let keys = DeviceKeys::generate().unwrap();
+    let device = Uuid::new_v4();
+    let (ring, nonce) = KeyRing::create(device, &keys.public).unwrap();
+    assert_eq!(ring.org(), org_id(device, &keys.public, &nonce));
+    assert_eq!(ring.org().get_version_num(), 4);
+    let (again, nonce2) = KeyRing::create(device, &keys.public).unwrap();
+    assert_ne!(nonce, nonce2, "a fresh nonce per organisation");
+    assert_ne!(ring.org(), again.org());
+    assert_ne!(org_id(Uuid::new_v4(), &keys.public, &nonce), ring.org());
+}
+
+/// M5: with a verified admin in the roster, the server's role list widens nothing.
+#[test]
+fn extra_admins_are_ignored_while_the_roster_holds_a_verified_admin() {
+    let (mut org, alf) = Org::create("alf");
+    let roy = org.join(&alf, "roy", None, Role::Member);
+    let planted = Uuid::new_v4();
+    org.append_roster(
+        &roy,
+        &RosterEntry::Approve {
+            member_id: Uuid::new_v4(),
+            handle: "srv".into(),
+            role: Role::Admin,
+            kind: ApprovalKind::Member,
+            device_id: planted,
+            device_pub: DeviceKeys::generate().unwrap().public,
+            approved_at: 1,
+            approver_device_id: roy.device,
+        },
+    );
+    let extra = BTreeSet::from([roy.member]);
+    let report = Roster::verify(&alf.ring, &org.roster, &extra);
+    assert!(report.extra_admins_ignored);
+    assert!(report.roster.device(planted).is_none());
+    assert_eq!(
+        report.rejected.last().unwrap().reason,
+        "only an admin approves a new member"
+    );
+    assert!(!report.roster.member(roy.member).unwrap().admin);
+    // Without extra admins nothing is "ignored".
+    assert!(!Roster::verify(&alf.ring, &org.roster, &BTreeSet::new()).extra_admins_ignored);
+}
+
+/// M5: when the roster holds no non-revoked admin (recovery after `awm serve promote`),
+/// confirmed extra admins apply.
+#[test]
+fn extra_admins_apply_only_when_no_admin_is_left() {
+    let (mut org, alf) = Org::create("alf");
+    let roy = org.join(&alf, "roy", None, Role::Member);
+    // alf leaves: the only admin revokes their own membership.
+    org.remove(&alf, alf.member);
+    let newcomer = Uuid::new_v4();
+    org.append_roster(
+        &roy,
+        &RosterEntry::Approve {
+            member_id: Uuid::new_v4(),
+            handle: "noa".into(),
+            role: Role::Member,
+            kind: ApprovalKind::Member,
+            device_id: newcomer,
+            device_pub: DeviceKeys::generate().unwrap().public,
+            approved_at: 2,
+            approver_device_id: roy.device,
+        },
+    );
+    let without = Roster::verify(&alf.ring, &org.roster, &BTreeSet::new());
+    assert!(without.roster.device(newcomer).is_none());
+    let with = Roster::verify(&alf.ring, &org.roster, &BTreeSet::from([roy.member]));
+    assert!(!with.extra_admins_ignored);
+    assert!(with.roster.device(newcomer).is_some());
+}
+
+/// M2: the joining device checks its own roster entry before its first push.
+#[test]
+fn a_joining_device_checks_its_own_roster_entry_before_pushing() {
+    let (mut org, alf) = Org::create("alf");
+    let roy = org.join(&alf, "roy", None, Role::Member);
+    let roster = org.verified(&roy.ring);
+    assert_eq!(
+        roster.check_own_approval(roy.device, roy.member, "roy", &roy.keys.public),
+        Ok(())
+    );
+    // The server answered the join with another member id, or the approval is not there.
+    let other = Uuid::new_v4();
+    assert!(roster
+        .check_own_approval(roy.device, other, "roy", &roy.keys.public)
+        .is_err());
+    assert!(roster
+        .check_own_approval(roy.device, alf.member, "alf", &roy.keys.public)
+        .is_err());
+    assert!(roster
+        .check_own_approval(roy.device, roy.member, "rex", &roy.keys.public)
+        .is_err());
+    assert!(roster
+        .check_own_approval(roy.device, roy.member, "roy", &alf.keys.public)
+        .is_err());
+    assert!(roster
+        .check_own_approval(Uuid::new_v4(), roy.member, "roy", &roy.keys.public)
+        .is_err());
+    // A revoked device fails the check.
+    org.append_roster(
+        &alf,
+        &RosterEntry::Revoke {
+            member_id: roy.member,
+            device_id: Some(roy.device),
+            revoked_at: 3,
+            by_device_id: alf.device,
+        },
+    );
+    assert!(org
+        .verified(&roy.ring)
+        .check_own_approval(roy.device, roy.member, "roy", &roy.keys.public)
+        .is_err());
+}
+
+/// M2: the approver refuses a member approval that reuses a member id its roster holds, and a
+/// device approval for a member it does not hold.
+#[test]
+fn an_approval_reusing_a_member_id_is_refused() {
+    let (mut org, alf) = Org::create("alf");
+    let roy = org.join(&alf, "roy", None, Role::Member);
+    let roster = org.verified(&alf.ring);
+    let invite = Invite::create(alf.ring.org(), "inv", "tok", "kit").unwrap();
+    let keys = DeviceKeys::generate().unwrap();
+    let verified = invite
+        .verify_join(&JoinRequest::new(&invite, Uuid::new_v4(), &keys))
+        .unwrap();
+    let info = |member_id, kind| ApprovalInfo {
+        member_id,
+        kind,
+        role: Role::Member,
+        approver_device: alf.device,
+        approved_at: 4,
+    };
+    for taken in [roy.member, alf.member] {
+        assert_eq!(
+            approve(
+                &alf.ring,
+                &roster,
+                &invite,
+                &verified,
+                info(taken, ApprovalKind::Member)
+            )
+            .unwrap_err(),
+            Error::Rejected("member id already in the roster")
+        );
+    }
+    assert!(approve(
+        &alf.ring,
+        &roster,
+        &invite,
+        &verified,
+        info(Uuid::new_v4(), ApprovalKind::Device)
+    )
+    .is_err());
+    // A device invite for roy under another handle is refused too.
+    assert!(approve(
+        &alf.ring,
+        &roster,
+        &invite,
+        &verified,
+        info(roy.member, ApprovalKind::Device)
+    )
+    .is_err());
+    assert!(approve(
+        &alf.ring,
+        &roster,
+        &invite,
+        &verified,
+        info(Uuid::new_v4(), ApprovalKind::Member)
+    )
+    .is_ok());
+}
+
+/// M1: one roster plaintext. What `keys` seals decodes through `wire`, and what `wire`
+/// serialises verifies through `keys`, for every entry type.
+#[test]
+fn roster_plaintext_round_trips_through_wire_and_keys() {
+    use awm_proto::wire::{decode_plaintext, Decoded, RosterPlaintext};
+    let (mut org, alf) = Org::create("alf");
+    let roy = org.join(&alf, "roy", None, Role::Member);
+    let laptop = org.join(&roy, "roy", Some(roy.member), Role::Member);
+    org.append_roster(
+        &roy,
+        &RosterEntry::Revoke {
+            member_id: roy.member,
+            device_id: Some(laptop.device),
+            revoked_at: 5,
+            by_device_id: roy.device,
+        },
+    );
+    let recovered = Dev {
+        member: alf.member,
+        device: Uuid::new_v4(),
+        keys: DeviceKeys::generate().unwrap(),
+        ring: alf.ring.clone(),
+    };
+    org.append_roster(
+        &recovered,
+        &RosterEntry::Recover {
+            member_id: alf.member,
+            handle: "alf".into(),
+            device_id: recovered.device,
+            device_pub: recovered.keys.public,
+            recovered_at: 6,
+        },
+    );
+    org.remove(&alf, roy.member);
+    org.append_roster(
+        &alf,
+        &RosterEntry::Epoch {
+            epoch: 0,
+            devices: vec![alf.device],
+            created_at: 7,
+            by_device_id: alf.device,
+        },
+    );
+    let mut types = BTreeSet::new();
+    let mut rebuilt = Vec::new();
+    for b in &org.roster {
+        let ad = RecordAd {
+            org: alf.ring.org(),
+            member: b.member,
+            device: b.device,
+            tag: ROSTER_TAG.into(),
+            idx: b.idx,
+            record_id: b.record_id,
+            epoch: b.epoch,
+        };
+        let plain = open_record(&alf.ring, &ad, &b.blob).unwrap();
+        let Ok(Decoded::Known(p)) = decode_plaintext::<RosterPlaintext>(&plain) else {
+            panic!("keys wrote a roster plaintext wire does not decode");
+        };
+        let v = serde_json::to_value(&p.entry).unwrap();
+        types.insert(v["type"].as_str().unwrap().to_string());
+        assert_eq!(serde_json::to_vec(&p).unwrap(), plain, "byte for byte");
+        // Re-seal the wire value as a record of the same stream: keys verifies it.
+        let bytes = serde_json::to_vec(&RosterPlaintext {
+            schema: 1,
+            entry: p.entry,
+        })
+        .unwrap();
+        rebuilt.push(RosterBlob {
+            blob: seal_record(alf.ring.get(b.epoch).unwrap(), &ad, &bytes).unwrap(),
+            ..b.clone()
+        });
+    }
+    assert_eq!(
+        types,
+        BTreeSet::from(["genesis", "approve", "recover", "revoke", "epoch"].map(String::from))
+    );
+    let report = Roster::verify(&alf.ring, &rebuilt, &BTreeSet::new());
+    assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+    assert_eq!(report.roster, org.verified(&alf.ring));
+    assert_eq!(
+        report.roster.status(&laptop.listed()),
+        DeviceStatus::Revoked
+    );
+    // The fixtures of the wire crate are entries keys accepts as such.
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1");
+    for t in ["genesis", "approve", "recover", "revoke", "epoch"] {
+        let text = std::fs::read(dir.join(format!("plaintext.roster.{t}.json"))).unwrap();
+        let Ok(Decoded::Known(p)) = decode_plaintext::<RosterPlaintext>(&text) else {
+            panic!("fixture {t}");
+        };
+        assert_eq!(serde_json::to_value(&p.entry).unwrap()["type"], t);
+    }
+}
+
+/// m6: a device approved by a device that is now revoked is wrapped but shown.
+#[test]
+fn a_device_approved_by_a_revoked_device_is_shown_to_the_rotating_admin() {
+    let (mut org, alf) = Org::create("alf");
+    let roy = org.join(&alf, "roy", None, Role::Member);
+    let laptop = org.join(&roy, "roy", Some(roy.member), Role::Member);
+    let phone = org.join(&laptop, "roy", Some(roy.member), Role::Member);
+    org.append_roster(
+        &roy,
+        &RosterEntry::Revoke {
+            member_id: roy.member,
+            device_id: Some(laptop.device),
+            revoked_at: 8,
+            by_device_id: roy.device,
+        },
+    );
+    let roster = org.verified(&alf.ring);
+    let plan = plan_rotation(
+        &alf.ring,
+        &roster,
+        &[alf.listed(), roy.listed(), laptop.listed(), phone.listed()],
+        &BTreeSet::new(),
+    );
+    assert_eq!(plan.revoked(), &[laptop.device]);
+    assert_eq!(plan.approved_by_removed(), &[phone.device]);
+    assert!(plan.wrap_to().iter().any(|d| d.device_id == phone.device));
 }

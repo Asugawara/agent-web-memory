@@ -2,7 +2,7 @@
 
 The end-to-end construction of awm team sync: epoch keys, the record envelope, device keys, invites and joins, approval, the roster, rotation, removal and recovery. It implements plan-v3-team §5.1 with the RV8-team changes (X1, M3, M4, M5, M6, M8, M14). Code: `crates/awm-proto/src/crypto.rs` (envelope) and `crates/awm-proto/src/keys.rs` (key flows). Tests: `crates/awm-proto/tests/crypto.rs`, `crates/awm-proto/tests/keys.rs`. Known-answer vectors: `crates/awm-proto/tests/vectors/v1/`. The wire format around these bytes is `docs/sync-v1.md` (TM2).
 
-Everything below is v1. Ciphertext written by v1 must stay readable: the vectors pin every byte, and a change to any of them is a new version (envelope byte `0x02`, `awmi2_`, `awmk2_`, wrap byte `0x02`), never an edit.
+Everything below is v1. Ciphertext written by v1 must stay readable: the vectors pin every byte, and a change to any of them is a new version (envelope byte `0x02`, `awmi2_`, `awmk2_`, wrap byte `0x02`), never an edit. The vectors are frozen from the first release: until then nothing written by v1 exists outside tests, and FT1 regenerated `keys.json` (`AWM_WRITE_VECTORS=1`) for the self-certifying organisation id (RVT1 B1); `envelope.json` did not change.
 
 ## 1. Primitives
 
@@ -29,13 +29,20 @@ Every HKDF `info` and every MAC label is distinct, so no key serves two purposes
 | `awm code v1` | the 6-digit code key from `S` |
 | `awm fp v1` | fingerprint hash prefix |
 | `awm export v1` | recovery export checksum prefix |
+| `awm org v1` | organisation id hash prefix (§2) |
 | `awm1` | record AD prefix |
 
 HKDF is always used with no salt (RFC 5869's zero salt) except for wraps, whose salt is `ephemeral public key ‖ recipient public key`.
 
 ## 2. Keys
 
-- **Organisation id**: a UUIDv4 made by the first admin's client together with `K_0` (`KeyRing::create`). It never changes; it is in every AD (M3).
+- **Organisation id**: derived by the first admin's client from its first device and a random nonce, together with `K_0` (`KeyRing::create(device id, public key)`, which returns the nonce):
+
+  ```
+  org = UUIDv4 bits set on the first 16 bytes of SHA-256("awm org v1" ‖ device id (16) ‖ device public key (32) ‖ org nonce (16))
+  ```
+
+  It is self-certifying (RVT1 B1): every member receives `org` in the invite string over the channel the admin trusts, and a `genesis` roster entry counts only if its device id, key and nonce hash to it (§7). It never changes; it is in every AD (M3). RVT1 proposed hashing the key and nonce only; FT1 also binds the device id, because otherwise any member could copy the genuine key and nonce into a genesis of their own stream, and the "two passing geneses are both rejected" rule would let any member deny the whole organisation its trust root.
 - **Epoch keys** `K_e`: 32 random bytes per epoch 0, 1, 2 ...; a key ring holds epochs 0 to n with no gaps (`KeyRing::from_keys` refuses anything else).
 - **`K_rec`** = HKDF-SHA256(`K_e`, "awm rec v1").
 - **`K_repo`** = HKDF-SHA256(`K_0`, "awm repo v1"), fixed for the organisation's life (M4). `repo_key(remote)` = the first 32 hex characters of HMAC-SHA256(`K_repo`, normalised remote). Normalising the remote is the caller's (§4.4). `RepoKey::encode` is the content of `team.repo`.
@@ -66,7 +73,7 @@ AD = "awm1" ‖ org (16) ‖ member (16) ‖ device (16) ‖ len (1) ‖ tag ‖
 | org | UUID, 16 bytes | a record cannot move to another organisation (or tenant) |
 | member | UUID, 16 bytes | nor to another member's stream |
 | device | UUID, 16 bytes | nor to another device's stream |
-| tag | 1-byte length, then 1-32 bytes of `[a-z0-9_]` | the record kind: `rec`, `flag`, `stats`, `policy`, `roster`; a `rec` cannot be replayed as a `roster` entry |
+| tag | 1-byte length, then a wire tag (`[a-z][a-z0-9_]{0,15}`, `docs/sync-v1.md` §8.1); the AD encoding accepts up to 32 bytes of `[a-z0-9_]` | the record kind: `rec`, `flag`, `stats`, `policy`, `roster`; a `rec` cannot be replayed as a `roster` entry |
 | idx | u64 big-endian | nor to another position (reorder) |
 | record id | UUID, 16 bytes | nor under another id (the deletion stream and tombstones name ids) |
 | epoch | u32 big-endian | nor to another epoch, even if two epochs held the same key |
@@ -145,21 +152,23 @@ auth (join, mode 1)     = HMAC-SHA256( HKDF(S, "awm wrap-auth v1"), transcript )
 auth (rotation, mode 2) = HMAC-SHA256( HKDF(K_{e-1}, "awm rot-auth v1"), transcript )
 ```
 
-A wrap on the wire is `{device id, epoch, approver device, blob, auth}`. A wrap for one device does not open for another (`a_wrap_for_one_device_does_not_open_for_another`: neither under the other device's id nor relabelled).
+A wrap on the wire is `{device id, epoch, approver device, blob, auth}`: `blob` travels as `wrap` (exactly 140 base64url characters) and the approver device as `created_by` in `GET /v1/keys`; the device id comes from the path or the `device_id` field, the epoch from the item or the request, and the approver is the caller when a wrap is posted (`docs/sync-v1.md` §6). A wrap for one device does not open for another (`a_wrap_for_one_device_does_not_open_for_another`: neither under the other device's id nor relabelled).
 
 ## 6. Approval
 
 `awm team approve` (and the automatic approval of one's own devices, §4.6 step 7):
 
 1. `Invite::verify_join(request)`: the MAC verifies under this invite's `S`; the result shows fingerprint and code.
-2. `approve(ring, invite, verified, info)`: one wrap per epoch 0 to n, mode 1 (authenticated with `S`), plus a roster `approve` entry.
+2. `approve(ring, roster, invite, verified, info)`: one wrap per epoch 0 to n, mode 1 (authenticated with `S`), plus a roster `approve` entry. The approver takes kind, handle and (device invites) the member id from its own invite record, never from the server's `pending` list. `approve` refuses a `member` approval whose member id the approver's verified roster already holds, a `device` approval for a member it does not hold under that handle, and a device id it already holds (RVT1 M2).
 3. The approver seals the roster entry into its own `roster` stream (`seal_roster`) and pushes it with the wraps.
 
 The joining device runs `accept_join(invite, device id, keys, wraps)`: every wrap must be for it, carry a valid `S` authenticator, open with its key, and together the wraps must hold epochs 0 to n. The server never sees `S`, so it cannot slip in a key it knows (`p2_a_wrap_not_authenticated_with_s_is_rejected`: a server-made approval, a modified authenticator, a spliced blob and a changed epoch are all rejected).
 
+The wraps do not bind the member id the server assigned. Before its first push the joining device verifies the roster and runs `Roster::check_own_approval(device id, member id, handle, public key)`: a verified, non-revoked entry must name its device with the member id and handle of its join response and its own key, else it refuses to push (`a_joining_device_checks_its_own_roster_entry_before_pushing`, `an_approval_reusing_a_member_id_is_refused`).
+
 ## 7. The roster (RV8-team X1)
 
-Every approval, recovery, revocation and rotation appends a roster record to the writing device's own `roster` stream, sealed under the current epoch key like any record. Plaintext (JSON):
+Every approval, recovery, revocation and rotation appends a roster record to the writing device's own `roster` stream, sealed under the current epoch key like any record. Plaintext (JSON; `wire::RosterPlaintext`, whose `entry` is `keys::RosterEntry`, so the wire schema and the verifier read one type: `roster_plaintext_round_trips_through_wire_and_keys`, RVT1 M1):
 
 ```json
 {"schema": 1, "entry": {"type": "approve", "member_id": "…", "handle": "alice", "role": "member",
@@ -169,24 +178,26 @@ Every approval, recovery, revocation and rotation appends a roster record to the
 
 | `type` | fields | written by | valid when |
 |---|---|---|---|
-| `genesis` | member_id, handle, device_id, device_pub, created_at | the first admin's first device (`awm team create`) | index 0, epoch 0, member and device equal the stream's; only one |
+| `genesis` | member_id, handle, device_id, device_pub, org_nonce (16 bytes, base64url), created_at | the first admin's first device (`awm team create`) | index 0, epoch 0, member and device equal the stream's, and SHA-256("awm org v1" ‖ device_id ‖ device_pub ‖ org_nonce) gives the organisation id (§2); any other genesis is rejected, and if two pass, both are; `created_at` and order are never trusted (`a_genesis_written_by_a_member_is_rejected`, `only_a_genesis_that_hashes_to_the_organisation_id_counts`) |
 | `approve` | member_id, handle, role, kind (`member` or `device`), device_id, device_pub, approved_at, approver_device_id | the approving device | approver = writer; writer verified and of the stream's member; `member` kind: writer is an admin and the member id is new; `device` kind: the member exists, writer is that member or an admin, handle matches; the device id is new |
 | `recover` | member_id, handle, device_id, device_pub, recovered_at | the new device of an admin restoring an export | member and device equal the stream's; the member is an admin in the roster; the device id is new |
-| `revoke` | member_id, device_id (absent: the whole member), revoked_at, by_device_id | an admin, or a member for their own devices | writer verified, revoker = writer; the device belongs to the member |
+| `revoke` | member_id, device_id (absent: the whole member), revoked_at, by_device_id | an admin, or a member for their own devices | writer verified, revoker = writer; the device belongs to the member. A revocation is not retroactive: records the revoked device writes later are refused by an honest server, not by the roster (P4 class, RVT1 m6) |
 | `epoch` | epoch, devices, created_at, by_device_id | the rotating admin, sealed under the new epoch | writer an admin; sealed under the epoch it names |
 
 `Roster::verify(ring, blobs, extra_admins)` opens each record with the AD of the stream it was served from, so the server can neither forge a record (it holds no `K_e`) nor move one (`a_roster_entry_with_a_forged_ad_is_rejected`: another stream, index, record id or epoch, and a record sealed under a server key, are all rejected). It then applies entries to a fixpoint (an entry waits until its writer is verified, so order does not matter: `roster_order_does_not_matter_and_authority_is_checked`), then revocations and epoch records. A member's removal revokes all its devices, including ones approved later.
 
-Admins are the genesis member and members approved with role `admin` by an admin. `extra_admins` lets the caller add the server's role list, which is needed after `awm serve promote` when no roster admin is left; doing so trusts the server's word on roles, which matters only to a member who also colludes with the server (P4/P5 class), because the server alone still cannot write a roster record.
+Admins are the genesis member and members approved with role `admin` by an admin. `extra_admins` applies only when the verified roster holds no non-revoked admin (recovery after `awm serve promote`), and only for the members the user confirms in `awm team members --trust-admin @h`; in that state the operator decides who is admin, and that is stated in `awm team status`. `Roster::verify` first verifies without `extra_admins`; if a non-revoked admin is verified it ignores them and sets `RosterReport::extra_admins_ignored` (RVT1 M5; `extra_admins_are_ignored_while_the_roster_holds_a_verified_admin`, `extra_admins_apply_only_when_no_admin_is_left`). An admin who lost every device and holds no export, and was never revoked, stays a verified admin, so `extra_admins` does not apply; recovery then goes through the export (§9).
+
+A roster record with a higher `schema` does not count (fail closed); the client keeps it in `roster_record` and verifies it after an upgrade (`docs/sync-v1.md` §14.4).
 
 `Roster::status(listed device)` gives `verified`, `unverified` (no roster entry: `awm team members` shows `unverified`), `mismatch` (the server lists another member or key than the roster) or `revoked`.
 
-Clients store the verified result in `team_member` and `team_device` (§4.4) and re-verify when new roster records arrive. If the server deletes or withholds roster records, devices fall back to `unverified` and get no wraps: the failure is closed (fewer wraps, never more). For the same reason server retention must never delete `roster` records: a joiner verifies the whole chain from the genesis entry.
+Clients store the verified result in `team_member` and `team_device` (§4.4), keep every roster record they have pulled or written in `roster_record`, and re-verify over those together with the server's when new roster records arrive. Withheld approvals fail closed (fewer wraps). Withheld revocations would not, so clients keep every roster record they have seen and never clear a revocation: `team_device.revoked` and a member's removal only rise (`docs/sync-v1.md` §11, RVT1 M3). Server retention must never delete `roster` records: a joiner verifies the whole chain from the genesis entry.
 
 ## 8. Rotation and removal
 
 1. `awm team remove @h` appends a roster `revoke` of the member (`device_id` absent) and the server sets `rotation_needed`.
-2. The next admin client to sync runs `plan_rotation(ring, roster, listed devices, removed members)`. A listed device gets a wrap only if it has a verified roster entry with the same member and public key (the roster's key is used, not the server's), is not revoked and is not a removed member's. The plan reports the rest: `unverified`, `mismatch`, `revoked`, `removed`, `not_listed` (verified but not listed by the server, which then cannot store a wrap), and `approved_by_removed` (devices of other members that the removed member approved: wrapped, but shown to the admin, because an admin could have enrolled a device under another member's id before being removed).
+2. The next admin client to sync runs `plan_rotation(ring, roster, listed devices, removed members)`. A listed device gets a wrap only if it has a verified roster entry with the same member and public key (the roster's key is used, not the server's), is not revoked and is not a removed member's. The plan reports the rest: `unverified`, `mismatch`, `revoked`, `removed`, `not_listed` (verified but not listed by the server, which then cannot store a wrap), and `approved_by_removed` (devices of other members that the removed member approved, and devices whose approving device is now revoked: wrapped, but shown to the admin, because an admin could have enrolled a device under another member's id before being removed, and a lost device could have approved one before its revocation; `a_device_approved_by_a_revoked_device_is_shown_to_the_rotating_admin`, RVT1 m6).
 3. `rotate(ring, plan, by_device, now)` makes `K_{e+1}`, wraps it to the planned devices (mode 2, authenticated with `K_e`), and returns the `epoch` roster entry, which the admin seals under `K_{e+1}`. The admin keeps `K_{e+1}` with `KeyRing::adopt_own_rotation`.
 4. Each device runs `KeyRing::accept_rotation(device id, keys, wrap)`: the wrap must be for epoch current + 1 and this device, authenticated with its current `K_e`, and open with its key.
 5. From then on the server refuses pushes under older epochs (409, §4.3.2). Old records stay under their epochs.
@@ -203,7 +214,7 @@ Clients store the verified result in `team_member` and `team_device` (§4.4) and
   awmk1_ ‖ base64url-nopad( org (16) ‖ n (u32 BE) ‖ n × (epoch (u32 BE) ‖ K_e (32)) ‖ first 4 bytes of SHA-256("awm export v1" ‖ everything before) )
   ```
 
-  for a password manager. The string is the keys themselves (no password: the password manager is the protection); the checksum catches typing errors (`a_recovery_export_rejects_typos_and_gaps`). An admin who lost every device imports it on a new device, obtains a device token for their member id from the server (`awm serve promote` or the operator's path, TM7), and appends a `recover` roster entry for the new device in its own stream. Other clients accept it because the member is an admin in the roster; a non-admin cannot self-enrol this way. The restored admin can then rotate, and remaining devices accept its wraps (`a_recovery_export_restores_an_admins_ability_to_rotate`).
+  for a password manager. The string is the keys themselves (no password: the password manager is the protection); the checksum catches typing errors (`a_recovery_export_rejects_typos_and_gaps`). After an import the client opens the genesis record with `K_0`, checks that it hashes to the export's `org` (§2), and refuses an export whose `org` differs from `team.toml` (TM12, RVT1 m12). An admin who lost every device imports it on a new device, obtains a device token for their member id from the server (`awm serve promote` or the operator's path, TM7), and appends a `recover` roster entry for the new device in its own stream. Other clients accept it because the member is an admin in the roster; a non-admin cannot self-enrol this way. The restored admin can then rotate, and remaining devices accept its wraps (`a_recovery_export_restores_an_admins_ability_to_rotate`).
 - If every device of every member is lost and no export exists, the server's data is unreadable (the cost of P1).
 
 ## 10. What the server sees
@@ -225,9 +236,9 @@ Never: plaintext, epoch keys, `K_repo`, invite secrets, device private keys. Tes
 | property (§5.1) | outcome in v1 | tests |
 |---|---|---|
 | P1: the server alone reads no record | holds | `crypto::p1_envelope_shows_the_server_nothing_but_its_length`, `keys::p1_nothing_the_server_receives_holds_a_key_or_plaintext` |
-| P2: the server alone cannot make a device accept a key it knows, at join or rotation, nor make a rotating admin wrap to a device it controls | holds (join: `S`; rotation: `K_e`; roster: X1) | `p2_a_wrap_not_authenticated_with_s_is_rejected`, `p2_a_rotation_wrap_forged_by_the_server_is_rejected`, `p2_a_rotation_wraps_nothing_to_an_extra_server_listed_device`, `p2_a_rotation_wraps_nothing_to_a_server_substituted_key`, `a_roster_entry_with_a_forged_ad_is_rejected`, `a_join_with_a_wrong_mac_is_rejected` |
-| P3: a removed member alone cannot read records written after the rotation | holds; no wrap to a removed or revoked device is produced | `p3_after_rotation_the_removed_members_keys_open_no_new_epoch_record`, `p3_a_revoked_device_of_a_remaining_member_gets_no_wrap` |
-| P4: a removed member colluding with the server | **not defended in v1** (decision below) | `p4_not_defended_removed_member_colluding_with_server_can_push_a_known_key` pins the gap |
+| P2: the server alone cannot make a device accept a key it knows, at join or rotation, nor make a rotating admin wrap to a device it controls | holds (join: `S`; rotation: `K_e`; roster: X1 with the self-certifying genesis of RVT1 B1) | `p2_a_wrap_not_authenticated_with_s_is_rejected`, `p2_a_rotation_wrap_forged_by_the_server_is_rejected`, `p2_a_rotation_wraps_nothing_to_an_extra_server_listed_device`, `p2_a_rotation_wraps_nothing_to_a_server_substituted_key`, `a_roster_entry_with_a_forged_ad_is_rejected`, `a_join_with_a_wrong_mac_is_rejected` |
+| P3: a removed member alone cannot read records written after the rotation | holds; no wrap to a removed or revoked device is produced, and a member cannot replace the genesis to plant one (RVT1 B1) | `p3_after_rotation_the_removed_members_keys_open_no_new_epoch_record`, `p3_a_revoked_device_of_a_remaining_member_gets_no_wrap`, `a_genesis_written_by_a_member_is_rejected` |
+| P4: a removed member colluding with the server | **not defended in v1** (decision below). Such a pair can forge any roster entry (approvals as any admin device, revocations of the admins), not only rotation wraps; with RVT1 B1's fix it cannot forge the genesis (RVT1 m13) | `p4_not_defended_removed_member_colluding_with_server_can_push_a_known_key` pins the gap |
 | P5: authorship against a member colluding with the server | not defended in v1, as the plan says | `p5_not_defended_member_can_seal_a_record_in_another_members_stream` |
 
 ### 11.1 P4 decision
@@ -244,13 +255,13 @@ What closes it later (additive within v1's versioning rules): an `admin_key` ros
 
 ## 12. Procedures
 
-- **Create**: `KeyRing::create` → organisation id and `K_0`; device key pair; seal a `genesis` roster entry at index 0 of the admin's own `roster` stream under epoch 0; write `team.key` (device secret, epoch keys, pending invite secrets) and `team.repo` (`K_repo`), both mode 0600.
+- **Create**: device key pair and device id first; `KeyRing::create(device id, public key)` → organisation id, `K_0` and the org nonce; seal a `genesis` roster entry (with the nonce) at index 0 of the admin's own `roster` stream under epoch 0; write `team.key` (device secret, epoch keys, pending invite secrets) and `team.repo` (`K_repo`), both mode 0600.
 - **Invite**: server issues id and token → `Invite::create` → print `Invite::encode`; keep the invite (with `S`) in `team.key` until approved or expired.
-- **Join**: `Invite::parse` → `DeviceKeys::generate` → `JoinRequest::new` → `POST /v1/join`; print the fingerprint and `Invite::confirmation_code`; poll `GET /v1/keys`; `accept_join` on the wraps; write `team.key` and `team.repo`.
-- **Approve**: `verify_join` → show fingerprint and code (member joins) → `approve` → `POST /v1/devices/{id}/approve` with the wraps → seal and push the roster entry.
+- **Join**: `Invite::parse` → `DeviceKeys::generate` → `JoinRequest::new` → `POST /v1/join`; print the fingerprint and `Invite::confirmation_code`; poll `GET /v1/keys`; `accept_join` on the wraps; write `team.key` and `team.repo`; before the first push, pull the roster and pass `Roster::check_own_approval` (§6).
+- **Approve**: `verify_join` → show fingerprint and code (member joins) → `approve` (with the verified roster) → `POST /v1/devices/{id}/approve` with the wraps → seal and push the roster entry.
 - **Remove and rotate**: `revoke` roster entry → `plan_rotation` (show `approved_by_removed`) → `rotate` → `POST /v1/keys/rotate` → seal the `epoch` entry under the new key and push it → `adopt_own_rotation`.
 - **Recover**: as §9.
 
 ## 13. Zeroisation
 
-Secret key material is overwritten on drop where the crates support it: `Secret32` (epoch keys, `K_rec`, `K_repo`, invite secrets, derived MAC keys), `EpochKey`, `DeviceKeys` (through `x25519-dalek`'s `StaticSecret`), `SharedSecret`, the AEAD key schedule (`chacha20poly1305` `zeroize`), HMAC state (`hmac` `zeroize`), and the padded plaintext and wrap buffers after use (`secret_material_is_zeroized_on_drop` checks the trait bounds and the explicit `zeroize`). Not covered: strings the caller asks for (`Invite::encode`, `KeyRing::export_recovery`, `RepoKey::encode`, the JSON of `team.key`), decrypted plaintext returned to the caller, by-value copies made when a 32-byte array is passed to a constructor, and anything the operating system swaps to disk.
+Secret key material is overwritten on drop where the crates support it: `Secret32` (epoch keys, `K_rec`, `K_repo`, invite secrets, derived MAC keys), `EpochKey`, `DeviceKeys` (through `x25519-dalek`'s `StaticSecret`), `SharedSecret`, the AEAD key schedule (`chacha20poly1305` `zeroize`), HMAC state (`hmac` `zeroize`), and the padded plaintext and wrap buffers after use (`secret_material_is_zeroized_on_drop` checks the trait bounds and the explicit `zeroize`). Not covered: strings the caller asks for (`Invite::encode`, `KeyRing::export_recovery`, `RepoKey::encode`, the JSON of `team.key`), decrypted plaintext returned to the caller, by-value copies made when a 32-byte array is passed to a constructor, the HKDF PRK inside `hkdf` 0.13 (no zeroize support in that crate; RVT1 m11), and anything the operating system swaps to disk.

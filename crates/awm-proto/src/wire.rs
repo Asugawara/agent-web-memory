@@ -688,12 +688,16 @@ pub enum Role {
     Unknown,
 }
 
-/// What an invite admits: a new member, or a further device of an existing member.
+/// What an invite admits: a new member, or a further device of an existing member. Responses
+/// (`status.pending`) accept a kind this build does not know as `Unknown`, which an approver
+/// never approves; a server refuses `Unknown` in a request with 400 `invalid_value` (RVT1 m3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InviteKind {
     Member,
     Device,
+    #[serde(other)]
+    Unknown,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -917,7 +921,9 @@ pub struct JoinRequest {
     pub handle: Handle,
     pub device_id: Id,
     pub device_pubkey: Key32,
-    /// `MAC_S(org ‖ invite id ‖ handle ‖ device id ‖ public key)` (TM3).
+    /// `HMAC-SHA256(HKDF(S, "awm join v1"), "awm join v1" ‖ org ‖ lp(invite id) ‖ lp(handle) ‖
+    /// device id ‖ public key)`, the invite id as its canonical 36-character text
+    /// (`docs/sync-v1-crypto.md` §4.2, `keys::Invite::join_mac`).
     pub join_mac: Key32,
 }
 
@@ -1445,7 +1451,8 @@ pub struct InviteResponse {
 pub struct EpochWrap {
     pub epoch: u32,
     pub wrap: B64,
-    /// `MAC_S` over the wrap and its bindings (TM3, §5.3).
+    /// The join-mode wrap authenticator under `HKDF(S, "awm wrap-auth v1")` (§5.3,
+    /// `docs/sync-v1-crypto.md` §5).
     pub auth: Key32,
 }
 
@@ -1735,57 +1742,27 @@ pub struct PolicyPlaintext {
     pub summary_chars: Option<u32>,
 }
 
-/// What a `roster` record states.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RosterKind {
-    /// A device was approved: `member_id`, `handle`, `role`, `device_id`, `device_pubkey`.
-    Approve,
-    /// A device (`device_id`) or a whole member (no `device_id`) was revoked.
-    Revoke,
-    /// A new epoch: `epoch` and the `devices` it was wrapped to.
-    Epoch,
-}
-
-/// Tag `roster` (plan-v3-team §5.1, RV8-team X1). TM3 and TM12 may add optional fields only.
+/// Tag `roster` (plan-v3-team §5.1, RV8-team X1): `{schema, entry}`, where `entry` is the
+/// [`crate::keys::RosterEntry`] that `keys::seal_roster` seals and `keys::Roster::verify`
+/// checks (`docs/sync-v1-crypto.md` §7). One type serves the wire and the key flows (RVT1 M1).
+/// TM12 may add optional fields only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RosterPlaintext {
     pub schema: u32,
-    pub kind: RosterKind,
-    pub member_id: Id,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub handle: Option<Handle>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role: Option<Role>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device_id: Option<Id>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device_pubkey: Option<Key32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub epoch: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub devices: Option<Vec<Id>>,
-    /// Unix seconds.
-    pub at: i64,
-    pub approver_device_id: Id,
+    pub entry: crate::keys::RosterEntry,
 }
 
 // ---------------------------------------------------------------------------------------------
 // Envelope structure (the server's only look at a blob)
 
-/// The server's structural check of a pushed blob (§9.1 step 2): 413 above 16 KiB, 422 unless
-/// the first byte is [`ENVELOPE_VERSION`] and the length is `41 + 256·k` with `k ≥ 1`.
+/// The server's structural check of a pushed blob (§9.1 step 3): 413 above 16 KiB, 422 unless
+/// the first byte is [`ENVELOPE_VERSION`] and the length is `41 + 256·k` with `k ≥ 1`. It is
+/// [`crate::crypto::check_structure`], so the server and the envelope code share one accept
+/// set (RVT1 m9).
 pub fn check_envelope(blob: &[u8]) -> Result<(), ErrorCode> {
-    use limits::*;
-    if blob.len() > BLOB_BYTES {
-        return Err(ErrorCode::TooLarge);
-    }
-    let shaped = blob.len() >= ENVELOPE_OVERHEAD + PAD_BUCKET
-        && (blob.len() - ENVELOPE_OVERHEAD).is_multiple_of(PAD_BUCKET)
-        && blob[0] == ENVELOPE_VERSION;
-    if shaped {
-        Ok(())
-    } else {
-        Err(ErrorCode::BadEnvelope)
+    match crate::crypto::check_structure(blob) {
+        Ok(_) => Ok(()),
+        Err(crate::crypto::Error::TooLarge) => Err(ErrorCode::TooLarge),
+        Err(_) => Err(ErrorCode::BadEnvelope),
     }
 }

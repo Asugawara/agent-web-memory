@@ -95,7 +95,9 @@ fn cases() -> Vec<Case> {
         "plaintext.flag" => "plaintext.flag", Plaintext, FlagPlaintext;
         "plaintext.stats" => "plaintext.stats", Plaintext, StatsPlaintext;
         "plaintext.policy" => "plaintext.policy", Plaintext, PolicyPlaintext;
+        "plaintext.roster.genesis" => "plaintext.roster", Plaintext, RosterPlaintext;
         "plaintext.roster.approve" => "plaintext.roster", Plaintext, RosterPlaintext;
+        "plaintext.roster.recover" => "plaintext.roster", Plaintext, RosterPlaintext;
         "plaintext.roster.revoke" => "plaintext.roster", Plaintext, RosterPlaintext;
         "plaintext.roster.epoch" => "plaintext.roster", Plaintext, RosterPlaintext;
     };
@@ -838,6 +840,12 @@ fn unknown_tags_roles_and_error_codes_decode() {
         serde_json::from_value(json!({"error": "quota_exceeded", "message": "x"})).unwrap();
     assert_eq!(e.error, ErrorCode::Unknown);
     assert_eq!(e.error.status(), None);
+
+    // A later invite kind in `status.pending` does not break the whole status (RVT1 m3).
+    let mut status = fixture("status.response");
+    status["pending"][0]["kind"] = json!("guest");
+    let s: StatusResponse = serde_json::from_value(status).unwrap();
+    assert_eq!(s.pending[0].kind, InviteKind::Unknown);
 }
 
 #[test]
@@ -1049,6 +1057,42 @@ fn the_envelope_check_separates_413_from_422() {
     let common = read_json(&schema_dir().join("common.schema.json"));
     assert_eq!(common["$defs"]["blob"]["minLength"], json!(396));
     assert_eq!(common["$defs"]["blob"]["maxLength"], json!(21_846));
+    // A wrap is exactly `keys::WRAP_LEN` bytes: 140 characters, no trailing bits (RVT1 m7).
+    assert_eq!(awm_proto::keys::WRAP_LEN, 105);
+    assert_eq!(
+        common["$defs"]["epoch_wrap_bytes"]["pattern"],
+        json!(format!(
+            "^[A-Za-z0-9_-]{{{}}}$",
+            b64_len(awm_proto::keys::WRAP_LEN)
+        ))
+    );
+}
+
+/// RVT1 m9: the server's check and the envelope code accept exactly the same lengths.
+#[test]
+fn the_wire_and_crypto_envelope_checks_agree_on_every_length() {
+    use awm_proto::crypto;
+    assert_eq!(limits::BLOB_BYTES, crypto::MAX_ENVELOPE);
+    assert_eq!(limits::ENVELOPE_OVERHEAD, crypto::OVERHEAD);
+    assert_eq!(limits::PAD_BUCKET, crypto::PAD_BUCKET);
+    assert_eq!(ENVELOPE_VERSION, crypto::ENVELOPE_VERSION);
+    for len in 0..=16_400 {
+        for first in [crypto::ENVELOPE_VERSION, 2] {
+            let mut b = vec![0u8; len];
+            if let Some(x) = b.first_mut() {
+                *x = first;
+            }
+            let wire = check_envelope(&b);
+            let structure = crypto::check_structure(&b);
+            match structure {
+                Ok(_) => assert_eq!(wire, Ok(()), "{len}"),
+                Err(crypto::Error::TooLarge) => {
+                    assert_eq!(wire, Err(ErrorCode::TooLarge), "{len}")
+                }
+                Err(_) => assert_eq!(wire, Err(ErrorCode::BadEnvelope), "{len}"),
+            }
+        }
+    }
 }
 
 #[test]

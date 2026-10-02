@@ -61,11 +61,11 @@ HTTPS only (plan-v3-team §5.4); a client refuses `http://` other than loopback.
 
 The organisation's `min_client` is a server setting (`GET`, `PUT /v1/org/settings`; RV8-team M26), raised only, never below the server release's floor (`GET /v1/info` `min_client`). A request whose `Awm-Client` version is below the organisation's `min_client` by semantic-versioning precedence (a pre-release sorts below its release: `0.2.1-rc.1` < `0.2.1`) gets **426 `client_too_old`** with `min_client` in the body, on exactly these endpoints, the ones that add content or devices:
 
-- `POST /v1/records`
+- `POST /v1/records`, except a request whose items are all `roster` items or markers (RVT1 m5)
 - `POST /v1/join`
 - `POST /v1/bootstrap` (against the release floor; there is no organisation yet)
 
-Everything else continues for an old client, so it can still pull, delete its records, rotate its token, leave, and (as an admin) remove members and rotate keys. `GET /v1/info` is cached by the client for an hour (plan-v3-team §4.6 step 2); the organisation's value is in every `GET /v1/status`.
+Everything else continues for an old client, so it can still pull, delete its records, rotate its token, leave, and (as an admin) remove members and rotate keys. The exemption lets such a client publish the roster revocations and epoch records that go with a removal or rotation, and fill indexes with markers after a 410. `GET /v1/info` is cached by the client for an hour (plan-v3-team §4.6 step 2); the organisation's value is in every `GET /v1/status`.
 
 ### 2.4 Response headers
 
@@ -77,7 +77,7 @@ Everything else continues for an old client, so it can still pull, delete its re
 
 | id | made by | when | notes |
 |---|---|---|---|
-| `org_id` | the first admin's client, with `K_0` | `awm team create` (`POST /v1/bootstrap`) or `awm cloud login` | never changes: it is in every record's associated data (§5.1); an export and import keep it; it is the `{org}` part of every token (RV8-team M3) |
+| `org_id` | the first admin's client, with `K_0`: derived from the first device's id and public key and a random nonce (`docs/sync-v1-crypto.md` §2, RVT1 B1) | `awm team create` (`POST /v1/bootstrap`) or `awm cloud login` | never changes: it is in every record's associated data (§5.1); an export and import keep it; it is the `{org}` part of every token (RV8-team M3); the genesis roster record must hash to it |
 | `member_id` | the server, random UUIDv4 | bootstrap, or a member join | survives device loss: a device invite for an existing member keeps it (RV8-team M6) |
 | `device_id` | the joining client, random UUIDv4 | bootstrap or join | a second device with an existing id gets 409 `device_conflict` |
 | record `id` | the writing client, random UUIDv4 | before the push (`event.sync_id`) | unique per organisation, also against the deletion stream (§9, §10.3) |
@@ -92,7 +92,7 @@ Everything else continues for an old client, so it can still pull, delete its re
 | invite (the server's half of an invite) | `awm_i_{org}_{secret}` | `POST /v1/join` body | SHA-256 hex |
 | bootstrap | `awm_b_{secret}` | `POST /v1/bootstrap` body | SHA-256 hex (path A: `AWM_BOOTSTRAP_SHA256`, plan-v3-team §4.8.1) |
 
-`{org}` is the canonical 36-character `org_id`; `{secret}` is 32 random bytes as 43 base64url characters. Because both parts have a fixed length, the `_` and `-` that base64url allows in the secret never make the split ambiguous: a parser takes the prefix, 36 characters, one `_`, then exactly 43 characters. The server reads `{org}` before any lookup (the cloud sets row-level security from it, plan-v3-team §4.2) and answers 401 `unauthenticated` when the organisation is not one it serves, when the hash is unknown, or when the token, device or member is revoked. Tokens are shown once and never logged; request logs keep the organisation id and the first 6 characters of the secret (plan-v3-team §4.3.1 "token prefix"). The invite string that travels between people, `awmi1_{invite id}_{invite token}_{S}`, is TM12's; only the invite id and invite token reach the server, never `S` (plan-v3-team §5.1).
+`{org}` is the canonical 36-character `org_id`; `{secret}` is 32 random bytes as 43 base64url characters. Because both parts have a fixed length, the `_` and `-` that base64url allows in the secret never make the split ambiguous: a parser takes the prefix, 36 characters, one `_`, then exactly 43 characters. The server reads `{org}` before any lookup (the cloud sets row-level security from it, plan-v3-team §4.2) and answers 401 `unauthenticated` when the organisation is not one it serves, when the hash is unknown, or when the token, device or member is revoked. Tokens are shown once and never logged; request logs keep the organisation id and the first 6 characters of the secret (plan-v3-team §4.3.1 "token prefix"). The invite string that travels between people is `awmi1_` + base64url(org ‖ S ‖ lp(invite id) ‖ lp(invite token) ‖ lp(handle)) (`docs/sync-v1-crypto.md` §4.1); only the invite id and invite token reach the server, never `S` (plan-v3-team §5.1). The joiner checks that the invite string's `org` equals the `{org}` of its invite token (TM12).
 
 ## 4. What the server stores and sees
 
@@ -131,16 +131,22 @@ TM3 must encode the AD so that no two field tuples produce the same bytes (fixed
 | `current_epoch`, `rotation_needed` | claim an old epoch, or withhold the rotation flag | a client never encrypts under an epoch lower than the highest it holds a verified wrap for; an admin client also rotates when its own roster holds a revocation newer than the current epoch's roster entry, whatever `rotation_needed` says (TM12) |
 | `GET /v1/members`: handles, roles, devices, public keys, `active` | add devices, change handles or roles | handles and device keys are taken from the verified roster (§5.3); a device without a verified roster entry is `unverified` and never receives a wrap (RV8-team X1); a role shown by the server only decides what the server will accept from that member |
 | `pending` devices (`device_pubkey`, `handle`, `invite_id`, `join_mac`) | substitute a key | the approver recomputes the join MAC with `S`; a mismatch is not approved |
-| `member_id` and `device_token` in join and bootstrap responses | assign another member id | the approval wrap's authenticator binds the member id (§5.3) |
+| roster records (withheld, or lost in a restore) | withhold approvals or revocations | clients keep every roster record they have seen (`roster_record`) and verify over those together with the server's; a revocation or removal never goes back (§11, RVT1 M3) |
+| `member_id` and `device_token` in join and bootstrap responses | assign another member id | the joining device checks, before its first push, that a verified roster `approve` entry names its device id with the member id and handle of its join response (`keys::Roster::check_own_approval`), else it refuses to push; the approver takes `kind`, `handle` and, for device invites, the member id from its own invite record (never from `pending`), and refuses a `member` approval whose `member_id` its verified roster already holds (`keys::approve`; RVT1 M2) |
+| `StreamRecords.member`, `.device`, `.tag` in pull and records responses | answer cursor X with the records of stream Y | a reader matches each entry to a cursor it sent, builds the AD and advances the head from that cursor, and ignores streams it did not ask for (RVT1 m4) |
+| `status.org_id`, `.member_id`, `.device_id`, `.role` | claim other ids or another role | the client uses the ids stored at join and the roster's role, never these |
+| `pending[].kind`, `.member_id` | relabel a device join as a member join, or name another member | the approver takes kind, handle and member id from its own invite record (row above); an `Unknown` kind is never approved |
+| `deletions.oldest` | set it above `deletion_head + 1` on every run | a full reconcile at most once per 24 h, with an `awm doctor` notice |
+| deletion entries and 410 `ids` naming the member's **own** `origin = 'local'` records | delete the author's local history | not defended, as for teammates' rows (plan-v3-team §5.3 item 4); TM11 decides between deleting the local row and keeping it with `shareable = 'never'`, and records the choice here |
 | `settings` (`retention_days`, `min_client`, `max_members`) | shorten retention, raise `min_client` | `retention_days` is ≥ 30 and a decrease shows for 7 days before it applies (§10.4); `min_client` only blocks pushes and joins |
 | `restore_pending`, error bodies | refuse service | denial of service is not defended |
 
 ### 5.3 Fields bound by MACs and authenticators (TM3)
 
-- `join_mac` = `MAC_S(org ‖ invite id ‖ handle ‖ device id ‖ device public key)` (plan-v3-team §5.1), so a pending device's key, id and handle cannot be substituted.
-- An approval wrap's `auth` (`MAC_S`) must bind `org ‖ member id ‖ device id ‖ device public key ‖ epoch ‖ wrap`, so the server cannot move a wrap to another device or epoch or slip the device a key it made.
-- A rotation wrap's `auth` (`MAC_{K_{e-1}}`) must bind `org ‖ device id ‖ device public key ‖ epoch ‖ wrap` (`epoch` the new epoch).
-- `roster` records are records: their AD (§5.1) binds the approving device's stream and index; their plaintext (§15.5) binds member id, handle, role, device id and public key.
+- `join_mac` = HMAC-SHA256(HKDF(S, "awm join v1"), "awm join v1" ‖ org ‖ lp(invite id) ‖ lp(handle) ‖ device id ‖ device public key) (`docs/sync-v1-crypto.md` §4.2); the invite id is its canonical 36-character text. A pending device's key, id and handle cannot be substituted.
+- An approval wrap's `auth` = HMAC-SHA256(HKDF(S, "awm wrap-auth v1"), "awm wrap-auth v1" ‖ 0x01 ‖ org ‖ device id ‖ epoch ‖ device public key ‖ approver device (`created_by`) ‖ len ‖ wrap) (crypto §5). The server cannot move a wrap to another device or epoch or slip the device a key it made. It does not bind the member id; the roster does (§5.2).
+- A rotation wrap's `auth` is the same transcript with mode 0x02 under HKDF(K_{e-1}, "awm rot-auth v1") (`epoch` the new epoch).
+- `roster` records are records: their AD (§5.1) binds the approving device's stream and index; their plaintext (§15.5) binds member id, handle, role, device id and public key; the genesis entry hashes to `org_id` (crypto §7).
 
 ## 6. Endpoints
 
@@ -149,7 +155,7 @@ Each request and response body has a schema `schemas/v1/{name}.schema.json` and 
 | method and path | caller | request | response (2xx) | schema names | notes |
 |---|---|---|---|---|---|
 | `GET /v1/info` | anyone | none | protocols, server version, `cloud`, `generation`, release-floor `min_client`, limits, features | `info.response` | cacheable 1 h; `generation` there is informational, the re-seed reads `GET /v1/status` |
-| `POST /v1/bootstrap` | holder of the bootstrap token | bootstrap token, `org_id`, handle, device id, device public key | `org_id`, member id, device id, device token (once), role `admin` | `bootstrap.request`, `bootstrap.response` | single use within 24 h: a used or expired token, or an organisation that already has an admin, gets 410 `invite_gone`; an `org_id` the cloud already holds gets 409 `id_conflict`; the device is approved at once and writes its own `roster` approval next |
+| `POST /v1/bootstrap` | holder of the bootstrap token | bootstrap token, `org_id`, handle, device id, device public key | `org_id`, member id, device id, device token (once), role `admin` | `bootstrap.request`, `bootstrap.response` | single use within 24 h: a used or expired token, or an organisation that already has an admin, gets 410 `invite_gone`; an `org_id` the cloud already holds gets 409 `id_conflict`; the device is approved at once and writes its `genesis` roster record (index 0 of its `roster` stream, epoch 0) next |
 | `POST /v1/join` | holder of an invite | invite id and token, handle (must equal the invite's), device id, device public key, join MAC | `org_id`, member id, device id, device token (once), `pending: true` | `join.request`, `join.response` | 410 `invite_gone` when used or expired (a second join with the same invite included); 400 `invalid_value` (`/handle`) when the handle differs; 10 per hour per IP |
 | `GET /v1/status` | member (also a pending device) | none | `generation`, ids, role, own `approved`, `current_epoch`, `rotation_needed`, `restore_pending`, settings, every stream's head, deletion-stream `head` and `oldest`, pending devices | `status.response` | the cursor source; one per sync run |
 | `POST /v1/records` | member: own device's `rec`, `flag`, `stats`, `roster`; admin: also `policy` | 1-100 items `{tag, idx, id, epoch, blob}` or `{tag, idx, id, deleted: true}`, ≤ 1.5 MiB encoded | new heads of the touched streams, `accepted`, `replayed` | `records.push.request`, `records.push.response` | atomic per request; checks and idempotency in §9 |
@@ -253,7 +259,7 @@ A push is idempotent by (stream, idx, id) (RV8-team M1): the replay check (step 
 
 ### 9.3 What the client keeps and does
 
-- Before sending, in one short transaction: `event.sync_id`, `event.sync_idx`, the outbox row holding the exact blob, its idx and epoch, and the stream head (plan-v3-team §4.6 step 3). A retry resends the stored items unchanged.
+- Before sending, in one short transaction: `event.sync_id`, `event.sync_idx`, the `sync_own` row holding the exact blob, its idx and epoch, the outbox row that references it (`sync_outbox.ref` = `tag:idx`), and the stream head (plan-v3-team §4.6 step 3). A retry resends the stored items unchanged. Roster items are queued the same way (outbox kind `roster`, RVT1 M4).
 - 200: set `pushed_at` for every item of the request (accepted or replayed).
 - 409 `stream_conflict`: refresh `GET /v1/status`; if the server's head is below the item's idx, the earlier items were lost (an older server copy, §11) and the client re-seeds; if the stored id at that index is not in the local outbox, the device id collides with another copy of this data directory (RVT0 m7: take a new device id through a device invite; `awm doctor` explains it).
 - 409 `stale_epoch`: the item never reached a server that holds it (otherwise step 4.1 would have answered); the client fetches `GET /v1/keys`, re-encrypts the same plaintext under the current epoch at the same stream, idx and id (only `epoch` in the AD changes), replaces the stored blob, and retries.
@@ -300,8 +306,9 @@ Server:
 Clients, when `GET /v1/status` shows a `generation` other than `sync_state.generation`:
 
 1. **Every client, as a reader**: for each stream where the server's head is below its own `head_idx`, lower `head_idx` to the server's head (re-pulled records whose id is already stored are skipped through the unique `event.sync_id`); set `deletion_head` to `oldest - 1` and re-apply the whole kept deletion stream (idempotent, because tombstones are written whether or not the row exists, §8.5). Entries the restored server lost were applied before; entries appended after the restore are applied now.
-2. **Every client, as an author**: for each of its own streams, re-push from the server's head + 1 to its own head: the stored record for each index from `event.sync_idx`, re-encrypted under the current epoch at the same idx and id, or a marker `{tag, idx, id, deleted: true}` for an index whose record it has deleted since; then re-send `POST /v1/delete` for every `team:` tombstone of its own of the last `retention_days` + 30 days. Non-admin pushes wait for 503 `restore_pending` to end; the deletions do not.
+2. **Every client, as an author**: for every tag, re-push every own item from `sync_own` above the server's head of that stream: a record (`rec` re-built from `event.sync_idx` and re-sealed under the current epoch; other tags re-sealed from the stored blob's plaintext under the current epoch) at the same idx and id, or a marker `{tag, idx, id, deleted: true}` with the stored `record_id` for an index whose record it has deleted since (`sync_own.deleted`); then re-send `POST /v1/delete` for every `team:` tombstone of its own of the last `retention_days` + 30 days. Non-admin pushes wait for 503 `restore_pending` to end; the deletions and an admin's pushes (its roster revocations and epoch records included) do not.
 3. **An admin client**, first: for every revocation in its verified roster (a removed member, a revoked device) that the server shows as active, call `POST /v1/members/{id}/remove` or `POST /v1/devices/{id}/revoke`; then, for each epoch from the server's `current_epoch + 1` to its own highest, `POST /v1/keys/rotate` with that epoch's existing key wrapped to the devices that are both in its verified roster and listed (not revoked) by the server; then `POST /v1/restore/complete`. Until an admin has done this, removals made after the backup point are not in force, which is why the restore command prints that an admin must run `awm sync` at once (RV8-team M8).
+3a. **Every client, for the roster**: verify the roster over its stored `roster_record` rows together with the server's records; `team_device.revoked` and a member's removal (`team_member.active = 0`) never go back to 0 (RVT1 M3). A client that re-verified only from the restored server would lose a revocation pushed after the backup point.
 4. Store the new `generation`.
 5. Tokens: a token rotated after the backup point is unknown to the restored server (401). The client keeps its previous device token in `team.key` until its next rotation; on a 401 with the current token after a generation change it tries the previous one once and, if that works, rotates at once, revoking the old token again. Devices and invites created after the backup point get 401 or 410, and `awm doctor` says "the server was restored from a backup older than this device's join; ask an admin for a new invite".
 
@@ -384,11 +391,12 @@ Only additive changes: new optional response fields; new endpoints; new tags; ne
 - Unknown tag in `GET /v1/status`: keep and advance the cursor, do not decrypt (`wire::Tag::known` is `None`).
 - Unknown `error` code: decodes as `Unknown`; act on the HTTP status.
 - Unknown role: decodes as `Unknown`; treat it as `member`.
+- Unknown invite kind in `status.pending`: decodes as `Unknown`; never approved (RVT1 m3).
 - Unknown `features`: ignore.
 
 ### 14.4 Plaintext `schema` and envelope version
 
-Every plaintext carries `schema` (1 in v0.2). A reader parses `schema` first: a higher `schema` decodes as `Newer` without looking at the other fields, the index counts as applied (the cursor moves on), and `awm doctor` shows "a teammate runs a newer awm" (`wire::decode_plaintext`). `schema` 0, a missing `schema`, or a schema-1 plaintext that does not parse is dropped and counted (plan-v3-team §4.5). A new required plaintext field, a changed meaning or a new enum value in a plaintext needs a higher `schema`; new optional plaintext fields do not. The envelope carries its own version byte (`0x01`); a server answers any other with 422.
+Every plaintext carries `schema` (1 in v0.2). A reader parses `schema` first: a higher `schema` decodes as `Newer` without looking at the other fields, the index counts as applied (the cursor moves on), and `awm doctor` shows "a teammate runs a newer awm" (`wire::decode_plaintext`). `schema` 0, a missing `schema`, or a schema-1 plaintext that does not parse is dropped and counted (plan-v3-team §4.5). Exception: a `roster` record with a higher `schema` is kept (`roster_record`) and verified after an upgrade; until then it does not count (fail closed, RVT1 m10). A new required plaintext field, a changed meaning or a new enum value in a plaintext needs a higher `schema`; new optional plaintext fields do not. The envelope carries its own version byte (`0x01`); a server answers any other with 422.
 
 ### 14.5 Introducing v2
 
@@ -431,7 +439,7 @@ What the envelope encrypts, as UTF-8 JSON, before padding (TM3 pads and removes 
 
 ### 15.5 `roster` (`plaintext.roster`)
 
-`schema`, `kind`, `member_id`, `at`, `approver_device_id`, and by kind: `approve`: `handle`, `role`, `device_id`, `device_pubkey`; `revoke`: `device_id` (absent: the whole member); `epoch`: `epoch` and `devices` (the device ids the new key was wrapped to). TM3 and TM12 may add optional fields only.
+`schema` and `entry`, whose `type` is `genesis`, `approve`, `recover`, `revoke` or `epoch`, with the fields of `docs/sync-v1-crypto.md` §7 (`wire::RosterPlaintext` holds `keys::RosterEntry`: one type for the wire and the key flows, RVT1 M1). TM12 may add optional fields only.
 
 ## 16. Worked examples
 
@@ -484,7 +492,7 @@ Outcome: no record lost, no deleted record back, kit holds no key of epoch 2 and
 ## 17. Fixtures and schemas
 
 - `crates/awm-proto/schemas/v1/`: `common.schema.json` ($defs for ids, tokens, handles, tags, heads, base64url, blob, versions) and one schema per request, response, query string and plaintext, written in JSON Schema draft 2020-12 (a subset: `type`, `properties`, `required`, `additionalProperties`, `items`, `minItems`, `maxItems`, `enum`, `const`, `minimum`, `maximum`, `multipleOf`, `minLength`, `maxLength`, `pattern`, `oneOf`, `$ref`). Request schemas set `additionalProperties: false` at every level; response and plaintext schemas leave it open.
-- `crates/awm-proto/tests/fixtures/v1/`: one fixture per request and response body of §6 (variants: `delete.request.{ids,all_mine,member}`, `invites.request.{member,device}`, `settings.put.request[.cancel]`), one per error code, and one per plaintext kind (`plaintext.rec.{search,fetch,link}`, `plaintext.roster.{approve,revoke,epoch}`).
+- `crates/awm-proto/tests/fixtures/v1/`: one fixture per request and response body of §6 (variants: `delete.request.{ids,all_mine,member}`, `invites.request.{member,device}`, `settings.put.request[.cancel]`), one per error code, and one per plaintext kind (`plaintext.rec.{search,fetch,link}`, `plaintext.roster.{genesis,approve,recover,revoke,epoch}`).
 - `crates/awm-proto/tests/wire_snapshots.rs` asserts: every fixture validates against its schema; it decodes into its Rust type and serialises back byte for byte after canonicalisation (sorted keys, no whitespace); the Rust output validates too; removing any field or adding an unknown one at any depth of any fixture is accepted by the schema exactly when serde accepts it (so each schema states the Rust type's required and optional fields and strictness); every declared property appears in a fixture; requests refuse unknown fields and responses and plaintexts ignore them; a plaintext with a higher `schema` decodes as `Newer`; plus the header grammar, token parsing, canonical ids, the envelope check, the limits and the error-code table. The test validates with its own implementation of the schema subset, which fails on any other keyword.
 
 ## 18. RV8-team findings and where they are answered
