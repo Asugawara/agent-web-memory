@@ -242,6 +242,18 @@ pub fn prompt_url_channel(conn: &Connection, prompt: &str, opts: &MatchOpts) -> 
 
 /// Builds the note of a hit: relation to the caller, and for a search the first result URL that passes `url_ok`.
 pub fn to_note(conn: &Connection, hit: &Hit, opts: &MatchOpts) -> Result<Note> {
+    to_note_as(conn, hit, opts, None)
+}
+
+/// [`to_note`] where the caller's own member id is known: the `member` of `team.toml`, read
+/// only when the record is a team row and `own_member` is `None`.
+pub fn to_note_as(
+    conn: &Connection,
+    hit: &Hit,
+    opts: &MatchOpts,
+    own_member: Option<&str>,
+) -> Result<Note> {
+    let own = own_member;
     type Row = (
         String,
         String,
@@ -255,11 +267,15 @@ pub fn to_note(conn: &Connection, hit: &Hit, opts: &MatchOpts) -> Result<Note> {
         Option<i64>,
         String,
         Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
     );
     let row: Row = conn
         .query_row(
             "SELECT tool, session_id, agent_id, agent_type, cwd_hash, created_at, query, url, \
-                    fetch_prompt, http_code, status, summary FROM event WHERE id = ?1",
+                    fetch_prompt, http_code, status, summary, origin, member, repo_key \
+             FROM event WHERE id = ?1",
             [hit.event_id],
             |r| {
                 Ok((
@@ -275,6 +291,9 @@ pub fn to_note(conn: &Connection, hit: &Hit, opts: &MatchOpts) -> Result<Note> {
                     r.get(9)?,
                     r.get(10)?,
                     r.get(11)?,
+                    r.get(12)?,
+                    r.get(13)?,
+                    r.get(14)?,
                 ))
             },
         )
@@ -293,10 +312,15 @@ pub fn to_note(conn: &Connection, hit: &Hit, opts: &MatchOpts) -> Result<Note> {
         code,
         status,
         summary,
+        origin,
+        member,
+        repo_key,
     ) = row;
     let tool = Tool::from_db_str(&tool).ok_or_else(|| anyhow!("bad tool {tool}"))?;
     let status = Status::from_db_str(&status).ok_or_else(|| anyhow!("bad status {status}"))?;
-    let relation = if session == opts.caller_session {
+    let relation = if origin == "team" {
+        team_relation(conn, member.as_deref(), repo_key.as_deref(), opts, own)?
+    } else if session == opts.caller_session {
         match agent {
             None => Relation::MainAgent,
             Some(_) => Relation::OtherSubagent {
@@ -338,5 +362,54 @@ pub fn to_note(conn: &Connection, hit: &Hit, opts: &MatchOpts) -> Result<Note> {
         http_code: code.and_then(|c| u16::try_from(c).ok()),
         summary,
         score: hit.score,
+    })
+}
+
+/// The caller's member id from `team.toml` (read without the `sync` feature); `None` outside a team.
+pub fn own_member_id() -> Option<String> {
+    let dir = crate::paths::data_dir().ok()?;
+    let text = std::fs::read_to_string(dir.join("team.toml")).ok()?;
+    let table = text.parse::<toml::Table>().ok()?;
+    table.get("member_id")?.as_str().map(str::to_string)
+}
+
+/// Relation of a team row (§3.5): the caller's other machine, or a teammate with the handle of
+/// the local roster and whether the record's `repo_key` is the caller's (through `project`).
+fn team_relation(
+    conn: &Connection,
+    member: Option<&str>,
+    repo_key: Option<&str>,
+    opts: &MatchOpts,
+    own: Option<&str>,
+) -> Result<Relation> {
+    let own = match own {
+        Some(o) => Some(o.to_string()),
+        None => own_member_id(),
+    };
+    if member.is_some() && member == own.as_deref() {
+        return Ok(Relation::OwnDevice);
+    }
+    let handle: Option<String> = match member {
+        Some(m) => conn
+            .query_row(
+                "SELECT handle FROM team_member WHERE member_id = ?1",
+                [m],
+                |r| r.get(0),
+            )
+            .optional()?,
+        None => None,
+    };
+    let caller_repo: Option<String> = conn
+        .query_row(
+            "SELECT repo_key FROM project WHERE cwd_hash = ?1",
+            [&opts.caller_cwd_hash],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let same_repo = matches!((repo_key, caller_repo.as_deref()), (Some(a), Some(b)) if a == b);
+    Ok(Relation::Teammate {
+        handle: handle.unwrap_or_default(),
+        same_repo,
     })
 }

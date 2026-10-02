@@ -169,6 +169,7 @@ pub fn find_repeat(
         "SELECT e.id, e.query, e.summary, e.agent FROM event e \
          WHERE e.tool = 'WebSearch' AND e.created_at >= ?1 AND e.status = 'ok' \
            AND e.quarantined = 0 AND e.summary IS NOT NULL \
+           AND (e.origin = 'local' OR e.member = ?6) \
            AND NOT (e.session_id = ?2 AND e.agent_id IS ?3) \
            AND (?4 IS NULL OR e.tool_use_id != ?4) \
            AND NOT EXISTS (SELECT 1 FROM tombstone t \
@@ -180,7 +181,8 @@ pub fn find_repeat(
         env.input.session_id,
         env.input.agent_id,
         env.input.tool_use_id,
-        SCAN_LIMIT
+        SCAN_LIMIT,
+        matching::own_member_id()
     ])?;
     while let Some(r) = rows.next()? {
         let query: Option<String> = r.get(1)?;
@@ -259,6 +261,9 @@ pub fn where_text(note: &Note, earlier_agent: &str, caller_is_codex: bool) -> St
         Relation::MainAgent => "in this session by the main agent".to_string(),
         Relation::SameProject => "in another session of this project".to_string(),
         Relation::OtherProject => "in another project".to_string(),
+        Relation::OwnDevice => "on your other machine".to_string(),
+        // A teammate's record never triggers a deny (`find_repeat`); the text keeps the match total.
+        Relation::Teammate { .. } => "by a teammate".to_string(),
     };
     let earlier_is_codex = earlier_agent == "codex";
     if earlier_is_codex != caller_is_codex {

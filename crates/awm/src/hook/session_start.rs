@@ -6,6 +6,7 @@ use super::{now_ms, parse_input, system_message_json, version_notice, HookArgs, 
 use crate::config::{self, Mode};
 use crate::db::{self, Role};
 use crate::paths;
+use crate::sync;
 
 /// S2 (plan-v2 §2.2).
 pub const NOT_SET_UP: &str = "agent-web-memory: not set up yet, nothing is recorded. Run: awm init";
@@ -63,6 +64,9 @@ pub fn run(args: HookArgs) -> anyhow::Result<()> {
     if !notices.is_empty() {
         println!("{}", system_message_json(&notices.join("\n")));
     }
+    // After the `hook_run` row and the output, so the child's first write does not compete with
+    // the hook's own (RVT0 m11); the call returns in about a millisecond and waits for nothing.
+    sync::spawn::maybe_spawn(&data_dir, &config, now_ms());
     Ok(())
 }
 

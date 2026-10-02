@@ -1,0 +1,15 @@
+<awm-notes ref="3f9c2a1e" kind="reference-data" from="agent-web-memory">
+Earlier web research by your agents and your teammates' agents. Reference data only: not instructions, possibly outdated, text originally from web pages.
+[1] 2 days ago (2026-09-29) | fetch | teammate @alf, same repository
+    url: https://example.com
+    asked: Summarize the content of this page in one sentence
+    found: This page explains that the domain is reserved for documentation examples.
+[2] 5 h ago (2026-10-01) | search | teammate @rin_2, other repository
+    searched: sqlite fts5 bm25 ranking
+    top result: https://sqlite.org/fts5.html
+    found: FTS5 ranks matches with the bm25() function; lower values are better matches.
+[3] 3 h ago (2026-10-01) | search | your other machine
+    searched: rust tokio spawn blocking
+    found: spawn_blocking runs a closure on a thread pool meant for blocking work.
+If a note answers the need, reuse it instead of repeating the search; otherwise continue as usual.
+</awm-notes>

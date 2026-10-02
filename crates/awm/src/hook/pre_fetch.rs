@@ -128,6 +128,7 @@ fn find_sibling(env: &Env, conn: &Connection, norm: &str) -> anyhow::Result<Opti
              WHERE e.tool = 'WebFetch' AND e.url_norm = ?1 AND e.session_id = ?2 \
                AND NOT (e.agent_id IS ?3) AND e.status = 'ok' AND e.http_code = 200 \
                AND e.created_at >= ?4 AND e.quarantined = 0 \
+               AND (e.origin = 'local' OR e.member = ?6) \
                AND (?5 IS NULL OR e.tool_use_id != ?5) \
                AND NOT EXISTS (SELECT 1 FROM tombstone t \
                                WHERE t.kind = 'tool_use_id' AND t.value = e.tool_use_id) \
@@ -137,7 +138,8 @@ fn find_sibling(env: &Env, conn: &Connection, norm: &str) -> anyhow::Result<Opti
                 env.input.session_id,
                 env.input.agent_id,
                 env.started_at_ms - window_ms,
-                env.input.tool_use_id
+                env.input.tool_use_id,
+                matching::own_member_id()
             ],
             |r| r.get(0),
         )
