@@ -1,7 +1,7 @@
 {
   "name": "agent-web-memory",
   "version": "0.1.0",
-  "description": "Remembers your agents' web research and shows earlier findings before they repeat it. Local only.",
+  "description": "Remembers your agents' web research and shows earlier findings before they repeat it. Local first; optional end-to-end encrypted team sync.",
   "license": "Apache-2.0",
   "homepage": "https://github.com/Asugawara/agent-web-memory",
   "author": {

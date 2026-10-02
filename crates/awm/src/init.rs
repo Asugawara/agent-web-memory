@@ -63,7 +63,7 @@ Recorded for every WebSearch and WebFetch call in Claude Code (main agent and su
 \x20 time, session id, subagent id, and a hash of the working directory.\n\
 Not recorded: your prompts (except the first 200 characters of a prompt that contained\n\
 \x20 a URL with a matching note, kept in the local log), code, files, other tools.\n\
-Stored in: {data_dir}/awm.db  (this machine only; awm makes no network requests)\n\
+Stored in: {data_dir}/awm.db  (this machine; nothing is sent unless you run `awm team join`)\n\
 Delete everything at any time: awm purge --all\n"
     )
 }

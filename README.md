@@ -48,7 +48,7 @@ This asks whether to record future research and whether to import your past rese
 
 **Stored in:**
 - The data directory, ~/Library/Application Support/agent-web-memory/ on macOS or ~/.local/share/agent-web-memory/ on Linux: the database awm.db and, with status line samples on, quota/samples-YYYY-MM.ndjson
-- This machine only; `awm` makes no network requests
+- This machine only, unless you join a team; hooks never make network requests
 
 **Delete everything at any time:**
 ```bash
@@ -146,7 +146,7 @@ awm setup --remove-codex-hooks
 
 ## Privacy
 
-- **Local only**: All research stays on your machine. No servers, no sync, no API calls.
+- **Local first**: Research stays on your machine. If you join a team, a background `awm sync` sends the records of the projects you share, end-to-end encrypted; hooks never wait on the network.
 - **Redacted**: API keys and secrets are redacted before storage.
 - **Deletable**: `awm forget` and `awm purge` permanently remove records. `awm config set mode off` pauses recording without deleting anything.
 - **Your control**: `awm config` lets you turn off channels, adjust matching thresholds, and pause recording.
@@ -185,9 +185,9 @@ To delete everything:
 
 A cache returns saved results in place of the tool call. agent-web-memory never blocks or replaces a call — it just shows your agent the earlier question, URL, and finding *alongside* the new result. The agent reads both and decides what to do. This keeps agents safe and lets them notice when pages change.
 
-### Why local only?
+### Why local first?
 
-Uploading research creates a privacy boundary you lose control of. Local-first means your data never leaves your machine unless you copy it. Team sync is planned for v0.2 if users ask for it — it will be optional and you'll control which machine it runs on.
+Uploading research creates a privacy boundary you lose control of. Local-first means your data never leaves your machine unless you copy it. Team sync is optional: when you join a team, see `docs/self-host.md` for self-hosting options and `docs/plan-v3-team.md` §3.2 for what fields are shared (your prompts, transcripts and file paths never leave your machine; summaries are cut to 1,000 characters by default; authenticated-SaaS pages share only the URL and title).
 
 ### Does it work in subagents?
 
