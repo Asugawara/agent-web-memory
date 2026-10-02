@@ -261,6 +261,9 @@ pub fn approve_pending(
     Ok(approved)
 }
 
+/// How far ahead of the local clock a roster date may be before it is clamped (one day).
+const MAX_AHEAD_S: i64 = 86_400;
+
 /// The dates of the verified roster that decide a rotation: the `created_at` of the current
 /// epoch's applied `epoch` entry (`None` under epoch 0, or when this device never saw it) and the
 /// `revoked_at` of every revocation the verified roster applies (a rejected entry naming an
@@ -269,7 +272,11 @@ fn epoch_dates(
     conn: &Connection,
     ring: &awm_proto::keys::KeyRing,
     roster: &Roster,
+    now_s: i64,
 ) -> Result<(Option<i64>, Vec<i64>)> {
+    // A date above this counts as this (RVT3v V1): a bogus far-future date can neither loop the
+    // rotation nor hold the date rule up for years.
+    let horizon = now_s.saturating_add(MAX_AHEAD_S);
     let current = ring.current_epoch();
     let listed = roster.epoch_devices(current);
     let mut epoch_at: Option<i64> = None;
@@ -298,6 +305,7 @@ fn epoch_dates(
                 created_at,
                 ..
             } if epoch == current && listed == Some(devices.as_slice()) => {
+                let created_at = created_at.min(horizon);
                 epoch_at = Some(epoch_at.map_or(created_at, |t| t.max(created_at)));
             }
             RosterEntry::Revoke {
@@ -311,7 +319,7 @@ fn epoch_dates(
                     None => roster.member(member_id).is_some_and(|m| m.revoked),
                 };
                 if applied {
-                    revoked_at.push(at);
+                    revoked_at.push(at.min(horizon));
                 }
             }
             _ => {}
@@ -339,6 +347,7 @@ pub fn revoked_since_current_epoch(
     conn: &Connection,
     ring: &awm_proto::keys::KeyRing,
     roster: &Roster,
+    now_s: i64,
 ) -> Result<bool> {
     let current = ring.current_epoch();
     let revoked_device = |d| roster.device(d).is_some_and(|d| d.revoked);
@@ -346,9 +355,16 @@ pub fn revoked_since_current_epoch(
     if listed.is_some_and(|devices| devices.iter().any(|d| revoked_device(*d))) {
         return Ok(true);
     }
-    let (epoch_at, revoked_at) = epoch_dates(conn, ring, roster)?;
+    let (epoch_at, revoked_at) = epoch_dates(conn, ring, roster, now_s)?;
     Ok(match epoch_at {
-        Some(t) => revoked_at.iter().any(|&at| at >= t),
+        // A date at the clamp is a far-future one (RVT3v V1). The clamp moves with the clock, so
+        // such a date would out-run the entry that covered it one second later and rotate again
+        // on every run; it decides nothing here, and only the listed-device rule, the server's
+        // `rotation_needed` and epoch 0 (below) can rotate for it.
+        Some(t) => {
+            let horizon = now_s.saturating_add(MAX_AHEAD_S);
+            revoked_at.iter().any(|&at| at >= t && at < horizon)
+        }
         // Epoch 0, or an epoch whose entry this device never saw: the key predates every
         // revocation it holds.
         None => !revoked_at.is_empty(),
@@ -368,7 +384,7 @@ pub fn rotation_created_at(
     roster: &Roster,
     now_s: i64,
 ) -> Result<i64> {
-    let (_, revoked_at) = epoch_dates(conn, ring, roster)?;
+    let (_, revoked_at) = epoch_dates(conn, ring, roster, now_s)?;
     Ok(revoked_at
         .iter()
         .map(|&at| at.saturating_add(1))
@@ -388,7 +404,9 @@ pub fn rotate_if_needed(s: &mut Session<'_>) -> Result<bool> {
     if !own_member_is_admin(&s.roster, &s.ident) {
         return Ok(false);
     }
-    if !status.rotation_needed && !revoked_since_current_epoch(&s.conn, &s.ring, &s.roster)? {
+    let now_s = s.now_ms() / 1_000;
+    if !status.rotation_needed && !revoked_since_current_epoch(&s.conn, &s.ring, &s.roster, now_s)?
+    {
         return Ok(false);
     }
     let members = s.client.members()?;
@@ -425,7 +443,7 @@ pub fn rotate_if_needed(s: &mut Session<'_>) -> Result<bool> {
             crate::sync::state::bump(&s.conn, &format!("dropped.{name}"), n as i64)?;
         }
     }
-    let created_at = rotation_created_at(&s.conn, &s.ring, &s.roster, s.now_ms() / 1_000)?;
+    let created_at = rotation_created_at(&s.conn, &s.ring, &s.roster, now_s)?;
     let rotation = rotate(
         &s.ring,
         &plan,

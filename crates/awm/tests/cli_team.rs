@@ -4,7 +4,8 @@
 //!
 //! Each test starts its own server (`awm_server::http::embedded` on a loopback port, a
 //! `SqliteStore` in a scratch directory, a captured log sink) and drives the built `awm` binary
-//! with one `AWM_HOME` per machine. Nothing else opens a socket. Where a test needs a server that
+//! with one `AWM_HOME` per machine. Nothing else opens a socket except `Proxy`, a loopback forwarder
+//! that stands in for a proxy or WAF in front of the server. Where a test needs a server that
 //! withholds or forges something, it edits the server's database directly, as a compromised host
 //! could.
 
@@ -2007,6 +2008,245 @@ fn a_single_item_the_server_refuses_is_dropped_counted_and_the_next_item_is_push
     // The next run is clean.
     let out = a.ok(&["sync"]);
     assert!(!out.contains("rejected"), "{out}");
+}
+
+/// A forwarding HTTP proxy in front of a [`Srv`] that answers chosen `POST /v1/records` requests
+/// itself (a proxy, WAF or load balancer in front of the server, RVT3v V2). One request per
+/// connection. Each queued rule answers the next push: `None` forwards it, `Some(raw)` replies
+/// with those bytes; with the queue empty everything is forwarded.
+struct Proxy {
+    addr: SocketAddr,
+    rules: Arc<Mutex<std::collections::VecDeque<Option<String>>>>,
+}
+
+impl Proxy {
+    fn start(upstream: SocketAddr) -> Proxy {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let rules: Arc<Mutex<std::collections::VecDeque<Option<String>>>> = Arc::default();
+        let queue = rules.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut client) = conn else { continue };
+                let queue = queue.clone();
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 65_536];
+                    let head_end = loop {
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break i + 4;
+                        }
+                        match client.read(&mut chunk) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse().unwrap())
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < head_end + len {
+                        match client.read(&mut chunk) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let is_push = head.starts_with("POST /v1/records ");
+                    let rule = if is_push {
+                        queue.lock().unwrap().pop_front().flatten()
+                    } else {
+                        None
+                    };
+                    if let Some(raw) = rule {
+                        let _ = client.write_all(raw.as_bytes());
+                        return;
+                    }
+                    let mut fwd: String = head
+                        .lines()
+                        .filter(|l| {
+                            !l.is_empty() && !l.to_ascii_lowercase().starts_with("connection:")
+                        })
+                        .map(|l| format!("{l}\r\n"))
+                        .collect();
+                    fwd.push_str("Connection: close\r\n\r\n");
+                    let Ok(mut up) = std::net::TcpStream::connect(upstream) else {
+                        return;
+                    };
+                    let mut bytes = fwd.into_bytes();
+                    bytes.extend_from_slice(&buf[head_end..head_end + len]);
+                    let _ = up.write_all(&bytes);
+                    let mut resp = Vec::new();
+                    let _ = up.read_to_end(&mut resp);
+                    let _ = client.write_all(&resp);
+                });
+            }
+        });
+        Proxy { addr, rules }
+    }
+
+    /// The next push is answered by `rule` (`None`: forwarded).
+    fn queue(&self, rule: Option<String>) {
+        self.rules.lock().unwrap().push_back(rule);
+    }
+
+    /// Points a node at this proxy.
+    fn serve(&self, n: &Node) {
+        let mut team = n.ident().team;
+        team.server_url = format!("http://{}", self.addr);
+        team.save(n.path()).unwrap();
+    }
+}
+
+/// A reply with no awm error body, as a proxy sends it.
+fn bare(status: &str) -> String {
+    let body = "<html>refused</html>";
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// A reply with an awm error body.
+fn coded(status: &str, code: &str) -> String {
+    let body = format!(r#"{{"error":"{code}","message":"test"}}"#);
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// A node with a shared project and one captured record waiting, behind a [`Proxy`].
+fn node_with_one_record_behind_a_proxy() -> (Srv, Proxy, Node) {
+    let srv = Srv::start();
+    let proxy = Proxy::start(srv.addr);
+    let a = create(&srv, "ann");
+    a.ok(&["sync"]);
+    share(&a);
+    a.capture(1, "https://docs.example.org/one", "One.");
+    proxy.serve(&a);
+    (srv, proxy, a)
+}
+
+const OWN_ROW: &str =
+    "SELECT COUNT(*) FROM sync_own WHERE tag = 'rec' AND blob IS NOT NULL AND deleted = 0";
+
+// RVT3v V2 (a): a 413 with no awm body is not the server refusing the item.
+#[test]
+fn a_413_without_an_awm_body_fails_the_run_and_keeps_the_item_for_the_next_run() {
+    let (_srv, proxy, a) = node_with_one_record_behind_a_proxy();
+    proxy.queue(Some(bare("413 Payload Too Large")));
+    let o = a.run(&["sync"]);
+    assert_ne!(o.code, Some(0), "{}{}", o.stdout, o.stderr);
+    assert!(!o.stderr.contains("dropped"), "{}", o.stderr);
+    assert_eq!(a.count(OWN_ROW), 1, "the sealed blob is still there");
+    assert_eq!(a.count("SELECT COUNT(*) FROM sync_outbox"), 1);
+    assert_eq!(a.status()["dropped"]["push_rejected"], Value::Null);
+    // The next run retries and pushes it.
+    let out = a.ok(&["sync"]);
+    assert!(out.contains("pushed 1"), "{out}");
+    assert!(!out.contains("rejected"), "{out}");
+    assert_eq!(a.count("SELECT COUNT(*) FROM sync_outbox"), 0);
+}
+
+// RVT3v V2 (b): a 413 with an awm body drops the item (F17), and its sealed blob goes only after
+// the marker's 200.
+#[test]
+fn a_413_with_an_awm_body_drops_the_item_and_clears_the_blob_after_the_marker_is_acknowledged() {
+    let srv = Srv::start();
+    let proxy = Proxy::start(srv.addr);
+    let a = create(&srv, "ann");
+    a.ok(&["sync"]);
+    share(&a);
+    let ident = a.ident();
+    let ring = ident.ring().unwrap();
+    awm::sync::push::queue_item(
+        &mut a.conn(),
+        &ident,
+        &ring,
+        "flag",
+        "flag",
+        b"{}",
+        now_ms(),
+    )
+    .unwrap();
+    a.conn()
+        .execute(
+            "UPDATE sync_own SET blob = zeroblob(1100000) WHERE tag = 'flag' AND idx = 0",
+            [],
+        )
+        .unwrap();
+    proxy.serve(&a);
+    // The server's own 413 `too_large` answers the item; the marker then meets a 503 without a
+    // body, so the run fails before the marker is acknowledged.
+    proxy.queue(None);
+    proxy.queue(Some(bare("503 Service Unavailable")));
+    let o = a.run(&["sync"]);
+    assert_ne!(o.code, Some(0), "{}{}", o.stdout, o.stderr);
+    assert!(
+        o.stderr.contains("the server refused flag 0") && o.stderr.contains("with 413"),
+        "{}",
+        o.stderr
+    );
+    let flag = "SELECT COUNT(*) FROM sync_own WHERE tag = 'flag' AND idx = 0 AND deleted = 1 AND blob IS NOT NULL";
+    assert_eq!(a.count(flag), 1, "marker not acknowledged: the blob stays");
+    assert_eq!(a.count("SELECT COUNT(*) FROM sync_outbox"), 1);
+    // The next run sends the marker; its 200 clears the blob and the outbox row.
+    let out = a.ok(&["sync"]);
+    assert!(
+        !out.contains("rejected 1"),
+        "counted once, not again: {out}"
+    );
+    assert_eq!(
+        a.count("SELECT COUNT(*) FROM sync_own WHERE tag = 'flag' AND idx = 0 AND deleted = 1 AND blob IS NULL"),
+        1
+    );
+    assert_eq!(a.count("SELECT COUNT(*) FROM sync_outbox"), 0);
+    let markers: i64 = srv
+        .raw()
+        .query_row(
+            "SELECT COUNT(*) FROM record WHERE member_id = ?1 AND tag = 'flag' AND idx = 0 AND blob IS NULL",
+            [a.member().to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(markers, 1);
+}
+
+// RVT3v V2 (c): a 403 with an awm code that is no refused write (`not_approved`) fails the run.
+#[test]
+fn a_403_with_a_code_that_is_not_a_refused_write_fails_the_run() {
+    let (_srv, proxy, a) = node_with_one_record_behind_a_proxy();
+    proxy.queue(Some(coded("403 Forbidden", "not_approved")));
+    let o = a.run(&["sync"]);
+    assert_ne!(o.code, Some(0), "{}{}", o.stdout, o.stderr);
+    assert!(!o.stderr.contains("dropped"), "{}", o.stderr);
+    assert_eq!(a.count(OWN_ROW), 1);
+    assert_eq!(a.count("SELECT COUNT(*) FROM sync_outbox"), 1);
+    assert_eq!(a.status()["dropped"]["push_rejected"], Value::Null);
+}
+
+// RVT3v V9: only a full run is "the last successful sync".
+#[test]
+fn only_a_full_run_writes_last_ok() {
+    let srv = Srv::start();
+    let a = create(&srv, "ann");
+    assert_eq!(a.state(state::LAST_OK), None);
+    a.ok(&["sync", "--pull-only"]);
+    assert_eq!(a.state(state::LAST_OK), None, "a pull-only run");
+    a.ok(&["sync", "--push-only"]);
+    assert_eq!(a.state(state::LAST_OK), None, "a push-only run");
+    a.ok(&["sync"]);
+    let full = a.state(state::LAST_OK).expect("a full run writes it");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    a.ok(&["sync", "--pull-only"]);
+    a.ok(&["sync", "--push-only"]);
+    assert_eq!(a.state(state::LAST_OK), Some(full));
 }
 
 #[test]

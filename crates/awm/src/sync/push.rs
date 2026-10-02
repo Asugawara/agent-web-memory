@@ -21,6 +21,7 @@ use crate::config::Config;
 use crate::note::{Status, Tool};
 use crate::record::{Agent, Record, ResultRow};
 use crate::sync::eligible::{self, Eligibility, OptIn, Project, RuleKind, ShareRule, TeamPolicy};
+use crate::sync::http::CallError;
 use crate::sync::payload::{self, Share, ShareCtx};
 use crate::sync::state::{self, Identity};
 use crate::sync::{roster, Backfill, Session};
@@ -724,6 +725,12 @@ fn finish(s: &mut Session<'_>, keys: &[(String, u64)]) -> Result<()> {
             "DELETE FROM sync_outbox WHERE ref = ?1",
             [format!("{tag}:{idx}")],
         )?;
+        // A refused item kept its sealed blob while its marker was in flight (RVT3v V2).
+        tx.execute(
+            "UPDATE sync_own SET blob = NULL, epoch = NULL \
+             WHERE tag = ?1 AND idx = ?2 AND deleted = 1 AND blob IS NOT NULL",
+            params![tag, *idx as i64],
+        )?;
     }
     for (idx, level) in levels {
         let id: Option<String> = tx
@@ -751,6 +758,22 @@ fn finish(s: &mut Session<'_>, keys: &[(String, u64)]) -> Result<()> {
     Ok(())
 }
 
+/// Whether the server refused one request's write for good (RVT3 F17, RVT3v V2): an awm error
+/// body with a code, and 400 `malformed`/`unknown_field`/`invalid_value`, 403 `forbidden` (a tag
+/// or stream the caller may not write; `not_approved` is no refusal of the item), 413
+/// `too_large` or 422 `bad_envelope`. A status without such a body (a proxy, a WAF, a load
+/// balancer) is not.
+fn is_refused_write(e: &CallError) -> bool {
+    use ErrorCode::*;
+    matches!(
+        (e.status(), e.code()),
+        (Some(400), Some(Malformed | UnknownField | InvalidValue))
+            | (Some(403), Some(Forbidden))
+            | (Some(413), Some(TooLarge))
+            | (Some(422), Some(BadEnvelope))
+    )
+}
+
 /// What stopped a send.
 #[derive(Debug)]
 pub enum SendStop {
@@ -761,7 +784,8 @@ pub enum SendStop {
 /// Sends the stored items `keys` in order, in requests of at most 100 items and 1.4 MB, and
 /// does the bookkeeping. Handles 409 `stale_epoch`, 410 `deleted`, 409 `id_conflict` and
 /// 409 `stream_conflict` as `docs/sync-v1.md` §9.3 says; a single-item request refused with
-/// 400, 403, 413 or 422 drops that item (`dropped.push_rejected`); every other failure is
+/// an awm error body (400 `malformed`/`unknown_field`/`invalid_value`, 403 `forbidden`, 413
+/// `too_large`, 422 `bad_envelope`) drops that item (`dropped.push_rejected`); every other failure is
 /// returned with the outbox untouched.
 pub fn send_keys(
     s: &mut Session<'_>,
@@ -816,11 +840,13 @@ pub fn send_keys(
                     }
                     break;
                 }
-                Err(e) if batch.len() == 1 && matches!(e.status(), Some(400 | 403 | 413 | 422)) => {
+                Err(e) if batch.len() == 1 && is_refused_write(&e) => {
                     // One item the server refuses for good would block every later push of this
                     // device (RVT3 F17): it is dropped, counted and logged once, and becomes a
-                    // marker at the same idx so the stream stays contiguous (§9.3). A refused
-                    // marker drops the outbox row.
+                    // marker at the same idx so the stream stays contiguous (§9.3). Only an awm
+                    // error body counts (RVT3v V2: a proxy or WAF answer fails the run). The
+                    // sealed blob stays until the marker is acknowledged (`finish`); a refused
+                    // marker drops the outbox row and the blob with it.
                     let (tag, idx) = &batch[0];
                     let p = load_pending(&s.conn, tag, *idx)?;
                     if !rejected {
@@ -837,12 +863,16 @@ pub fn send_keys(
                     }
                     if p.is_some_and(|p| p.blob.is_some()) {
                         s.conn.execute(
-                            "UPDATE sync_own SET deleted = 1, blob = NULL, epoch = NULL \
-                             WHERE tag = ?1 AND idx = ?2",
+                            "UPDATE sync_own SET deleted = 1 WHERE tag = ?1 AND idx = ?2",
                             params![tag, *idx as i64],
                         )?;
                         continue;
                     }
+                    s.conn.execute(
+                        "UPDATE sync_own SET blob = NULL, epoch = NULL \
+                         WHERE tag = ?1 AND idx = ?2 AND deleted = 1",
+                        params![tag, *idx as i64],
+                    )?;
                     s.conn.execute(
                         "DELETE FROM sync_outbox WHERE ref = ?1",
                         [format!("{tag}:{idx}")],

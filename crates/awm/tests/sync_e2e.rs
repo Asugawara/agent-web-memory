@@ -1254,6 +1254,36 @@ fn a_revocation_dated_ahead_of_the_rotating_admins_clock_rotates_exactly_once() 
     assert!(!sync_withheld(&srv, &b).rotated);
 }
 
+/// RVT3v V1: a revocation signed with a date far beyond the clock (`i64::MAX`, or ten years
+/// ahead) causes one rotation; the next two runs, a second apart, are quiet.
+fn a_far_dated_revocation_rotates_exactly_once(revoked_at: i64) {
+    let (srv, a, b) = org_of_two();
+    let c = add_member(&srv, &a, "carol", "member");
+    c.sync();
+    remove_member_at(&a, c.ident().team.member_id, revoked_at);
+    let r = a.sync();
+    assert!(r.rotated, "{r:?}");
+    assert_eq!(a.ident().ring().unwrap().current_epoch(), 1);
+    for _ in 0..2 {
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        assert!(!sync_withheld(&srv, &a).rotated, "no second rotation");
+    }
+    assert_eq!(a.ident().ring().unwrap().current_epoch(), 1);
+    b.sync();
+    assert!(!sync_withheld(&srv, &b).rotated);
+    assert_eq!(b.ident().ring().unwrap().current_epoch(), 1);
+}
+
+#[test]
+fn a_revocation_dated_i64_max_rotates_exactly_once() {
+    a_far_dated_revocation_rotates_exactly_once(i64::MAX);
+}
+
+#[test]
+fn a_revocation_dated_ten_years_ahead_rotates_exactly_once() {
+    a_far_dated_revocation_rotates_exactly_once(unix_secs() + 10 * 365 * 86_400);
+}
+
 // FT3a (RVT3 F3): `roster_record` is only ever added to.
 #[test]
 fn a_stored_roster_record_is_never_replaced_by_a_later_one_at_the_same_place() {
@@ -1333,10 +1363,8 @@ fn a_pull_of_200_records_writes_at_most_25_rows_per_transaction() {
     }
     let r = b.sync();
     assert_eq!(r.pulled, 200, "{r:?}");
-    assert!(
-        (1..=awm::sync::apply::CHUNK_ROWS).contains(&r.max_rows_per_txn),
-        "{r:?}"
-    );
+    // The literal, not the constant: the test must fail when `CHUNK_ROWS` moves (RVT3v V6).
+    assert!((1..=25).contains(&r.max_rows_per_txn), "{r:?}");
     assert!(r.apply_ms.len() >= 8, "{r:?}");
 }
 

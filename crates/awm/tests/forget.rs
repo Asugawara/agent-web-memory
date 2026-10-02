@@ -1987,3 +1987,58 @@ fn forget_and_a_remote_deletion_remove_stale_calibration_copies_and_keep_a_live_
     assert!(scrub.copies.is_empty());
     assert!(dead[0].exists());
 }
+
+// RVT3v V10: a symlinked `tmp` is foreign. `purge --all` and `uninstall` refuse it, calibration
+// makes no copy under it (the scores come from the live database), and no sweep follows it.
+#[test]
+fn a_symlinked_tmp_is_foreign_and_nothing_is_copied_into_or_swept_from_it() {
+    let env = Env::new();
+    seed_for_calibration(&env);
+    let elsewhere = tempfile::tempdir().unwrap();
+    // A stale copy (dead pid) in the link's target: a sweep that followed the link would delete it.
+    let stale = elsewhere
+        .path()
+        .join(format!("awm.db.calibrate-{}-{}", dead_pid(), now_nanos()));
+    std::fs::write(&stale, "someone else's file").unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), env.data().join("tmp")).unwrap();
+    let untouched = |what: &str| {
+        let names: Vec<_> = std::fs::read_dir(elsewhere.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(names, vec![stale.clone()], "{what}");
+        assert!(
+            std::fs::symlink_metadata(env.data().join("tmp"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "{what}"
+        );
+    };
+
+    // Calibration: no copy under the link, scores from the live database.
+    let (code, out, err) = env.awm(&["calibrate"]);
+    assert_eq!(code, Some(0), "{out}{err}");
+    assert!(!out.contains("defaults in use"), "{out}");
+    untouched("calibrate");
+
+    // A scrub (`forget`) and the scrub after a remote deletion sweep nothing through the link.
+    let (outcome, out) = env.forget(forget_url(URL));
+    assert_eq!(outcome, Outcome::Done, "{out}");
+    let scrub = awm::sync::apply::after_deletions(&env.conn(), &env.data(), 1, None, NOW).unwrap();
+    assert!(scrub.copies.is_empty());
+    untouched("forget and after_deletions");
+
+    // purge --all and uninstall refuse it as an entry awm did not create.
+    for args in [
+        &["purge", "--all", "--yes"][..],
+        &["uninstall", "--yes"][..],
+    ] {
+        let (code, out, err) = env.awm(args);
+        assert_eq!(code, Some(2), "{args:?}: {out}{err}");
+        assert!(out.contains("entries awm did not create: tmp."), "{out}");
+        assert!(env.db_path().exists());
+        untouched("refusal");
+    }
+}

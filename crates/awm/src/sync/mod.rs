@@ -318,7 +318,12 @@ mod engine {
                         r.get::<_, i64>(0)
                     })?
                     .max(0) as usize;
-                state::record_success(&s.conn, real_now(env))?;
+                // Only a full run counts as the last successful sync (RVT3v V9): `team status`
+                // and the `awm sync` waiting line would otherwise count a run that pushed (or
+                // pulled) nothing by design.
+                if !opts.pull_only && !opts.push_only {
+                    state::record_success(&s.conn, real_now(env))?;
+                }
                 Ok(Outcome::Done(s.report))
             }
             Err(e) => {
