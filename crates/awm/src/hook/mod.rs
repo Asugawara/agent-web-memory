@@ -167,10 +167,30 @@ pub fn recording_consented(conn: &Connection) -> Result<bool> {
     Ok(meta_value(conn, "consent.record")?.as_deref() == Some("yes"))
 }
 
+/// Longest `AWM_CANARY` value used, in characters, so a canary line cannot push a field over
+/// Claude Code's 10,000-character `additionalContext` limit (a block or deny reason is at most 9,500).
+pub const CANARY_VALUE_CAP: usize = 64;
+
+/// `AWM-CANARY-{event}-{value}` with the value cut to [`CANARY_VALUE_CAP`] characters.
+fn canary_text(event: &str, value: &str) -> String {
+    let v: String = value.chars().take(CANARY_VALUE_CAP).collect();
+    format!("AWM-CANARY-{event}-{v}")
+}
+
 /// `AWM-CANARY-{event}-{value}` when `AWM_CANARY` is set (§5.5).
 pub fn canary_line(event: &str) -> Option<String> {
     let v = std::env::var("AWM_CANARY").ok().filter(|v| !v.is_empty())?;
-    Some(format!("AWM-CANARY-{event}-{v}"))
+    Some(canary_text(event, &v))
+}
+
+/// Appends `\n{line}` to `text` and checks the result is within the 10,000-character field limit.
+pub(crate) fn append_canary(text: &mut String, line: &str) {
+    text.push('\n');
+    text.push_str(line);
+    debug_assert!(
+        text.chars().count() <= 10_000,
+        "canary pushed a field over 10,000 characters"
+    );
 }
 
 fn print_line(text: &str) {
@@ -639,8 +659,7 @@ pub fn deliver(env: &Env, conn: &Connection, d: Delivery<'_>) -> Result<Verdict>
         .collect();
     let mut text = rendered.text.clone();
     if let Some(line) = &canary {
-        text.push('\n');
-        text.push_str(line);
+        append_canary(&mut text, line);
     }
     let mut inj = Injection {
         hook: hook_name,
@@ -690,4 +709,26 @@ pub fn deliver(env: &Env, conn: &Connection, d: Delivery<'_>) -> Result<Verdict>
 /// Milliseconds elapsed since `t`.
 pub fn elapsed_ms(t: Instant) -> i64 {
     millis(t.elapsed())
+}
+
+#[cfg(test)]
+mod canary_tests {
+    use super::*;
+
+    #[test]
+    fn an_over_long_canary_value_is_cut_and_a_maximal_block_stays_under_10000() {
+        let line = canary_text("PostToolUse", &"x".repeat(2000));
+        assert_eq!(
+            line.chars().count(),
+            "AWM-CANARY-PostToolUse-".len() + CANARY_VALUE_CAP
+        );
+        let mut text = "a".repeat(crate::render::MAX_CHARS);
+        append_canary(&mut text, &line);
+        assert!(text.chars().count() <= 10_000, "{}", text.chars().count());
+    }
+
+    #[test]
+    fn a_short_canary_value_is_kept() {
+        assert_eq!(canary_text("e", "abc"), "AWM-CANARY-e-abc");
+    }
 }

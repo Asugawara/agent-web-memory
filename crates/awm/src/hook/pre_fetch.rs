@@ -9,7 +9,7 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use super::{canary_line, deny_json, Env, HookArgs, Injection, Verdict};
+use super::{append_canary, canary_line, deny_json, Env, HookArgs, Injection, Verdict};
 use crate::config::{Mode, ShortCircuitMode};
 use crate::matching::{self, Hit};
 use crate::note::{Channel, Relation};
@@ -97,8 +97,7 @@ fn handle_fetch(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
             .to_string(),
     };
     if let (true, Some(line)) = (denies, canary_line(EVENT)) {
-        reason.push('\n');
-        reason.push_str(&line);
+        append_canary(&mut reason, &line);
     }
     let shown = denies.then(|| reason.clone());
     Ok(Verdict {

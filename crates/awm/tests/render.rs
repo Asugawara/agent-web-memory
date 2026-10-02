@@ -382,3 +382,98 @@ fn a_deny_reason_with_an_8000_character_summary_holds_it_in_full() {
     assert!(text.chars().count() <= DENY_MAX, "{}", text.chars().count());
     assert!(text.contains(&format!("found: {sanitised}\n")));
 }
+
+// Boundary tests: the room left for a later note's found text, computed from rendered lengths.
+
+/// Exactly `chars` characters of plain words (no sentence marks), which the sanitiser keeps whole.
+fn plain_text(chars: usize) -> String {
+    let s: String = "alpha beta gamma delta "
+        .chars()
+        .cycle()
+        .take(chars)
+        .collect();
+    let s = s.trim_end().to_string();
+    // Keep the length exact: pad a trimmed tail with a letter.
+    format!("{s}{}", "a".repeat(chars - s.chars().count()))
+}
+
+fn plain_note(id: i64, chars: usize) -> Note {
+    let mut n = base(id, Tool::WebFetch, HOUR);
+    n.url = Some(format!("https://example.com/p{id}"));
+    n.summary = Some(plain_text(chars));
+    assert_eq!(
+        awm::sanitize::excerpt(n.summary.as_deref().unwrap(), 8000)
+            .text
+            .chars()
+            .count(),
+        chars,
+        "the sanitiser must keep the plain text whole"
+    );
+    n
+}
+
+/// Characters of note 3's `[3] ... found: ` prefix (everything before its found text).
+fn fixed_of_third() -> usize {
+    let r = render::render(&[plain_note(3, 10)], &ctx(Channel::Url, 3)).expect("rendered");
+    let start = r.text.find("[1] ").unwrap();
+    let end = r.text.find("    found: ").unwrap() + "    found: ".len();
+    // Plus the newline that ends the found line.
+    r.text[start..end].chars().count() + 1
+}
+
+/// Notes 1 and 2 with note 2 sized so that `MAX_CHARS - (their block) - fixed(note 3) == room`.
+fn two_notes_leaving(room: usize) -> Vec<Note> {
+    let fixed3 = fixed_of_third();
+    let n1 = plain_note(1, 4_000);
+    let mut len = 4_000;
+    loop {
+        let n2 = plain_note(2, len);
+        let r = render::render(&[n1.clone(), n2.clone()], &ctx(Channel::Url, 3)).unwrap();
+        let have = MAX_CHARS as i64 - r.chars as i64 - fixed3 as i64;
+        if have == room as i64 {
+            return vec![n1, n2];
+        }
+        len = (len as i64 + have - room as i64) as usize;
+    }
+}
+
+#[test]
+fn exactly_199_characters_of_room_drops_the_note_and_the_later_ones() {
+    let mut notes = two_notes_leaving(199);
+    notes.push(plain_note(3, 5_000));
+    notes.push(plain_note(4, 300));
+    let r = render::render(&notes, &ctx(Channel::Url, 3)).expect("rendered");
+    assert_eq!(r.event_ids, vec![1, 2]);
+    assert!(!r.text.contains("\n[3] ") && !r.text.contains("\n[4] "));
+}
+
+#[test]
+fn exactly_200_characters_of_room_renders_a_cut_note() {
+    let mut notes = two_notes_leaving(200);
+    notes.push(plain_note(3, 5_000));
+    notes.push(plain_note(4, 300));
+    let r = render::render(&notes, &ctx(Channel::Url, 3)).expect("rendered");
+    assert_eq!(r.event_ids, vec![1, 2, 3]);
+    let third = found_of(&r.text, 3);
+    assert!(third.ends_with("..."), "{third}");
+    assert!(third.chars().count() <= 200 && third.chars().count() > 150);
+    assert!(r.chars <= MAX_CHARS);
+}
+
+#[test]
+fn a_block_landing_exactly_on_the_cap_is_not_cut() {
+    // Room for note 3's text is exactly its length: total == 9,500, still whole (<=).
+    let room = 1_000;
+    let mut notes = two_notes_leaving(room);
+    notes.push(plain_note(3, room));
+    let r = render::render(&notes, &ctx(Channel::Url, 3)).expect("rendered");
+    assert_eq!(r.chars, MAX_CHARS);
+    assert_eq!(r.event_ids, vec![1, 2, 3]);
+    assert_eq!(found_of(&r.text, 3), plain_text(room));
+    // One character more is cut to the room, still within the cap.
+    let mut notes = two_notes_leaving(room);
+    notes.push(plain_note(3, room + 1));
+    let r = render::render(&notes, &ctx(Channel::Url, 3)).expect("rendered");
+    assert!(r.chars <= MAX_CHARS);
+    assert!(found_of(&r.text, 3).ends_with("..."));
+}
