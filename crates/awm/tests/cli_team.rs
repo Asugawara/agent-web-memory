@@ -34,6 +34,9 @@ use awm_server::store::Store;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
+mod support;
+use support::{bare, coded, Proxy};
+
 // ---------------------------------------------------------------------------------------------
 // The server
 
@@ -249,6 +252,34 @@ impl Node {
             .stderr(Stdio::piped())
             .output()
             .unwrap();
+        Out {
+            code: o.status.code(),
+            stdout: String::from_utf8(o.stdout).unwrap(),
+            stderr: String::from_utf8(o.stderr).unwrap(),
+        }
+    }
+
+    /// Runs with `input` on stdin.
+    fn run_stdin(&self, args: &[&str], input: &str) -> Out {
+        use std::io::Write;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_awm"))
+            .args(args)
+            .env("AWM_HOME", self.path())
+            .env("HOME", self.home.path())
+            .env_remove("CODEX_HOME")
+            .env_remove("AWM_DEBUG")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let o = child.wait_with_output().unwrap();
         Out {
             code: o.status.code(),
             stdout: String::from_utf8(o.stdout).unwrap(),
@@ -513,6 +544,7 @@ fn create_writes_private_files_and_the_first_sync_pushes_the_genesis_at_roster_0
     assert_eq!(srv.roster_head(team.member_id, team.device_id), -1);
 
     a.ok(&["sync"]);
+    assert_eq!(a.mode("sync.lock"), 0o600, "sync.lock");
     assert_eq!(srv.roster_head(team.member_id, team.device_id), 0);
     let epoch: i64 = srv
         .raw()
@@ -2010,115 +2042,13 @@ fn a_single_item_the_server_refuses_is_dropped_counted_and_the_next_item_is_push
     assert!(!out.contains("rejected"), "{out}");
 }
 
-/// A forwarding HTTP proxy in front of a [`Srv`] that answers chosen `POST /v1/records` requests
-/// itself (a proxy, WAF or load balancer in front of the server, RVT3v V2). One request per
-/// connection. Each queued rule answers the next push: `None` forwards it, `Some(raw)` replies
-/// with those bytes; with the queue empty everything is forwarded.
-struct Proxy {
-    addr: SocketAddr,
-    rules: Arc<Mutex<std::collections::VecDeque<Option<String>>>>,
-}
-
 impl Proxy {
-    fn start(upstream: SocketAddr) -> Proxy {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let rules: Arc<Mutex<std::collections::VecDeque<Option<String>>>> = Arc::default();
-        let queue = rules.clone();
-        std::thread::spawn(move || {
-            for conn in listener.incoming() {
-                let Ok(mut client) = conn else { continue };
-                let queue = queue.clone();
-                std::thread::spawn(move || {
-                    let mut buf = Vec::new();
-                    let mut chunk = [0u8; 65_536];
-                    let head_end = loop {
-                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                            break i + 4;
-                        }
-                        match client.read(&mut chunk) {
-                            Ok(0) | Err(_) => return,
-                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                        }
-                    };
-                    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
-                    let len: usize = head
-                        .lines()
-                        .find_map(|l| {
-                            l.to_ascii_lowercase()
-                                .strip_prefix("content-length:")
-                                .map(|v| v.trim().parse().unwrap())
-                        })
-                        .unwrap_or(0);
-                    while buf.len() < head_end + len {
-                        match client.read(&mut chunk) {
-                            Ok(0) | Err(_) => return,
-                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                        }
-                    }
-                    let is_push = head.starts_with("POST /v1/records ");
-                    let rule = if is_push {
-                        queue.lock().unwrap().pop_front().flatten()
-                    } else {
-                        None
-                    };
-                    if let Some(raw) = rule {
-                        let _ = client.write_all(raw.as_bytes());
-                        return;
-                    }
-                    let mut fwd: String = head
-                        .lines()
-                        .filter(|l| {
-                            !l.is_empty() && !l.to_ascii_lowercase().starts_with("connection:")
-                        })
-                        .map(|l| format!("{l}\r\n"))
-                        .collect();
-                    fwd.push_str("Connection: close\r\n\r\n");
-                    let Ok(mut up) = std::net::TcpStream::connect(upstream) else {
-                        return;
-                    };
-                    let mut bytes = fwd.into_bytes();
-                    bytes.extend_from_slice(&buf[head_end..head_end + len]);
-                    let _ = up.write_all(&bytes);
-                    let mut resp = Vec::new();
-                    let _ = up.read_to_end(&mut resp);
-                    let _ = client.write_all(&resp);
-                });
-            }
-        });
-        Proxy { addr, rules }
-    }
-
-    /// The next push is answered by `rule` (`None`: forwarded).
-    fn queue(&self, rule: Option<String>) {
-        self.rules.lock().unwrap().push_back(rule);
-    }
-
     /// Points a node at this proxy.
     fn serve(&self, n: &Node) {
         let mut team = n.ident().team;
         team.server_url = format!("http://{}", self.addr);
         team.save(n.path()).unwrap();
     }
-}
-
-/// A reply with no awm error body, as a proxy sends it.
-fn bare(status: &str) -> String {
-    let body = "<html>refused</html>";
-    format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    )
-}
-
-/// A reply with an awm error body.
-fn coded(status: &str, code: &str) -> String {
-    let body = format!(r#"{{"error":"{code}","message":"test"}}"#);
-    format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    )
 }
 
 /// A node with a shared project and one captured record waiting, behind a [`Proxy`].
@@ -2299,4 +2229,384 @@ fn remove_rotates_exactly_once_and_a_later_sync_does_not_rotate_again() {
     }
     assert_eq!(TeamKey::load(a.path()).unwrap().epoch_keys.len(), 2);
     assert_eq!(srv.wrap_epochs(b.device()), [0, 1]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// FT5c: VF-B B7, B15, B16
+
+/// A node whose project has `n` records captured before it was shared (older than the rule), so
+/// only a backfill names them. Record `k` is `ages_days[k]` days old.
+fn node_with_old_records(srv: &Srv, ages_days: &[i64]) -> Node {
+    let a = create(srv, "ann");
+    a.ok(&["sync"]);
+    for (k, _) in ages_days.iter().enumerate() {
+        a.capture(
+            k as u32 + 1,
+            &format!("https://docs.example.org/old-{k}"),
+            &format!("Old record {k}."),
+        );
+    }
+    for (k, days) in ages_days.iter().enumerate() {
+        a.conn()
+            .execute(
+                "UPDATE event SET created_at = created_at - ?1 WHERE url LIKE ?2",
+                params![days * 86_400_000, format!("%/old-{k}")],
+            )
+            .unwrap();
+    }
+    share(&a);
+    a
+}
+
+fn server_rec_rows(srv: &Srv) -> i64 {
+    srv.raw()
+        .query_row("SELECT COUNT(*) FROM record WHERE tag = 'rec'", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+}
+
+// B7: `awm sync --dry-run` stands alone: it scans what the next run would share (per project a
+// count and one redacted sample payload) and sends nothing.
+#[test]
+fn sync_dry_run_alone_sends_nothing_and_prints_a_sample_per_project() {
+    let srv = Srv::start();
+    let a = create(&srv, "ann");
+    a.ok(&["sync"]);
+    share(&a);
+    a.capture(1, "https://docs.example.org/one", "One shared page.");
+    a.capture(2, "https://docs.example.org/two", "Two shared page.");
+    let before = server_rec_rows(&srv);
+    let out = a.ok(&["sync", "--dry-run"]);
+    assert!(
+        out.contains("would share 2 record(s); nothing was sent"),
+        "{out}"
+    );
+    assert!(out.contains("directory "), "one line per project: {out}");
+    assert!(out.contains(": 2 record(s)"), "{out}");
+    let sample = out
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("sample: "))
+        .unwrap_or_else(|| panic!("no sample: {out}"));
+    let v: Value = serde_json::from_str(sample).unwrap();
+    assert!(v["url"]
+        .as_str()
+        .unwrap()
+        .starts_with("https://docs.example.org/"));
+    assert!(v["summary"].as_str().unwrap().contains("shared page"));
+    // The plaintext fields as the receiver sees them: nothing that never leaves the machine.
+    for never in ["sess-private", "cwd_hash", "session_id", "match_text"] {
+        assert!(!sample.contains(never), "{never} in {sample}");
+    }
+    // Nothing was queued, marked or sent.
+    assert_eq!(a.count("SELECT COUNT(*) FROM sync_outbox"), 0);
+    assert_eq!(
+        a.count("SELECT COUNT(*) FROM event WHERE sync_id IS NOT NULL OR pushed_at IS NOT NULL"),
+        0
+    );
+    assert_eq!(server_rec_rows(&srv), before);
+    // The real run still sends both.
+    let out = a.ok(&["sync"]);
+    assert!(out.contains("pushed 2"), "{out}");
+}
+
+// B7 and B16: `--backfill --since --project` through the CLI; a live backfill prints the count per
+// project before it sends, a dry run with it prints the same and sends nothing.
+#[test]
+fn backfill_through_the_cli_honours_since_and_project_and_prints_the_count_per_project() {
+    use time::{Duration, OffsetDateTime};
+    let srv = Srv::start();
+    let a = node_with_old_records(&srv, &[40, 10]);
+    let project = a.project();
+    let project = project.to_str().unwrap();
+    // Without a backfill the older records stay local.
+    let out = a.ok(&["sync", "--dry-run"]);
+    assert!(out.contains("would share 0 record(s)"), "{out}");
+
+    let day = OffsetDateTime::now_utc() - Duration::days(20);
+    let since = format!(
+        "{:04}-{:02}-{:02}",
+        day.year(),
+        day.month() as u8,
+        day.day()
+    );
+    let out = a.ok(&[
+        "sync",
+        "--dry-run",
+        "--backfill",
+        "--since",
+        &since,
+        "--project",
+        project,
+    ]);
+    assert!(
+        out.contains("would share 1 record(s); nothing was sent"),
+        "--since leaves the 40-day-old record: {out}"
+    );
+    assert!(out.contains("Old record 1"), "{out}");
+    assert!(!out.contains("Old record 0"), "{out}");
+    assert_eq!(server_rec_rows(&srv), 0);
+    assert_eq!(a.count("SELECT COUNT(*) FROM sync_outbox"), 0);
+
+    let out = a.ok(&["sync", "--dry-run", "--backfill", "--project", project]);
+    assert!(out.contains("would share 2 record(s)"), "{out}");
+
+    // Another project is not covered by the rule.
+    let out = a.ok(&[
+        "sync",
+        "--dry-run",
+        "--backfill",
+        "--project",
+        a.path().to_str().unwrap(),
+    ]);
+    assert!(out.contains("would share 0 record(s)"), "{out}");
+
+    // Live: the count per project is printed first, then the records go out.
+    let out = a.ok(&[
+        "sync",
+        "--backfill",
+        "--since",
+        &since,
+        "--project",
+        project,
+    ]);
+    assert!(out.contains("backfill: sharing 1 record(s)"), "{out}");
+    assert!(out.contains("directory "), "{out}");
+    assert!(out.contains("pushed 1"), "{out}");
+    assert_eq!(server_rec_rows(&srv), 1);
+    let out = a.ok(&["sync", "--backfill", "--project", project]);
+    assert!(out.contains("backfill: sharing 1 record(s)"), "{out}");
+    assert_eq!(server_rec_rows(&srv), 2);
+}
+
+// B16: the refused-write codes, one by one, through the test proxy: each drops the item, counts
+// it once and keeps the run going.
+#[test]
+fn every_refused_write_code_drops_the_item_counts_it_and_the_run_succeeds() {
+    for (status, code) in [
+        ("400 Bad Request", "malformed"),
+        ("400 Bad Request", "unknown_field"),
+        ("400 Bad Request", "invalid_value"),
+        ("403 Forbidden", "forbidden"),
+        ("422 Unprocessable Entity", "bad_envelope"),
+    ] {
+        let (srv, proxy, a) = node_with_one_record_behind_a_proxy();
+        proxy.queue(Some(coded(status, code)));
+        let o = a.run(&["sync"]);
+        let number = &status[..3];
+        assert_eq!(o.code, Some(0), "{code}: {}{}", o.stdout, o.stderr);
+        assert!(
+            o.stderr.contains("the server refused rec 0")
+                && o.stderr.contains(&format!("with {number}")),
+            "{code}: {}",
+            o.stderr
+        );
+        assert!(o.stdout.contains("rejected 1"), "{code}: {}", o.stdout);
+        assert_eq!(a.status()["dropped"]["push_rejected"], 1, "{code}");
+        assert_eq!(a.count("SELECT COUNT(*) FROM sync_outbox"), 0, "{code}");
+        let markers: i64 = srv
+            .raw()
+            .query_row(
+                "SELECT COUNT(*) FROM record WHERE member_id = ?1 AND tag = 'rec' AND idx = 0 AND blob IS NULL",
+                [a.member().to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(markers, 1, "{code}: a marker keeps the stream contiguous");
+    }
+}
+
+// B16: `--ca-file` on `create` and `join` is stored (canonical path) in team.toml and used by the
+// next sync; a file that is not there is refused before anything is written.
+#[test]
+fn ca_file_is_stored_by_create_and_join_and_a_missing_file_is_refused() {
+    const CA: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBfTCCASOgAwIBAgIULyozQuBVc/Q7j5h9x4YDCOeITs8wCgYIKoZIzj0EAwIw\n\
+EzERMA8GA1UEAwwIYXdtLXRlc3QwIBcNMjYxMDAyMjI1MTUzWhgPMjEyNjA5MDgy\n\
+MjUxNTNaMBMxETAPBgNVBAMMCGF3bS10ZXN0MFkwEwYHKoZIzj0CAQYIKoZIzj0D\n\
+AQcDQgAEjrTXKTzlQlDKh00Xceqbgv/AzyAVJq84i4TJhYAMk3FhqORDahjSrVf4\n\
+Swv6l/g6WZQ/OFUvLc7D6ZiOFfANQaNTMFEwHQYDVR0OBBYEFCtkgLUlDaA1hPq9\n\
+W27uAncDU9RXMB8GA1UdIwQYMBaAFCtkgLUlDaA1hPq9W27uAncDU9RXMA8GA1Ud\n\
+EwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSAAwRQIhALv511Nbxe1nalgLnLGjJogA\n\
+LVJSTGpVxxbORyIkEdEcAiBTtEZ/3mRo1NSTe2QcEGXjAhFuGK5AA6ouhyy+dJUM\n\
+TQ==\n\
+-----END CERTIFICATE-----\n";
+    let srv = Srv::start();
+    let scratch = tempfile::tempdir().unwrap();
+    let ca = scratch.path().join("ca.pem");
+    std::fs::write(&ca, CA).unwrap();
+    let canonical = std::fs::canonicalize(&ca)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    // A missing file: refused, nothing written.
+    let n = Node::new();
+    let err = n.refused(&[
+        "team",
+        "create",
+        &srv.url(),
+        "--token",
+        &srv.bootstrap_token(),
+        "--handle",
+        "ann",
+        "--ca-file",
+        scratch.path().join("missing.pem").to_str().unwrap(),
+    ]);
+    assert!(err.contains("cannot read the CA file"), "{err}");
+    assert!(!n.path().join("team.toml").exists());
+
+    let a = Node::new();
+    a.ok(&[
+        "team",
+        "create",
+        &srv.url(),
+        "--token",
+        &srv.bootstrap_token(),
+        "--handle",
+        "ann",
+        "--ca-file",
+        ca.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        TeamToml::load(a.path()).unwrap().ca_file.as_deref(),
+        Some(canonical.as_str())
+    );
+    a.ok(&["sync"]);
+
+    let t = invite(&srv, &a, "bob");
+    let b = Node::new();
+    let out = b.ok(&[
+        "team",
+        "join",
+        &srv.url(),
+        "--token",
+        &t,
+        "--ca-file",
+        ca.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        TeamToml::load(b.path()).unwrap().ca_file.as_deref(),
+        Some(canonical.as_str())
+    );
+    a.ok(&["team", "approve", "bob", "--code", &code_of(&out)]);
+    b.ok(&["sync"]);
+    assert_eq!(b.status()["approval"], "approved");
+}
+
+// B16: `audit-log --from N` lists the rows from index N on.
+#[test]
+fn audit_log_from_lists_only_the_rows_from_that_index() {
+    let srv = Srv::start();
+    let a = create(&srv, "ann");
+    a.ok(&["sync"]);
+    member(&srv, &a, "bob");
+    let all = a.json(&["team", "audit-log", "--json"]);
+    let idxs: Vec<u64> = all["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["idx"].as_u64().unwrap())
+        .collect();
+    assert!(idxs.len() > 3, "{idxs:?}");
+    let from = idxs[2];
+    let part = a.json(&["team", "audit-log", "--json", "--from", &from.to_string()]);
+    let got: Vec<u64> = part["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["idx"].as_u64().unwrap())
+        .collect();
+    let want: Vec<u64> = idxs.iter().copied().filter(|i| *i >= from).collect();
+    assert_eq!(got, want);
+    assert!(got.len() < idxs.len());
+    let text = a.ok(&["team", "audit-log", "--from", &from.to_string()]);
+    assert_eq!(text.lines().count(), got.len(), "{text}");
+}
+
+// B16: `key import` reads the recovery string from stdin when it is not given as an argument.
+#[test]
+fn key_import_reads_the_recovery_string_from_stdin() {
+    let srv = Srv::start();
+    let a = create(&srv, "ann");
+    a.ok(&["sync"]);
+    let b = member(&srv, &a, "bob");
+    a.ok(&["team", "rotate-key"]);
+    b.ok(&["sync"]);
+    let export = a.ok(&["team", "key", "export"]).trim().to_string();
+
+    let mut key = TeamKey::load(b.path()).unwrap();
+    let held = key.epoch_keys.len();
+    assert_eq!(held, 2);
+    key.epoch_keys.truncate(1);
+    key.save(b.path()).unwrap();
+    std::fs::remove_file(b.path().join("team.repo")).unwrap();
+
+    let o = b.run_stdin(&["team", "key", "import"], &format!("{export}\n"));
+    assert_eq!(o.code, Some(0), "{}{}", o.stdout, o.stderr);
+    assert!(o.stdout.contains("up to epoch 1"), "{}", o.stdout);
+    assert_eq!(TeamKey::load(b.path()).unwrap().epoch_keys.len(), held);
+    assert_eq!(b.mode("team.repo"), 0o600);
+
+    // Garbage on stdin: refused, nothing written.
+    let before = std::fs::read(b.path().join("team.key")).unwrap();
+    let o = b.run_stdin(&["team", "key", "import"], "awmk1_notvalid\n");
+    assert_ne!(o.code, Some(0));
+    assert!(o.stderr.contains("nothing was written"), "{}", o.stderr);
+    assert_eq!(std::fs::read(b.path().join("team.key")).unwrap(), before);
+}
+
+// B16: an admin's new device (the roster holds the admin, not this device) that imports the
+// recovery string queues a `recover` roster entry for itself; a member's does not.
+#[test]
+fn key_import_on_a_new_admin_device_queues_a_recover_entry() {
+    let srv = Srv::start();
+    let a = create(&srv, "ann");
+    a.ok(&["sync"]);
+    let b = member(&srv, &a, "bob");
+    let export = a.ok(&["team", "key", "export"]).trim().to_string();
+
+    // Ann's new machine: her identity and the roster, a device of its own.
+    let r = Node::new();
+    for f in ["awm.db", "awm.db-wal", "awm.db-shm"] {
+        let _ = std::fs::remove_file(r.path().join(f));
+    }
+    a.conn()
+        .execute(
+            "VACUUM INTO ?1",
+            [r.path().join("awm.db").to_str().unwrap()],
+        )
+        .unwrap();
+    let mut team = a.ident().team;
+    team.device_id = Id::new_v4();
+    team.save(r.path()).unwrap();
+    let mut key = a.ident().key;
+    key.device_secret = Key32(
+        *awm_proto::keys::DeviceKeys::generate()
+            .unwrap()
+            .secret_bytes(),
+    );
+    key.save(r.path()).unwrap();
+    // The copy carries the roster; the streams and the outbox belong to the old device.
+    for table in ["sync_own", "sync_outbox", "sync_stream"] {
+        r.conn()
+            .execute(&format!("DELETE FROM {table}"), [])
+            .unwrap();
+    }
+
+    let out = r.ok(&["team", "key", "import", &export]);
+    assert!(
+        out.contains("enrols itself as a recovered admin device"),
+        "{out}"
+    );
+    assert_eq!(
+        r.count("SELECT COUNT(*) FROM sync_outbox WHERE kind = 'roster' AND ref = 'roster:0'"),
+        1
+    );
+
+    // Bob is no admin: nothing is queued.
+    let before = b.count("SELECT COUNT(*) FROM sync_outbox");
+    let out = b.ok(&["team", "key", "import", &export]);
+    assert!(!out.contains("enrols itself"), "{out}");
+    assert_eq!(b.count("SELECT COUNT(*) FROM sync_outbox"), before);
 }

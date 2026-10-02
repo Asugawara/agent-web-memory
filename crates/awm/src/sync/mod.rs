@@ -103,7 +103,8 @@ mod engine {
         /// A run started by a hook honours the backoff; one the user starts does not.
         pub honour_backoff: bool,
         pub backfill: Option<Backfill>,
-        /// With `backfill`: count what would be shared, send nothing, open no connection.
+        /// Scan what would be shared (with `backfill`: the backfill set), send nothing, open no
+        /// connection.
         pub dry_run: bool,
         /// `awm sync --push-only`: skip step 5 (pull, deletion stream, retention).
         pub push_only: bool,
@@ -179,9 +180,11 @@ mod engine {
         },
         /// The database is not at this build's schema; the message says what to do.
         Refused(String),
-        /// `--backfill --dry-run`: records that would be shared, and why the others stay.
+        /// `awm sync --dry-run`: records that would be shared (per project: a count and a sample
+        /// payload), and why the others stay.
         DryRun {
             would_share: usize,
+            projects: Vec<push::ProjectPreview>,
             kept: BTreeMap<String, u64>,
         },
         Done(Report),
@@ -247,6 +250,22 @@ mod engine {
         }
     }
 
+    /// What a live `--backfill` is about to share, per project (the count `awm sync` prints
+    /// before it sends). Reads only; an unconfigured machine or a database that is not at this
+    /// build's schema yields nothing and `run` reports the refusal.
+    pub fn backfill_preview(env: &Env, backfill: &Backfill) -> Result<Vec<push::ProjectPreview>> {
+        let db_path = env.data_dir.join(paths::DB_FILE);
+        if !state::configured(&env.data_dir) || !db_path.is_file() {
+            return Ok(Vec::new());
+        }
+        let conn = db::open(&db_path, Role::Sync)?;
+        if db::check_version(&conn)? != VersionCheck::Current {
+            return Ok(Vec::new());
+        }
+        let scan = push::scan(&conn, &env.config, Some(backfill), 100_000)?;
+        push::previews(&conn, &env.config, Some(backfill), &scan)
+    }
+
     /// Runs `awm sync` once.
     pub fn run(env: &Env, opts: &Opts) -> Result<Outcome> {
         let dir = env.data_dir.as_path();
@@ -288,6 +307,7 @@ mod engine {
             let scan = push::scan(&conn, &env.config, backfill, 100_000)?;
             return Ok(Outcome::DryRun {
                 would_share: scan.candidates.len(),
+                projects: push::previews(&conn, &env.config, backfill, &scan)?,
                 kept: scan.counts,
             });
         }

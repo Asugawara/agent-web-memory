@@ -1,5 +1,9 @@
 //! Claude Code hook entry points and the code the synchronous hooks share
 //! (plan-v2 §5). Every path returns exit code 0.
+//!
+//! The `injection` and `hook_run` rows are written after the output is printed, with one retry
+//! after 20 ms when the database is busy. Under contention (a large pull being applied) a write
+//! may still be dropped after the retry: the hook never waits longer for its rows.
 
 pub mod capture;
 pub mod post_tool;
@@ -367,8 +371,18 @@ fn local_offset_minutes() -> i32 {
     time::UtcOffset::current_local_offset().map_or(0, |o| i32::from(o.whole_minutes()))
 }
 
+/// Pause before the one retry of the post-output write when the database is busy.
+const WRITE_RETRY_PAUSE: Duration = Duration::from_millis(20);
+
 /// Runs a synchronous hook: stdin, config, deadline, database, `handler`, output,
 /// then the `injection` and `hook_run` rows. Never fails.
+///
+/// The rows are written after the output is printed, with a 50 ms busy timeout
+/// ([`Role::HookRead`]). When the database is busy the write is tried once more after 20 ms;
+/// the hook's total deadline is unchanged (the watchdog has already been committed). Under
+/// heavy contention (for example `awm sync` applying a large pull) the second try can fail too,
+/// and the `injection` / `hook_run` rows of that run are then dropped: the hook never waits
+/// longer for them.
 pub fn run_sync<F>(hook: &'static str, handler: F)
 where
     F: FnOnce(&Env, &Connection) -> Result<Verdict>,
@@ -438,7 +452,14 @@ where
     if let Some(out) = &verdict.output {
         print_line(out);
     }
-    if let Err(e) = write_rows(&mut conn, &env, &meta, &verdict) {
+    // The output is already printed: a busy database costs one more try after a short pause
+    // (the transaction rolled back, nothing is half written).
+    let mut written = write_rows(&mut conn, &env, &meta, &verdict);
+    if matches!(&written, Err(e) if is_busy(e)) {
+        std::thread::sleep(WRITE_RETRY_PAUSE);
+        written = write_rows(&mut conn, &env, &meta, &verdict);
+    }
+    if let Err(e) = written {
         if debug_enabled() {
             eprintln!("awm {hook}: cannot write the log rows: {e:#}");
         }

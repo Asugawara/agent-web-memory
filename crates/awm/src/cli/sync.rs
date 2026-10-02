@@ -1,5 +1,5 @@
 //! `awm sync [--once] [--quiet] [--push-only | --pull-only] [--status]
-//! [--backfill --since DATE --project P [--dry-run]]` (plan-v3-team §4.6, §4.8; TM10).
+//! [--dry-run] [--backfill --since DATE --project P]` (plan-v3-team §4.6, §4.8; TM10).
 //!
 //! `--push-only` and `--pull-only` skip the other phase of the run (both still take
 //! `sync.lock`; only a full run writes `last_ok`, RVT3v V9); `--status` prints what `awm team status` prints and does not sync (RVT3 F5).
@@ -37,8 +37,9 @@ pub struct Args {
     /// With --backfill: a project directory, a cwd hash or a repo key (repeatable)
     #[arg(long, requires = "backfill")]
     pub project: Vec<String>,
-    /// With --backfill: show what would be shared and send nothing
-    #[arg(long, requires = "backfill")]
+    /// Show what the next run would share (with --backfill: the backfill set), per project a count
+    /// and one sample payload as the receiver would see it, and send nothing
+    #[arg(long)]
     pub dry_run: bool,
 }
 
@@ -70,6 +71,19 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         } else {
             None
         };
+        // A live backfill says what it is about to send, per project (no prompt).
+        if let (Some(b), false) = (&backfill, args.dry_run) {
+            if !quiet {
+                let projects = sync::backfill_preview(&env, b)?;
+                let total: usize = projects.iter().map(|p| p.count).sum();
+                if total > 0 {
+                    println!("backfill: sharing {total} record(s)");
+                    for p in &projects {
+                        println!("  {}: {} record(s)", p.project, p.count);
+                    }
+                }
+            }
+        }
         let opts = Opts {
             quiet,
             honour_backoff: quiet,
@@ -143,8 +157,18 @@ fn print_outcome(outcome: &crate::sync::Outcome, pull_only: bool) {
             println!("waiting after an error until {}", super::fmt_ts(*until_ms))
         }
         Outcome::Refused(why) => eprintln!("awm sync: {why}"),
-        Outcome::DryRun { would_share, kept } => {
-            println!("would share {would_share} record(s)");
+        Outcome::DryRun {
+            would_share,
+            projects,
+            kept,
+        } => {
+            println!("would share {would_share} record(s); nothing was sent");
+            for p in projects {
+                println!("  {}: {} record(s)", p.project, p.count);
+                if let Some(sample) = &p.sample {
+                    println!("    sample: {sample}");
+                }
+            }
             for (reason, n) in kept {
                 println!("  stays local: {reason}: {n}");
             }

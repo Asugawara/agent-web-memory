@@ -925,7 +925,7 @@ fn log_tags_team_rows_and_filters_by_origin_and_shared() {
         &fetch(2, "https://example.org/mine-shared", "s0", BASE + 2),
     );
     conn.execute(
-        "UPDATE event SET sync_id = 'rec-2', shareable = 'full' WHERE id = 2",
+        "UPDATE event SET sync_id = 'rec-2', shareable = 'full', pushed_at = 1 WHERE id = 2",
         [],
     )
     .unwrap();
@@ -967,6 +967,87 @@ fn log_tags_team_rows_and_filters_by_origin_and_shared() {
     assert_eq!(json[0]["origin"], "team");
     assert_eq!(json[0]["handle"], "alf");
     assert_eq!(json[1]["origin"], "local");
+}
+
+// B10: `--shared` lists what reached the server (`pushed_at`); a record queued but not yet sent
+// shows a `queued` marker in the text output and `"queued": true` in JSON, and is not listed by
+// `--shared`.
+#[test]
+fn log_shared_lists_what_reached_the_server_and_marks_what_is_only_queued() {
+    let env = Env::new();
+    let conn = env.conn();
+    insert(
+        &conn,
+        &fetch(1, "https://example.org/pushed-one", "s0", BASE + 1),
+    );
+    insert(
+        &conn,
+        &fetch(2, "https://example.org/queued-two", "s0", BASE + 2),
+    );
+    insert(
+        &conn,
+        &fetch(3, "https://example.org/private-three", "s0", BASE + 3),
+    );
+    conn.execute(
+        "UPDATE event SET sync_id = 'rec-1', shareable = 'full', pushed_at = 1 WHERE id = 1",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE event SET sync_id = 'rec-2', shareable = 'full' WHERE id = 2",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let shared = env.awm(&["log", "--shared"]).ok().to_string();
+    assert_eq!(shared.lines().count(), 1, "{shared}");
+    assert!(shared.contains("pushed-one"), "{shared}");
+    assert!(!shared.contains("queued"), "{shared}");
+
+    let all = env.awm(&["log"]).ok().to_string();
+    let marked: Vec<&str> = all.lines().filter(|l| l.contains("[queued]")).collect();
+    assert_eq!(marked.len(), 1, "{all}");
+    assert!(marked[0].contains("queued-two"), "{all}");
+
+    let json: Vec<Value> = env
+        .awm(&["log", "--json"])
+        .ok()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let by_target = |t: &str| {
+        json.iter()
+            .find(|v| v["target"].as_str().is_some_and(|s| s.ends_with(t)))
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(by_target("queued-two")["queued"], true);
+    assert!(by_target("pushed-one").get("queued").is_none());
+    assert!(by_target("private-three").get("queued").is_none());
+}
+
+// B14: `--origin` is read only with `--value`: without it the command is refused, not ignored.
+#[test]
+fn stats_origin_without_value_is_an_error() {
+    let env = Env::new();
+    for args in [
+        &["stats", "--origin", "team"][..],
+        &["stats", "--savings", "--origin", "local"][..],
+    ] {
+        let o = env.awm(args);
+        assert_eq!(o.code, Some(2), "{args:?}: {}{}", o.stdout, o.stderr);
+        assert!(
+            o.stderr.contains("--origin needs --value"),
+            "{args:?}: {}",
+            o.stderr
+        );
+        assert!(o.stdout.is_empty(), "{}", o.stdout);
+    }
+    assert_eq!(
+        env.awm(&["stats", "--value", "--origin", "team"]).code,
+        Some(0)
+    );
 }
 
 #[test]

@@ -429,6 +429,49 @@ pub fn scan(
     Ok(scan)
 }
 
+/// What a scan would share for one project: the count and one sample payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectPreview {
+    /// `repo <key prefix>` or `directory <hash prefix>`: the hashes a rule or `--project` names.
+    pub project: String,
+    pub count: usize,
+    /// The plaintext JSON of the first record, redacted as the receiver would see it.
+    pub sample: Option<String>,
+}
+
+/// Groups the candidates of `scan` per project (the repository key when there is one, else the
+/// working-directory hash), with the count and one built sample each. Nothing is written.
+pub fn previews(
+    conn: &Connection,
+    cfg: &Config,
+    backfill: Option<&Backfill>,
+    scan: &Scan,
+) -> Result<Vec<ProjectPreview>> {
+    let values: Vec<String> = backfill.map(|b| b.values.clone()).unwrap_or_default();
+    let policy = load_policy(conn, load_opt_in(conn, &values)?)?;
+    let mut groups: BTreeMap<String, ProjectPreview> = BTreeMap::new();
+    for c in &scan.candidates {
+        let (kind, key) = match &c.repo_key {
+            Some(k) => ("repo", k.as_str()),
+            None => ("directory", c.record.cwd_hash.as_str()),
+        };
+        let label = format!("{kind} {}", key.chars().take(12).collect::<String>());
+        let entry = groups.entry(label.clone()).or_insert(ProjectPreview {
+            project: label,
+            count: 0,
+            sample: None,
+        });
+        entry.count += 1;
+        if entry.sample.is_none() {
+            let ctx = ShareCtx::new(c.share, c.repo_key.clone(), cfg, &policy);
+            if let Ok(p) = payload::build(&c.record, &ctx) {
+                entry.sample = Some(String::from_utf8_lossy(&p.plaintext).into_owned());
+            }
+        }
+    }
+    Ok(groups.into_values().collect())
+}
+
 /// Builds, seals and queues the candidates in batches of at most 100: `sync_id`, `sync_idx`,
 /// the `sync_own` row, the outbox row and the stream head, one short transaction per batch,
 /// before any request. Returns how many were queued.

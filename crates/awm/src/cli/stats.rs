@@ -47,6 +47,13 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
+    if args.origin.is_some() && !args.value {
+        clap::Error::raw(
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "--origin needs --value\n",
+        )
+        .exit();
+    }
     let conn = super::open_db()?;
     let v = collect(&conn, &args)?;
     if args.json {

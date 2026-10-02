@@ -236,7 +236,6 @@ mod imp {
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::{BufRead, IsTerminal};
     use std::path::{Path, PathBuf};
-    use std::time::{Duration, Instant};
 
     use anyhow::{anyhow, bail, Context, Result};
     use awm_proto::crypto::{open_record, RecordAd};
@@ -360,35 +359,10 @@ mod imp {
         }
     }
 
-    /// `sync.lock`, waiting up to 10 s (plan-v3-team §3.6), then refusing.
+    /// `sync.lock`, waiting up to 10 s (plan-v3-team §3.6), then refusing: the one
+    /// implementation lives in [`sync::apply::lock_sync`].
     fn lock(dir: &Path) -> Result<std::fs::File> {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.create(true).truncate(false).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let f = opts
-            .open(dir.join(sync::LOCK_FILE))
-            .context("cannot open sync.lock")?;
-        let start = Instant::now();
-        loop {
-            match f.try_lock() {
-                Ok(()) => return Ok(f),
-                Err(std::fs::TryLockError::WouldBlock)
-                    if start.elapsed() < Duration::from_secs(10) =>
-                {
-                    std::thread::sleep(Duration::from_millis(100))
-                }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    bail!("awm sync is running (sync.lock is held): try again in a moment")
-                }
-                Err(std::fs::TryLockError::Error(e)) => {
-                    return Err(e).context("cannot take sync.lock")
-                }
-            }
-        }
+        sync::apply::lock_sync(dir)
     }
 
     fn client_of(ident: &Identity) -> Result<Client> {
