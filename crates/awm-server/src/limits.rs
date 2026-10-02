@@ -95,6 +95,8 @@ impl Limits {
         Rule::per_hour(self.joins_per_hour)
     }
 
+    /// Unused since `POST /v1/delete` goes through `delete::run`, whose bulk limit is durable.
+    #[allow(dead_code)]
     pub(crate) fn bulk_delete_rule(&self) -> Rule {
         Rule::per_hour(self.bulk_deletes_per_hour)
     }

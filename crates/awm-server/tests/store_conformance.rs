@@ -1843,6 +1843,73 @@ mod cases {
             }
         }
     }
+
+    /// TM9 P1: retention keeps the newest `policy` record of each `(member, device, policy)`
+    /// stream whatever its age (a member who joins later must still find the policy); older
+    /// `policy` records and every other tag expire as usual.
+    pub async fn retention_keeps_the_newest_policy_record_of_each_stream(f: Fixture) {
+        let s = &*f.store;
+        let org = bootstrap(s).await;
+        let a = org.admin;
+        let roy = add_member(s, &org, "roy", 2).await;
+        let mut ids: Vec<Vec<Id>> = Vec::new();
+        for (who, n) in [(&a, 3u64), (&roy, 1)] {
+            let mut stream = Vec::new();
+            for i in 0..n {
+                let id = Id::new_v4();
+                stream.push(id);
+                s.push(PushBatch {
+                    member_id: who.member_id,
+                    device_id: who.device_id,
+                    items: vec![rec("policy", i, id, 0, blob(&id.to_string(), 1))],
+                    now: T0 + i as i64 * DAY,
+                })
+                .await
+                .unwrap();
+            }
+            ids.push(stream);
+        }
+        let other = push_n(s, &a, "rec", 1).await;
+        let now = T0 + 1_000 * DAY;
+        assert_eq!(
+            s.retention_batch(now - 365 * DAY, 1_000, now)
+                .await
+                .unwrap(),
+            3,
+            "the rec record and the two older admin policy records"
+        );
+        let deleted: HashSet<Id> = s
+            .deletions(0, 1_000)
+            .await
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| e.record_id)
+            .collect();
+        assert_eq!(
+            deleted,
+            HashSet::from([ids[0][0], ids[0][1], other[0]]),
+            "older policy records expire"
+        );
+        for (who, stream) in [(&a, &ids[0]), (&roy, &ids[1])] {
+            let items = all_records(s, who, "policy").await;
+            match items.last().unwrap() {
+                PulledItem::Record(r) => {
+                    assert_eq!(r.id, *stream.last().unwrap());
+                    assert_eq!(r.blob, blob(&r.id.to_string(), 1), "the blob is kept");
+                }
+                PulledItem::Deleted(_) => panic!("the newest policy record was deleted"),
+            }
+        }
+        // Run again: nothing more goes, however old the newest policy record becomes.
+        let later = now + 5_000 * DAY;
+        assert_eq!(
+            s.retention_batch(later - 365 * DAY, 1_000, later)
+                .await
+                .unwrap(),
+            0
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1868,6 +1935,7 @@ macro_rules! conformance_cases {
             removal_roles_and_the_last_admin,
             retention_is_bounded_oldest_first_and_prunes_keep_the_head,
             roster_records_survive_retention_and_bulk_deletes,
+            retention_keeps_the_newest_policy_record_of_each_stream,
         );
     };
     (@each $factory:path; $($case:ident),* $(,)?) => {

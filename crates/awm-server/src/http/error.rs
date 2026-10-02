@@ -185,6 +185,20 @@ impl From<AuthError> for ApiError {
     }
 }
 
+impl From<crate::delete::DeleteError> for ApiError {
+    fn from(e: crate::delete::DeleteError) -> ApiError {
+        match e.to_body() {
+            Some(body) => ApiError {
+                status: StatusCode::from_u16(e.status()).unwrap_or(StatusCode::BAD_REQUEST),
+                retry_after: e.retry_after(),
+                body: Some(Box::new(body)),
+                log: None,
+            },
+            None => ApiError::internal(e.to_string()),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Parsing bodies and query strings
 

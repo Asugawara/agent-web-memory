@@ -13,8 +13,8 @@ use axum::response::Response;
 use super::ctx::{Cap, Class, Client, Cx};
 use super::error::ApiError;
 use super::{json, reply, AppState};
-use crate::authz::{self, Action, DeleteScope};
-use crate::limits::RateKey;
+use crate::authz::{self, Action};
+use crate::delete;
 use crate::store::PushBatch;
 
 const DAY_S: i64 = 86_400;
@@ -258,34 +258,17 @@ async fn delete_inner(app: &AppState, req: Request) -> Result<Response, ApiError
     let limits = &app.config.limits;
     let mut cx = Cx::open(app, req, Client::Required, Class::Token, Cap::Body)?;
     let body: DeleteRequest = cx.json(Cap::Body).await?;
-    let scope = match &body {
-        DeleteRequest::Ids(ids) => {
-            if ids.len() > limits.delete_ids {
-                return Err(ApiError::too_large(
-                    "delete_ids",
-                    limits.delete_ids as u64,
-                    None,
-                ));
-            }
-            DeleteScope::Ids
+    // Kept in front of `delete::run` (which checks the same cap after authorising): it rejects an
+    // oversized list before the token lookup.
+    if let DeleteRequest::Ids(ids) = &body {
+        if ids.len() > limits.delete_ids {
+            return Err(ApiError::too_large(
+                "delete_ids",
+                limits.delete_ids as u64,
+                None,
+            ));
         }
-        DeleteRequest::AllMine => DeleteScope::AllMine,
-        DeleteRequest::Member(_) => DeleteScope::Member,
-    };
-    let caller = cx.authenticate().await?;
-    cx.authorise(&caller, Action::Delete(scope)).await?;
-    let actor = caller
-        .actor()
-        .ok_or_else(|| ApiError::from(authz::Refusal::Forbidden))?;
-    if scope != DeleteScope::Ids {
-        // Bulk deletion: 1 an hour per token; the store audits it for the admins' next read.
-        app.limiter
-            .take(
-                RateKey::BulkDelete(actor.device_id),
-                limits.bulk_delete_rule(),
-                cx.now,
-            )
-            .map_err(|s| ApiError::rate_limited(s, None))?;
     }
-    json(&app.store.delete(body, actor, cx.now).await?)
+    let caller = cx.authenticate().await?;
+    json(&delete::run(&*app.store, &caller, body, cx.now).await?)
 }
