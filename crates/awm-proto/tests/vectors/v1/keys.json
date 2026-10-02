@@ -1,0 +1,59 @@
+{
+  "invite": {
+    "handle": "alice",
+    "invite_id": "inv_01",
+    "s": "505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f",
+    "string": "awmi1_bxwqnjtNTl-KewwdLj9KW1BRUlNUVVZXWFlaW1xdXl9gYWJjZGVmZ2hpamtsbW5vBmludl8wMQt0b2tfYWJjX2RlZgVhbGljZQ",
+    "token": "tok_abc_def"
+  },
+  "join_wrap": {
+    "approver_device": "2c3d4e5f-6a7b-4c8d-9e0f-1a2b3c4d5e6f",
+    "auth": "76be130001a9dcf3ac9c3191fe3499ffe97f59f8efc5f72bbf627391f0b1c301",
+    "blob": "019fd7ad6dcff4298dd3f96d5b1b2af910a0535b1488d7f8fabb349a982880b615b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c74b3ffc712e86ec987e033d9ac575519015306c5147caf3c10435e963a4f7cfb604ca3e8420aa0893e60a1b7b3508ad0c",
+    "epoch": 0,
+    "rng": "909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7"
+  },
+  "joiner": {
+    "code": "927 832",
+    "device_id": "9d8c7b6a-5f4e-4d3c-8b2a-1f0e9d8c7b6a",
+    "fingerprint": "b4ae be66 03f5 9128 cf1a 966a bd1d 9ece",
+    "join_mac": "557ccc12354a776da15f252377276825a808da97d25bdc6ea2049251b9e4728f",
+    "public": "23b7bb8c91ae008711fb12846780bcdf1e065f821bdfec49f57e7c7dcd4c4823",
+    "secret": "707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f"
+  },
+  "k0": "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f",
+  "k_repo_of_k0": "fijE53y7zJd_JBbH3ViNeLy_EnovAcqBYyAYccPDXaI",
+  "org": "6f1c2a9e-3b4d-4e5f-8a7b-0c1d2e3f4a5b",
+  "recovery_export": "awmk1_bxwqnjtNTl-KewwdLj9KWwAAAAIAAAAAEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8AAAABICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj_K7NBt",
+  "repo_key": {
+    "remote": "github.com/owner/repo",
+    "value": "8a4313a0cca95ab1984f8d4863be9b68"
+  },
+  "roster_record": {
+    "entry": {
+      "approved_at": 1790000100,
+      "approver_device_id": "2c3d4e5f-6a7b-4c8d-9e0f-1a2b3c4d5e6f",
+      "device_id": "9d8c7b6a-5f4e-4d3c-8b2a-1f0e9d8c7b6a",
+      "device_pub": "I7e7jJGuAIcR-xKEZ4C83x4GX4Ib3-xJ9X58fc1MSCM",
+      "handle": "alice",
+      "kind": "member",
+      "member_id": "1a2b3c4d-5e6f-4a1b-9c2d-3e4f5a6b7c8d",
+      "role": "member",
+      "type": "approve"
+    },
+    "envelope": "01c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7a1354bce4f226538f154ff04920792eda0da3aed423fefa682ba1e19338dd643c3e0bab61b62219d87a9cee14eff764a83d85bc5369f8fd8a35dec94ef99e507c905c8822dab22b83b0792b936e52a4006f0bc35354783c6c66364499acd46e09a888af1d10cc331076c6daac02b783d16ac40412cdcdbfff6dd88a49d1f87d6c73f308bdb1faf30bb1f54114609d52ec9771ec0b8a26d5c22de4774c09358d5854e7cc391d1be1b6bf6e47c368bd24a5d235ad6f9e81c30b3a18d9c28d22050ce195a6797d35ee75495e92eddde96ff2f8be9014098f5fe897b634d165e2487112782362bf22e2b67f09fc469e6e1370efdba438acdb7329859026007243728e78110f8d74964eab7a9be972bacb1b02bafb874c008249df97a060c4337a6f330afdac044d25b1ef9a9f0f0e8c1ff0f1922439aa614be289982e1ac4dc442936a8772e85733b8491cbebe628156289a395abe6a7ef16bbeea7f5a27b9ba5b23668b1e16f4f4cfddba506b88854da4d06f9cd84bc1c518209447688cdaa5fe4aa03316cbba7a6fc9314bd7a63600fd8a1d2deb0b0e2e62ace1c07ef4f3a9392c0ffdab8728e47c37048844a865cd9314aa09b0f87d61231bf00b6726f0040157a44d091ec030c0090b7f4f0a62f790f983b44b124d7222b8bec6e78f8e75eb9eef701bd31566e04dc7312fe9a06088eebc1b8c2bd915ad05cc3c3a0c1881ad67109a104a946485ff9d916a08f4d51637",
+    "epoch": 0,
+    "idx": 1,
+    "nonce": "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7",
+    "record_id": "0b1c2d3e-4f5a-4b6c-ad7e-8f9a0b1c2d3e",
+    "writer_device": "2c3d4e5f-6a7b-4c8d-9e0f-1a2b3c4d5e6f",
+    "writer_member": "00000000-0000-0000-0000-000000000000"
+  },
+  "rotation_wrap": {
+    "auth": "76a4431cac603683a6ccc6eef1e2f61e5619328589d772dc0522a1e22fcd93a1",
+    "blob": "01605a725d2a4adfeeb1a29e17edd621c1b7593ee8cdbc44ac6c4ab6e2f805d23cd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7810261f5e21d138a4cb29bf120cbb219ffedae71f3e82b548470e44e49a8439c9d792b22c7a732c0eb5b6b9483fcedbc",
+    "epoch": 1,
+    "new_key": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "rng": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7"
+  }
+}

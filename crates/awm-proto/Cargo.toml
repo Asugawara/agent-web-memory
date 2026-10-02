@@ -9,10 +9,10 @@ description = "Wire types, record envelope and key handling for awm team sync (p
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-chacha20poly1305 = "0.11.0"
+chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
 hkdf = "0.13.0"
-hmac = "0.13.0"
+hmac = { version = "0.13.0", features = ["zeroize"] }
 sha2 = "0.11.0"
 getrandom = "0.4"
 uuid = { version = "1", features = ["v4", "serde"] }
