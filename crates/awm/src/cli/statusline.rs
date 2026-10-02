@@ -48,15 +48,17 @@ fn read_input() -> Option<Value> {
     serde_json::from_slice(&buf).ok()
 }
 
-/// The `quota` directory when a sample may be written: the data dir exists, the
-/// config parses, `mode` is not `off` and `quota.capture` is not `false`.
-fn sample_dir() -> Option<std::path::PathBuf> {
+/// The `quota` directory and `quota.retention_days` when a sample may be
+/// written: the data dir exists, the config parses, `mode` is not `off` and
+/// `quota.capture` is not `false`.
+fn sample_dir() -> Option<(std::path::PathBuf, u32)> {
     let data = crate::paths::data_dir().ok()?;
     if !data.is_dir() {
         return None;
     }
     let cfg = config::load(&data.join(crate::paths::CONFIG_FILE)).ok()?;
-    (cfg.mode != Mode::Off && cfg.quota.capture).then(|| data.join(quota::DIR))
+    (cfg.mode != Mode::Off && cfg.quota.capture)
+        .then(|| (data.join(quota::DIR), cfg.quota.retention_days))
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -78,8 +80,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         }
     }
 
-    if let (Some(dir), Some(sample)) = (dir, &sample) {
-        if let Err(e) = store::record(&dir, sample) {
+    if let (Some((dir, retention_days)), Some(sample)) = (dir, &sample) {
+        let result = store::record(&dir, sample).and_then(|r| match r {
+            // Old months go only after a written append (plan-quota §4.2 step 4).
+            store::Recorded::Written => store::prune(&dir, now, retention_days).map(drop),
+            store::Recorded::Unchanged => Ok(()),
+        });
+        if let Err(e) = result {
             if debug_enabled() {
                 eprintln!("awm statusline: {e}");
             }

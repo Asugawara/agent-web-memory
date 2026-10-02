@@ -844,6 +844,15 @@ fn spool_file(e: &std::fs::DirEntry) -> bool {
             .is_some_and(|x| x == "json")
 }
 
+/// A usage sample in `quota/`: a regular file named `samples-YYYY-MM.ndjson`
+/// (symlinks are not files here; plan-quota §5.2).
+fn quota_file(e: &std::fs::DirEntry) -> bool {
+    e.file_type().is_ok_and(|t| t.is_file())
+        && e.file_name()
+            .to_str()
+            .is_some_and(crate::quota::store::is_sample_file)
+}
+
 fn print_deleted(out: &mut dyn Write, d: &Deleted, again: Option<&str>) -> anyhow::Result<()> {
     writeln!(
         out,
@@ -988,7 +997,8 @@ fn awm_config(path: &Path) -> bool {
 
 /// Entries of the data dir that awm did not create, as paths relative to it.
 /// A symlink with an awm name is ours (only the link is deleted); `spool/`
-/// must be a symlink or a directory of regular `*.json` files.
+/// must be a symlink or a directory of regular `*.json` files, and `quota/` a
+/// symlink or a directory of regular sample files ([`quota_file`]).
 fn foreign_entries(dir: &Path) -> anyhow::Result<Vec<String>> {
     let mut foreign = Vec::new();
     for e in std::fs::read_dir(dir)
@@ -1001,13 +1011,16 @@ fn foreign_entries(dir: &Path) -> anyhow::Result<Vec<String>> {
             continue;
         };
         let ok = if kind.is_symlink() {
-            ours(&name) || name == paths::CONFIG_FILE || name == paths::SPOOL_DIR
-        } else if name == paths::SPOOL_DIR && kind.is_dir() {
+            ours(&name)
+                || name == paths::CONFIG_FILE
+                || name == paths::SPOOL_DIR
+                || name == crate::quota::DIR
+        } else if let (true, Some(allowed)) = (kind.is_dir(), dir_filter(&name)) {
             for f in std::fs::read_dir(e.path())
                 .with_context(|| format!("cannot read {}", e.path().display()))?
                 .flatten()
             {
-                if !spool_file(&f) {
+                if !allowed(&f) {
                     foreign.push(format!("{name}/{}", f.file_name().to_string_lossy()));
                 }
             }
@@ -1023,6 +1036,19 @@ fn foreign_entries(dir: &Path) -> anyhow::Result<Vec<String>> {
     }
     foreign.sort();
     Ok(foreign)
+}
+
+/// The files a real directory of the data dir may hold, by its name: `spool/`
+/// holds [`spool_file`]s and `quota/` holds [`quota_file`]s. `None` for any
+/// other directory, which is foreign.
+fn dir_filter(name: &str) -> Option<fn(&std::fs::DirEntry) -> bool> {
+    if name == paths::SPOOL_DIR {
+        Some(spool_file)
+    } else if name == crate::quota::DIR {
+        Some(quota_file)
+    } else {
+        None
+    }
 }
 
 /// Prints the refusal of `purge --all` when the data dir holds foreign entries.
@@ -1127,17 +1153,25 @@ pub fn purge_all(
         return Ok((refuse_foreign(io, &dir, &foreign)?, Some(summary)));
     }
     // Only awm's entries are left: files and symlinks (removed as links, never
-    // followed), and a real `spool/` holding only `*.json` files.
+    // followed), a real `spool/` holding only `*.json` files and a real
+    // `quota/` holding only sample files.
     for e in std::fs::read_dir(&dir)
         .with_context(|| format!("cannot read {}", dir.display()))?
         .flatten()
     {
         let path = e.path();
         if e.file_type().is_ok_and(|t| t.is_dir()) {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(allowed) = dir_filter(&name) else {
+                bail!(
+                    "cannot delete {}: a directory awm did not create appeared",
+                    path.display()
+                );
+            };
             for f in std::fs::read_dir(&path)
                 .with_context(|| format!("cannot read {}", path.display()))?
                 .flatten()
-                .filter(spool_file)
+                .filter(allowed)
             {
                 std::fs::remove_file(f.path())
                     .with_context(|| format!("cannot delete {}", f.path().display()))?;

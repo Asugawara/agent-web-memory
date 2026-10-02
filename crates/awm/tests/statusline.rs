@@ -407,3 +407,103 @@ fn read_all_sorts_and_skips_malformed_lines() {
     let ts: Vec<i64> = store::read_all(&dir).iter().map(|s| s.t).collect();
     assert_eq!(ts, [10, 20, 30]);
 }
+
+/// 2026-10-15T00:00:00Z: June ended 106 days before, July 75.
+const OCT_15: &str = "1792022400000";
+
+#[test]
+fn prunes_month_files_past_retention() {
+    let env = Env::new();
+    let full = fixture("full.json");
+    let at = |stdin: &str| {
+        let o = env.run(
+            &["--quiet"],
+            stdin.as_bytes(),
+            &[("AWM_TEST_NOW_MS", OCT_15)],
+        );
+        assert_silent_ok(&o);
+    };
+    at(&full);
+    let q = env.quota();
+    let outside = env.dir.path().join("outside-sample");
+    std::fs::write(q.join("samples-2026-06.ndjson"), "june\n").unwrap();
+    std::fs::write(q.join("samples-2026-07.ndjson"), "july\n").unwrap();
+    std::fs::write(q.join("notes.txt"), "mine").unwrap();
+    std::fs::write(q.join("samples-2026-06.ndjson.tmp"), "mine").unwrap();
+    std::fs::create_dir(q.join("samples-2026-05.ndjson")).unwrap();
+    std::fs::write(q.join("samples-2026-05.ndjson/inner"), "mine").unwrap();
+    std::fs::write(&outside, "mine").unwrap();
+    std::os::unix::fs::symlink(&outside, q.join("samples-2026-04.ndjson")).unwrap();
+
+    // An unchanged sample writes nothing, so nothing is pruned.
+    at(&full);
+    assert!(q.join("samples-2026-06.ndjson").exists());
+
+    at(&with_cost(&full, 0.5));
+    assert!(!q.join("samples-2026-06.ndjson").exists());
+    assert_eq!(
+        std::fs::read_to_string(q.join("samples-2026-07.ndjson")).unwrap(),
+        "july\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(q.join("notes.txt")).unwrap(),
+        "mine"
+    );
+    assert!(q.join("samples-2026-06.ndjson.tmp").exists());
+    assert!(q.join("samples-2026-05.ndjson/inner").exists());
+    let link = std::fs::symlink_metadata(q.join("samples-2026-04.ndjson")).unwrap();
+    assert!(link.file_type().is_symlink());
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "mine");
+    let month = std::fs::read_to_string(q.join("samples-2026-10.ndjson")).unwrap();
+    assert_eq!(month.lines().count(), 2);
+}
+
+#[test]
+fn retention_days_comes_from_config() {
+    // 2026-10-11 and 2026-10-06: September ended 10 and 5 days before.
+    for (now, kept) in [("1791676800000", false), ("1791244800000", true)] {
+        let env = Env::new();
+        std::fs::write(
+            env.home().join("config.toml"),
+            "[quota]\nretention_days = 7\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(env.quota()).unwrap();
+        let sept = env.quota().join("samples-2026-09.ndjson");
+        std::fs::write(&sept, "sept\n").unwrap();
+        let o = env.run(
+            &["--quiet"],
+            fixture("full.json").as_bytes(),
+            &[("AWM_TEST_NOW_MS", now)],
+        );
+        assert_silent_ok(&o);
+        assert_eq!(sept.exists(), kept, "now {now}");
+        assert!(env.month_file().exists());
+    }
+}
+
+/// A file that cannot be deleted (`chflags uchg`) does not stop the next one.
+#[cfg(target_os = "macos")]
+#[test]
+fn prune_goes_on_after_a_file_it_cannot_delete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    let stuck = d.join("samples-2026-01.ndjson");
+    std::fs::write(&stuck, "x\n").unwrap();
+    std::fs::write(d.join("samples-2026-02.ndjson"), "x\n").unwrap();
+    let flags = |f: &str| {
+        let ok = Command::new("chflags")
+            .arg(f)
+            .arg(&stuck)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "chflags {f}");
+    };
+    flags("uchg");
+    let n = store::prune(d, OCT_15.parse().unwrap(), 92);
+    flags("nouchg");
+    assert_eq!(n.unwrap(), 1);
+    assert!(stuck.exists());
+    assert!(!d.join("samples-2026-02.ndjson").exists());
+}

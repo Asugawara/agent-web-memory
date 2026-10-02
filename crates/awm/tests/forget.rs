@@ -1612,3 +1612,168 @@ fn purge_all_removes_symlinks_but_not_their_targets() {
         "mine"
     );
 }
+
+// ---------------------------------------------------------------------------
+// QP: usage samples in `quota/` (plan-quota §5.2)
+
+impl Env {
+    fn quota(&self) -> PathBuf {
+        self.data().join("quota")
+    }
+
+    /// A config with a `[quota]` table, a spool file and two sample files.
+    fn with_quota_samples(&self) {
+        std::fs::write(
+            self.data().join("config.toml"),
+            "mode = \"shadow\"\n\n[quota]\nretention_days = 30\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(self.data().join("spool")).unwrap();
+        std::fs::write(self.data().join("spool/x.json"), "{}").unwrap();
+        std::fs::create_dir_all(self.quota()).unwrap();
+        for m in ["2026-09", "2026-10"] {
+            std::fs::write(self.quota().join(format!("samples-{m}.ndjson")), "{}\n").unwrap();
+        }
+    }
+}
+
+#[test]
+fn purge_all_deletes_a_data_dir_with_quota_samples() {
+    let env = Env::new();
+    env.with_quota_samples();
+    let (code, out, err) = env.awm(&["purge", "--all", "--yes"]);
+    assert_eq!(code, Some(0), "{out}{err}");
+    assert!(
+        out.contains(&format!("Deleted {} (", env.data().display())),
+        "{out}"
+    );
+    assert!(!env.data().exists(), "{out}");
+}
+
+#[test]
+fn uninstall_deletes_quota_samples() {
+    let env = Env::new();
+    env.with_quota_samples();
+    let (code, out, err) = env.awm(&["uninstall", "--yes"]);
+    assert_eq!(code, Some(0), "{out}{err}");
+    assert!(!env.data().exists(), "{out}");
+    let tail: Vec<&str> = out
+        .lines()
+        .skip_while(|l| !l.starts_with("Deleted "))
+        .skip(1)
+        .collect();
+    assert_eq!(tail.first(), Some(&"To finish:"), "{out}");
+    assert!(
+        tail.contains(&"  claude plugin uninstall agent-web-memory@agent-web-memory"),
+        "{out}"
+    );
+}
+
+#[test]
+fn purge_all_deletes_an_empty_quota_dir() {
+    let env = Env::new();
+    std::fs::create_dir(env.quota()).unwrap();
+    let (code, out, err) = env.awm(&["purge", "--all", "--yes"]);
+    assert_eq!(code, Some(0), "{out}{err}");
+    assert!(!env.data().exists(), "{out}");
+}
+
+#[test]
+fn purge_all_refuses_an_unknown_file_inside_quota() {
+    let env = Env::new();
+    env.with_quota_samples();
+    std::fs::write(env.quota().join("notes.txt"), "mine").unwrap();
+    for args in [
+        &["purge", "--all", "--yes"][..],
+        &["uninstall", "--yes"][..],
+    ] {
+        let (code, out, err) = env.awm(args);
+        assert_eq!(code, Some(2), "{args:?}: {out}{err}");
+        assert!(
+            out.contains("entries awm did not create: quota/notes.txt."),
+            "{out}"
+        );
+        assert!(!out.contains("To finish:"), "{out}");
+        assert!(env.db_path().exists());
+        assert!(env.data().join("spool/x.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(env.quota().join("notes.txt")).unwrap(),
+            "mine"
+        );
+        for m in ["2026-09", "2026-10"] {
+            assert!(env.quota().join(format!("samples-{m}.ndjson")).exists());
+        }
+    }
+}
+
+#[test]
+fn purge_all_refuses_misnamed_files_and_directories_inside_quota() {
+    type Make = fn(&Path, &Path);
+    let cases: [(&str, Make); 4] = [
+        ("samples-2026-13.ndjson", |q, _| {
+            std::fs::write(q.join("samples-2026-13.ndjson"), "{}\n").unwrap()
+        }),
+        ("samples-2026-10.ndjson.tmp-1", |q, _| {
+            std::fs::write(q.join("samples-2026-10.ndjson.tmp-1"), "{}\n").unwrap()
+        }),
+        ("samples-2026-08.ndjson", |q, _| {
+            std::fs::create_dir(q.join("samples-2026-08.ndjson")).unwrap();
+            std::fs::write(q.join("samples-2026-08.ndjson/inner"), "mine").unwrap();
+        }),
+        ("samples-2026-07.ndjson", |q, outside| {
+            std::fs::write(outside, "mine").unwrap();
+            std::os::unix::fs::symlink(outside, q.join("samples-2026-07.ndjson")).unwrap();
+        }),
+    ];
+    for (name, make) in cases {
+        let env = Env::new();
+        env.with_quota_samples();
+        let outside = env.root.join("samples-2026-07.ndjson");
+        make(&env.quota(), &outside);
+        let (code, out, err) = env.awm(&["purge", "--all", "--yes"]);
+        assert_eq!(code, Some(2), "{name}: {out}{err}");
+        assert!(
+            out.contains(&format!("entries awm did not create: quota/{name}.")),
+            "{name}: {out}"
+        );
+        assert!(env.db_path().exists(), "{name}");
+        assert!(env.data().join("spool/x.json").exists(), "{name}");
+        assert!(
+            std::fs::symlink_metadata(env.quota().join(name)).is_ok(),
+            "{name}"
+        );
+        for m in ["2026-09", "2026-10"] {
+            assert!(
+                env.quota().join(format!("samples-{m}.ndjson")).exists(),
+                "{name}"
+            );
+        }
+        if name == "samples-2026-08.ndjson" {
+            assert!(env.quota().join("samples-2026-08.ndjson/inner").exists());
+        }
+        if name == "samples-2026-07.ndjson" {
+            assert_eq!(std::fs::read_to_string(&outside).unwrap(), "mine");
+        }
+    }
+}
+
+#[test]
+fn purge_all_removes_a_quota_symlink_but_not_its_target() {
+    let env = Env::new();
+    let outside = env.root.join("quotadir");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("samples-2026-10.ndjson"), "{}\n").unwrap();
+    std::fs::write(outside.join("precious.txt"), "mine").unwrap();
+    std::os::unix::fs::symlink(&outside, env.quota()).unwrap();
+    let (code, out, err) = env.awm(&["purge", "--all", "--yes"]);
+    assert_eq!(code, Some(0), "{out}{err}");
+    assert!(!env.data().exists(), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(outside.join("samples-2026-10.ndjson")).unwrap(),
+        "{}\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.join("precious.txt")).unwrap(),
+        "mine"
+    );
+}

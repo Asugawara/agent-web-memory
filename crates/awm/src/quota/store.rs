@@ -85,6 +85,61 @@ pub fn record(dir: &Path, s: &Sample) -> io::Result<Recorded> {
     Ok(Recorded::Written)
 }
 
+/// Unix ms at 00:00 UTC of the first day after the month of the sample file `name`.
+/// `None` when `name` is not a sample file or the next month is out of range.
+fn month_end_ms(name: &str) -> Option<i64> {
+    if !is_sample_file(name) {
+        return None;
+    }
+    let year: i32 = name.get(8..12)?.parse().ok()?;
+    let month: u8 = name.get(13..15)?.parse().ok()?;
+    let (year, month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    let month = time::Month::try_from(month).ok()?;
+    let start = time::Date::from_calendar_date(year, month, 1).ok()?;
+    Some(start.midnight().assume_utc().unix_timestamp() * 1000)
+}
+
+/// Deletes the entries of `dir` that are regular files (checked with
+/// `symlink_metadata`, so links are never followed), pass [`is_sample_file`],
+/// and whose month ended more than `retention_days` days before `now_ms`
+/// (plan-quota §4.2 step 4, §5.2). The month of `now_ms` is never deleted.
+/// Returns how many files were deleted. An error on one file does not stop the
+/// others; only a `dir` that cannot be read is an error.
+pub fn prune(dir: &Path, now_ms: i64, retention_days: u32) -> io::Result<usize> {
+    let keep_ms = i64::from(retention_days) * 86_400_000;
+    let current = month_file(dir, now_ms);
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    // A fixed order, so one failing file is always tried before the next.
+    paths.sort();
+    let mut deleted = 0;
+    for path in paths {
+        let Some(end) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(month_end_ms)
+        else {
+            continue;
+        };
+        if path == current || now_ms.saturating_sub(end) <= keep_ms {
+            continue;
+        }
+        if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file()) {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
+}
+
 /// Samples at or after `since_ms` and the newest `t`, from the last 1 MiB of the two
 /// newest sample files (`awm doctor`).
 pub fn recent(dir: &Path, since_ms: i64) -> (usize, Option<i64>) {
@@ -173,6 +228,67 @@ mod tests {
         ] {
             assert!(!is_sample_file(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn month_end_is_the_first_instant_of_the_next_utc_month() {
+        // 2026-07-01T00:00Z, 2027-01-01T00:00Z, 2024-03-01T00:00Z (leap year).
+        assert_eq!(
+            month_end_ms("samples-2026-06.ndjson"),
+            Some(1_782_864_000_000)
+        );
+        assert_eq!(
+            month_end_ms("samples-2026-12.ndjson"),
+            Some(1_798_761_600_000)
+        );
+        assert_eq!(
+            month_end_ms("samples-2024-02.ndjson"),
+            Some(1_709_251_200_000)
+        );
+        assert_eq!(month_end_ms("samples-9999-12.ndjson"), None);
+        assert_eq!(month_end_ms("samples-2026-13.ndjson"), None);
+        assert_eq!(month_end_ms("notes.ndjson"), None);
+    }
+
+    #[test]
+    fn prune_never_deletes_the_current_or_a_later_month() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        for m in ["2026-09", "2026-10", "2026-11", "9999-12"] {
+            std::fs::write(d.join(format!("samples-{m}.ndjson")), "x\n").unwrap();
+        }
+        // Names that only look like old month files.
+        for name in [
+            "samples-2026-08.ndjson.tmp",
+            "samples-2026-08.json",
+            "samples-2026-8.ndjson",
+        ] {
+            std::fs::write(d.join(name), "x\n").unwrap();
+        }
+        // 2026-10-01T00:00:00.001Z, retention 0: September ended 1 ms before.
+        let now = 1_790_812_800_001;
+        assert_eq!(prune(d, now, 0).unwrap(), 1);
+        let mut left: Vec<String> = std::fs::read_dir(d)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "samples-2026-08.json",
+                "samples-2026-08.ndjson.tmp",
+                "samples-2026-10.ndjson",
+                "samples-2026-11.ndjson",
+                "samples-2026-8.ndjson",
+                "samples-9999-12.ndjson"
+            ]
+        );
+        // Exactly `retention_days` after the end is kept; one ms more is not.
+        std::fs::write(d.join("samples-2026-09.ndjson"), "x\n").unwrap();
+        assert_eq!(prune(d, 1_790_812_800_000 + 86_400_000, 1).unwrap(), 0);
+        assert_eq!(prune(d, 1_790_812_800_001 + 86_400_000, 1).unwrap(), 1);
     }
 
     #[test]
