@@ -30,7 +30,8 @@ reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no
 [features]
 default = []
 sqlite = ["dep:rusqlite"]
-pg = ["dep:tokio-postgres", "dep:deadpool-postgres"]
+# `pg` implies `sqlite`: the canonical export and import on PgStore write and read the SQLite file (TM26 request 1).
+pg = ["dep:tokio-postgres", "dep:deadpool-postgres", "sqlite"]
 acme = ["dep:instant-acme", "dep:rcgen", "dep:rustls", "dep:tokio-rustls", "dep:ring"]
 backup-gcs = ["object-store-ring", "object_store/gcp-base"]
 backup-s3 = ["object-store-ring", "object_store/aws-base"]
