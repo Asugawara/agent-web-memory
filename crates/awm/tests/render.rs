@@ -4,6 +4,7 @@ use awm::note::{Channel, Note, Relation, RenderCtx, Status, Tool};
 use awm::render::{self, age_string, MAX_CHARS};
 use time::macros::datetime;
 
+const DENY_MAX: usize = 9500;
 const MIN: i64 = 60_000;
 const HOUR: i64 = 60 * MIN;
 const DAY: i64 = 24 * HOUR;
@@ -98,7 +99,8 @@ fn worst_case_stays_within_caps() {
         notes.push(n);
     }
     let r = render::render(&notes, &ctx(Channel::Url, 3)).expect("rendered");
-    assert_eq!(r.event_ids.len(), 3);
+    // Note 1 takes about 8,700 characters; note 2 is cut to the rest (>= 200) or dropped.
+    assert!(r.event_ids.len() <= 2 && r.event_ids[0] == 1);
     assert!(r.chars <= MAX_CHARS, "{}", r.chars);
     let lines: Vec<&str> = r.text.lines().collect();
     let envelope: usize = lines[0].chars().count()
@@ -182,12 +184,12 @@ fn deny_reason_is_short_and_framed() {
     assert!(text.starts_with("agent-web-memory: this URL was already fetched 9 days ago in this session by subagent (general-purpose)."));
     assert!(text.contains("asked: Summarize the content of this page in one sentence"));
     assert!(text.contains("found: This page explains"));
-    assert!(text.chars().count() <= 800);
+    assert!(text.chars().count() <= DENY_MAX);
     let mut long = notes[0].clone();
     long.asked = Some("query words ".repeat(200));
     long.summary = Some("The default weight is 1.0. ".repeat(2000));
     let text = render::deny_reason(&long, &ctx(Channel::Url, 3), &"who ".repeat(125));
-    assert!(text.chars().count() <= 800, "{}", text.chars().count());
+    assert!(text.chars().count() <= DENY_MAX, "{}", text.chars().count());
 }
 
 #[test]
@@ -230,7 +232,7 @@ fn deny_reason_search_is_framed_and_names_the_other_agent() {
 }
 
 #[test]
-fn deny_reason_search_stays_within_800_characters_and_has_no_angle_brackets() {
+fn deny_reason_search_stays_within_the_cap_and_has_no_angle_brackets() {
     let mut n = search_note();
     n.searched = Some("query <b>words</b> ".repeat(5000));
     n.summary = Some("The default weight is 1.0 <script>. ".repeat(5000));
@@ -239,7 +241,7 @@ fn deny_reason_search_stays_within_800_characters_and_has_no_angle_brackets() {
         "a".repeat(50_000)
     );
     let text = render::deny_reason_search(&n, &ctx(Channel::Query, 3), &where_);
-    assert!(text.chars().count() <= 800, "{}", text.chars().count());
+    assert!(text.chars().count() <= DENY_MAX, "{}", text.chars().count());
     assert!(!text.contains(['<', '>']), "{text}");
     assert!(text.ends_with("it will not be blocked again."));
 }
@@ -278,4 +280,105 @@ fn deny_reason_search_never_prints_found_for_a_non_ok_note() {
             assert!(!text.contains("found:"), "{text}");
         }
     }
+}
+
+/// Distinct sentences of the form `Sentence 0007 says the cache is stored on disk. `, at least `chars` long.
+fn numbered_text(prefix: &str, chars: usize) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while out.chars().count() < chars {
+        out.push_str(&format!(
+            "{prefix} {i:04} says the cache is stored on disk. "
+        ));
+        i += 1;
+    }
+    out.trim_end().to_string()
+}
+
+fn found_of(text: &str, index: usize) -> String {
+    let marker = format!("[{index}] ");
+    let start = text.find(&format!("\n{marker}")).expect("note present");
+    let rest = &text[start..];
+    let f = rest.find("    found: ").expect("found line") + "    found: ".len();
+    rest[f..].lines().next().unwrap().to_string()
+}
+
+#[test]
+fn a_6000_character_summary_renders_in_full() {
+    let summary = numbered_text("Sentence", 6000);
+    let sanitised = awm::sanitize::excerpt(&summary, 8000).text;
+    assert!(sanitised.chars().count() > 5000);
+    let mut n = base(1, Tool::WebFetch, HOUR);
+    n.url = Some("https://example.com/p".to_string());
+    n.summary = Some(summary);
+    let r = render::render(&[n], &ctx(Channel::Url, 3)).expect("rendered");
+    assert_eq!(found_of(&r.text, 1), sanitised);
+    assert!(!found_of(&r.text, 1).ends_with("..."));
+}
+
+fn long_notes(count: usize, chars: usize) -> Vec<Note> {
+    (0..count)
+        .map(|i| {
+            let mut n = base(i as i64 + 1, Tool::WebFetch, HOUR);
+            n.url = Some(format!("https://example.com/p{i}"));
+            n.summary = Some(numbered_text(&format!("Note{i}"), chars));
+            n
+        })
+        .collect()
+}
+
+#[test]
+fn a_second_long_note_is_cut_to_the_remaining_budget() {
+    let notes = long_notes(2, 6000);
+    let r = render::render(&notes, &ctx(Channel::Url, 3)).expect("rendered");
+    assert_eq!(r.event_ids, vec![1, 2]);
+    assert!(
+        r.chars <= MAX_CHARS && r.chars > MAX_CHARS - 20,
+        "{}",
+        r.chars
+    );
+    assert!(!found_of(&r.text, 1).ends_with("..."));
+    let second = found_of(&r.text, 2);
+    assert!(second.ends_with("..."));
+    assert!(second.chars().count() >= 200 && second.chars().count() < 6000);
+}
+
+#[test]
+fn a_note_with_under_200_characters_of_room_is_dropped_with_the_later_ones() {
+    // Note 2 is sized so that, after it, fewer than 200 characters of found text fit for note 3.
+    let mut notes = long_notes(3, 4_000);
+    let mut found_case = false;
+    for len in (3_000..=8_000).step_by(25) {
+        notes[1].summary = Some(numbered_text("Note1", len));
+        let r = render::render(&notes, &ctx(Channel::Url, 3)).expect("rendered");
+        assert!(r.chars <= MAX_CHARS);
+        if r.event_ids == vec![1, 2] && !found_of(&r.text, 2).ends_with("...") {
+            assert!(!r.text.contains("\n[3] "), "{}", r.text);
+            found_case = true;
+            break;
+        }
+    }
+    assert!(
+        found_case,
+        "no summary length left note 3 under 200 characters of room"
+    );
+}
+
+#[test]
+fn a_deny_reason_with_an_8000_character_summary_holds_it_in_full() {
+    let summary = numbered_text("Sentence", 8000);
+    let sanitised = awm::sanitize::excerpt(&summary, 8000).text;
+    let mut n = base(1, Tool::WebFetch, HOUR);
+    n.url = Some("https://example.com/p".to_string());
+    n.asked = Some("query words ".repeat(200));
+    n.summary = Some(summary.clone());
+    let text = render::deny_reason(&n, &ctx(Channel::Url, 3), &"who ".repeat(125));
+    assert!(text.chars().count() <= DENY_MAX, "{}", text.chars().count());
+    assert!(text.contains(&format!("found: {sanitised}\n")));
+    let mut s = search_note();
+    s.searched = Some("query words ".repeat(200));
+    s.summary = Some(summary);
+    let text = render::deny_reason_search(&s, &ctx(Channel::Query, 3), &"a".repeat(200));
+    assert!(text.chars().count() <= DENY_MAX, "{}", text.chars().count());
+    assert!(text.contains(&format!("found: {sanitised}\n")));
 }

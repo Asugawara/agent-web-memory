@@ -103,7 +103,7 @@ Two settings can block a repeated call once and hand over the earlier answer ins
 | `short_circuit.query_window_minutes` | 1440 | 1-10080 | how far back a query deny looks (24 hours) |
 | `short_circuit.subagents` | false | true, false | allow either deny inside subagents (needs the installed plugin check, `scripts/verify-hooks.sh`) |
 
-A **query deny** needs an earlier WebSearch by another agent (a sibling subagent, another session or project, or the other coding agent; never the agent's own earlier search) inside the window, with status ok and a non-empty finding, and the same token set (case, order and punctuation ignored, at least 3 words). Searches with `allowed_domains` / `blocked_domains` and Codex calls other than a plain search are never denied. The agent gets a reason with the earlier query, top result and a short finding, and the same search run again (same words, any order, any length) always passes; at most one deny per search and 3 per agent. The global `mode = "shadow"` also downgrades `on` to shadow.
+A **query deny** needs an earlier WebSearch by another agent (a sibling subagent, another session or project, or the other coding agent; never the agent's own earlier search) inside the window, with status ok and a non-empty finding, and the same token set (case, order and punctuation ignored, at least 3 words). Searches with `allowed_domains` / `blocked_domains` and Codex calls other than a plain search are never denied. The agent gets a reason with the earlier query, top result and the earlier finding, and the same search run again (same words, any order, any length) always passes; at most one deny per search and 3 per agent. The global `mode = "shadow"` also downgrades `on` to shadow.
 
 Turn it on with `awm config set short_circuit.query on`, and back with `awm config set short_circuit.query shadow`. The suggested bar for `on` is at least 20 shadow denies labelled in `awm review`, at least 80% of them label 2 and none h, and at least 1 shadow deny per 100 searches.
 
@@ -114,7 +114,7 @@ Turn it on with `awm config set short_circuit.query on`, and back with `awm conf
 Codex support is experimental (started 2026-10-02; spike in `docs/reports/codex-hooks.md`, tested with Codex CLI 0.159.3).
 
 **What works**
-- Notes about earlier research are shown with your prompt (`UserPromptSubmit`).
+- Notes about earlier research are shown with your prompt (`UserPromptSubmit`). A note holds the earlier result in full (sanitised, up to 8,000 characters); a block of notes is at most 9,500 characters, about 2,400 tokens.
 - Notes are shown after a web search through Codex's `webrun` tool, and searches are captured with their full results on current models.
 
 **What is missing**
