@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "tool": "WebFetch",
+  "url": "https://docs.google.com/document/d/abc/edit",
+  "status": "refusal",
+  "results": [],
+  "agent": "claude",
+  "source": "hook",
+  "created_at": 1790906400,
+  "share": "link"
+}

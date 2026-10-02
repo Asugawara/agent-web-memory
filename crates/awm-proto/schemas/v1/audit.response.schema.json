@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awm.invalid/schemas/v1/audit.response.schema.json",
+  "title": "GET /v1/audit response",
+  "type": "object",
+  "properties": {
+    "head": {
+      "$ref": "common.schema.json#/$defs/head"
+    },
+    "rows": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "idx": {
+            "$ref": "common.schema.json#/$defs/idx"
+          },
+          "at": {
+            "$ref": "common.schema.json#/$defs/time"
+          },
+          "actor": {
+            "$ref": "common.schema.json#/$defs/id"
+          },
+          "action": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_.]{0,63}$"
+          },
+          "target": {
+            "type": "string",
+            "maxLength": 256
+          },
+          "detail": {
+            "type": "string",
+            "maxLength": 1024
+          }
+        },
+        "required": [
+          "action",
+          "at",
+          "idx"
+        ]
+      },
+      "maxItems": 1000
+    }
+  },
+  "required": [
+    "head",
+    "rows"
+  ]
+}

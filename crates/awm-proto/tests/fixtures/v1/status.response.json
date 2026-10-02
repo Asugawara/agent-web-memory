@@ -1,0 +1,68 @@
+{
+  "generation": "5e8a1f3c-2b4d-4e6f-a7b9-c0d1e2f3a4b5",
+  "org_id": "6f1c2a4e-8b3d-4e5f-9a7b-1c2d3e4f5a6b",
+  "member_id": "2b7e4c1a-5d3f-4a6b-8c9d-0e1f2a3b4c5d",
+  "device_id": "9d8c7b6a-5f4e-4d3c-8b2a-1f0e9d8c7b6a",
+  "role": "admin",
+  "approved": true,
+  "current_epoch": 1,
+  "rotation_needed": false,
+  "restore_pending": false,
+  "settings": {
+    "retention_days": 365,
+    "min_client": "0.2.0",
+    "max_members": 100,
+    "pending_retention": {
+      "retention_days": 180,
+      "effective_at": 1791511200
+    }
+  },
+  "streams": [
+    {
+      "member": "2b7e4c1a-5d3f-4a6b-8c9d-0e1f2a3b4c5d",
+      "device": "9d8c7b6a-5f4e-4d3c-8b2a-1f0e9d8c7b6a",
+      "tag": "rec",
+      "head": 43
+    },
+    {
+      "member": "2b7e4c1a-5d3f-4a6b-8c9d-0e1f2a3b4c5d",
+      "device": "9d8c7b6a-5f4e-4d3c-8b2a-1f0e9d8c7b6a",
+      "tag": "roster",
+      "head": 2
+    },
+    {
+      "member": "2b7e4c1a-5d3f-4a6b-8c9d-0e1f2a3b4c5d",
+      "device": "9d8c7b6a-5f4e-4d3c-8b2a-1f0e9d8c7b6a",
+      "tag": "policy",
+      "head": 0
+    },
+    {
+      "member": "4a5b6c7d-8e9f-4a0b-9c1d-2e3f4a5b6c7d",
+      "device": "c1d2e3f4-a5b6-4c7d-8e9f-0a1b2c3d4e5f",
+      "tag": "rec",
+      "head": 7
+    },
+    {
+      "member": "4a5b6c7d-8e9f-4a0b-9c1d-2e3f4a5b6c7d",
+      "device": "c1d2e3f4-a5b6-4c7d-8e9f-0a1b2c3d4e5f",
+      "tag": "flag",
+      "head": 0
+    }
+  ],
+  "deletions": {
+    "head": 3,
+    "oldest": 0
+  },
+  "pending": [
+    {
+      "device_id": "e5f6a7b8-c9d0-4e1f-a2b3-c4d5e6f7a8b9",
+      "member_id": "8f9e0d1c-2b3a-4948-a756-453423120f0e",
+      "handle": "kit",
+      "kind": "member",
+      "invite_id": "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f",
+      "device_pubkey": "W2h1go-cqbbD0N3q9wQRHis4RVJfbHmGk6CtusfU4e4",
+      "join_mac": "Ym98iZajsL3K1-Tx_gsYJTI_TFlmc4CNmqe0wc7b6PU",
+      "joined_at": 1790906400
+    }
+  ]
+}

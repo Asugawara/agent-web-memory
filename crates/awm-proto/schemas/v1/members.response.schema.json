@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awm.invalid/schemas/v1/members.response.schema.json",
+  "title": "GET /v1/members response",
+  "type": "object",
+  "properties": {
+    "members": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "member_id": {
+            "$ref": "common.schema.json#/$defs/id"
+          },
+          "handle": {
+            "$ref": "common.schema.json#/$defs/handle"
+          },
+          "role": {
+            "$ref": "common.schema.json#/$defs/role"
+          },
+          "active": {
+            "type": "boolean"
+          },
+          "devices": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "device_id": {
+                  "$ref": "common.schema.json#/$defs/id"
+                },
+                "device_pubkey": {
+                  "$ref": "common.schema.json#/$defs/key32"
+                },
+                "approved": {
+                  "type": "boolean"
+                },
+                "revoked": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "approved",
+                "device_id",
+                "device_pubkey",
+                "revoked"
+              ]
+            }
+          }
+        },
+        "required": [
+          "active",
+          "devices",
+          "handle",
+          "member_id",
+          "role"
+        ]
+      }
+    }
+  },
+  "required": [
+    "members"
+  ]
+}

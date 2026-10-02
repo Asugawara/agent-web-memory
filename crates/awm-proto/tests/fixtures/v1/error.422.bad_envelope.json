@@ -1,0 +1,5 @@
+{
+  "error": "bad_envelope",
+  "message": "envelope version byte is not 1",
+  "item": 2
+}

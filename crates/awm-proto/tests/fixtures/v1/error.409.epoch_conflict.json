@@ -1,0 +1,5 @@
+{
+  "error": "epoch_conflict",
+  "message": "epoch must be current + 1",
+  "current_epoch": 2
+}

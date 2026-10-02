@@ -1,0 +1,5 @@
+{
+  "error": "invalid_value",
+  "message": "handle differs from the invite's",
+  "field": "/handle"
+}

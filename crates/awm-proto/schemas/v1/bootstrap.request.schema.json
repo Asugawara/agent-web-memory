@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awm.invalid/schemas/v1/bootstrap.request.schema.json",
+  "title": "POST /v1/bootstrap request",
+  "type": "object",
+  "properties": {
+    "bootstrap_token": {
+      "$ref": "common.schema.json#/$defs/bootstrap_token"
+    },
+    "org_id": {
+      "$ref": "common.schema.json#/$defs/id"
+    },
+    "handle": {
+      "$ref": "common.schema.json#/$defs/handle"
+    },
+    "device_id": {
+      "$ref": "common.schema.json#/$defs/id"
+    },
+    "device_pubkey": {
+      "$ref": "common.schema.json#/$defs/key32"
+    }
+  },
+  "required": [
+    "bootstrap_token",
+    "device_id",
+    "device_pubkey",
+    "handle",
+    "org_id"
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awm.invalid/schemas/v1/info.response.schema.json",
+  "title": "GET /v1/info response",
+  "type": "object",
+  "properties": {
+    "protocols": {
+      "type": "array",
+      "items": {
+        "$ref": "common.schema.json#/$defs/u32"
+      },
+      "minItems": 1
+    },
+    "server": {
+      "$ref": "common.schema.json#/$defs/version"
+    },
+    "cloud": {
+      "type": "boolean"
+    },
+    "generation": {
+      "$ref": "common.schema.json#/$defs/id"
+    },
+    "min_client": {
+      "$ref": "common.schema.json#/$defs/version"
+    },
+    "limits": {
+      "type": "object",
+      "properties": {
+        "blob_bytes": {
+          "$ref": "common.schema.json#/$defs/count"
+        },
+        "batch_records": {
+          "$ref": "common.schema.json#/$defs/count"
+        },
+        "batch_bytes": {
+          "$ref": "common.schema.json#/$defs/count"
+        },
+        "body_bytes": {
+          "$ref": "common.schema.json#/$defs/count"
+        },
+        "pull_records": {
+          "$ref": "common.schema.json#/$defs/count"
+        },
+        "pull_cursors": {
+          "$ref": "common.schema.json#/$defs/count"
+        },
+        "pull_response_bytes": {
+          "$ref": "common.schema.json#/$defs/count"
+        },
+        "deletions_page": {
+          "$ref": "common.schema.json#/$defs/count"
+        },
+        "delete_ids": {
+          "$ref": "common.schema.json#/$defs/count"
+        },
+        "records_per_day": {
+          "$ref": "common.schema.json#/$defs/count"
+        },
+        "requests_per_minute": {
+          "$ref": "common.schema.json#/$defs/count"
+        },
+        "request_burst": {
+          "$ref": "common.schema.json#/$defs/count"
+        }
+      },
+      "required": [
+        "batch_bytes",
+        "batch_records",
+        "blob_bytes",
+        "body_bytes",
+        "delete_ids",
+        "deletions_page",
+        "pull_cursors",
+        "pull_records",
+        "pull_response_bytes",
+        "records_per_day",
+        "request_burst",
+        "requests_per_minute"
+      ]
+    },
+    "features": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_.-]{0,63}$"
+      }
+    }
+  },
+  "required": [
+    "cloud",
+    "features",
+    "generation",
+    "limits",
+    "min_client",
+    "protocols",
+    "server"
+  ]
+}

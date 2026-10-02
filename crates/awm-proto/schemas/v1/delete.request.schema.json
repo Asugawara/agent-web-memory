@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awm.invalid/schemas/v1/delete.request.schema.json",
+  "title": "POST /v1/delete request",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "ids": {
+          "type": "array",
+          "items": {
+            "$ref": "common.schema.json#/$defs/id"
+          },
+          "minItems": 1,
+          "maxItems": 1000
+        }
+      },
+      "required": [
+        "ids"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "all_mine": {
+          "const": true
+        }
+      },
+      "required": [
+        "all_mine"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "member": {
+          "$ref": "common.schema.json#/$defs/id"
+        }
+      },
+      "required": [
+        "member"
+      ],
+      "additionalProperties": false,
+      "description": "admins only"
+    }
+  ]
+}

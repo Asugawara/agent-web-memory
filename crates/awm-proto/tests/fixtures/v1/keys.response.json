@@ -1,0 +1,18 @@
+{
+  "current_epoch": 1,
+  "rotation_needed": false,
+  "wraps": [
+    {
+      "epoch": 0,
+      "wrap": "DyAxQlNkdYaXqLnK2-z9Dh8wQVJjdIWWp7jJ2uv8DR4vQFFic4SVprfI2er7DB0uP1BhcoOUpbbH2On6CxwtPk9gcYKTpLXG1-j5ChssPU5fcIGSo7TF1uf4CRorPE1eb4CRorPE1eY",
+      "auth": "oa67yNXi7_wJFiMwPUpXZHF-i5ilsr_M2ebzAA0aJzQ",
+      "created_by": "9d8c7b6a-5f4e-4d3c-8b2a-1f0e9d8c7b6a"
+    },
+    {
+      "epoch": 1,
+      "wrap": "FCU2R1hpeoucrb7P4PECEyQ1RldoeYqbrL3O3_ABEiM0RVZneImaq7zN3u8AESIzRFVmd4iZqrvM3e7_ECEyQ1RldoeYqbrL3O3-DyAxQlNkdYaXqLnK2-z9Dh8wQVJjdIWWp7jJ2us",
+      "auth": "qLXCz9zp9gMQHSo3RFFea3iFkp-sucbT4O36BxQhLjs",
+      "created_by": "9d8c7b6a-5f4e-4d3c-8b2a-1f0e9d8c7b6a"
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+{
+  "retention_days": 180,
+  "min_client": "0.2.1"
+}

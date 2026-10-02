@@ -1,0 +1,14 @@
+{
+  "wraps": [
+    {
+      "epoch": 0,
+      "wrap": "BRYnOElaa3yNnq_A0eLzBBUmN0hZanuMna6_0OHyAxQlNkdYaXqLnK2-z-DxAhMkNUZXaHmKm6y9zt_wARIjNEVWZ3iJmqu8zd7vABEiM0RVZneImaq7zN3u_xAhMkNUZXaHmKm6y9w",
+      "auth": "k6CtusfU4e77CBUiLzxJVmNwfYqXpLG-y9jl8v8MGSY"
+    },
+    {
+      "epoch": 1,
+      "wrap": "ChssPU5fcIGSo7TF1uf4CRorPE1eb4CRorPE1eb3CBkqO0xdbn-QobLD1OX2BxgpOktcbX6PoLHC0-T1BhcoOUpbbH2On7DB0uP0BRYnOElaa3yNnq_A0eLzBBUmN0hZanuMna6_0OE",
+      "auth": "mqe0wc7b6PUCDxwpNkNQXWp3hJGeq7jF0t_s-QYTIC0"
+    }
+  ]
+}

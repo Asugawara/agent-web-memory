@@ -1,0 +1,9 @@
+{
+  "retention_days": 365,
+  "min_client": "0.2.0",
+  "max_members": 100,
+  "pending_retention": {
+    "retention_days": 180,
+    "effective_at": 1791511200
+  }
+}

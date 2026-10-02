@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awm.invalid/schemas/v1/plaintext.rec.schema.json",
+  "title": "Plaintext of a rec record, schema 1",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1,
+      "description": "a reader skips a higher schema (it decodes as Newer)"
+    },
+    "tool": {
+      "enum": [
+        "WebSearch",
+        "WebFetch"
+      ]
+    },
+    "query": {
+      "type": "string",
+      "maxLength": 500
+    },
+    "url": {
+      "type": "string",
+      "maxLength": 2048
+    },
+    "fetch_prompt": {
+      "type": "string",
+      "maxLength": 500
+    },
+    "http_code": {
+      "type": "integer"
+    },
+    "bytes": {
+      "type": "integer"
+    },
+    "duration_ms": {
+      "type": "integer"
+    },
+    "status": {
+      "enum": [
+        "ok",
+        "dead_end",
+        "refusal"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "maxLength": 2000
+    },
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "rank": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4294967295
+          },
+          "url": {
+            "type": "string",
+            "maxLength": 512
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 120
+          }
+        },
+        "required": [
+          "rank",
+          "url"
+        ]
+      },
+      "maxItems": 10
+    },
+    "agent": {
+      "enum": [
+        "claude",
+        "codex"
+      ]
+    },
+    "source": {
+      "enum": [
+        "hook",
+        "import"
+      ]
+    },
+    "created_at": {
+      "$ref": "common.schema.json#/$defs/hour"
+    },
+    "repo_key": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "share": {
+      "enum": [
+        "full",
+        "link"
+      ]
+    }
+  },
+  "required": [
+    "agent",
+    "created_at",
+    "results",
+    "schema",
+    "share",
+    "source",
+    "status",
+    "tool"
+  ]
+}

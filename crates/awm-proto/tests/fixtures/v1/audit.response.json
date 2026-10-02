@@ -1,0 +1,18 @@
+{
+  "head": 1,
+  "rows": [
+    {
+      "idx": 0,
+      "at": 1790906400,
+      "actor": "2b7e4c1a-5d3f-4a6b-8c9d-0e1f2a3b4c5d",
+      "action": "bootstrap",
+      "target": "alf"
+    },
+    {
+      "idx": 1,
+      "at": 1790910000,
+      "action": "retention",
+      "detail": "deleted 12"
+    }
+  ]
+}

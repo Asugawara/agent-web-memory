@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://awm.invalid/schemas/v1/members.remove.request.schema.json",
+  "title": "POST /v1/members/{id}/remove request",
+  "type": "object",
+  "properties": {
+    "delete_records": {
+      "type": "boolean"
+    }
+  },
+  "required": [],
+  "additionalProperties": false
+}

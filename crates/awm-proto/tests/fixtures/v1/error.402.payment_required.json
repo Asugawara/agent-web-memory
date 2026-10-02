@@ -1,0 +1,6 @@
+{
+  "error": "payment_required",
+  "message": "read-only: the trial ended",
+  "state": "paused",
+  "billing_url": "https://awm.example/billing"
+}
