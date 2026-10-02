@@ -213,6 +213,12 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     imp::run(args)
 }
 
+/// The JSON of `awm team status` for `dir`, without printing it (`awm doctor` reads it).
+#[cfg(feature = "sync")]
+pub fn status_report(dir: &std::path::Path) -> anyhow::Result<serde_json::Value> {
+    imp::status_value(dir)
+}
+
 #[cfg(feature = "sync")]
 mod imp {
     use std::collections::{BTreeMap, BTreeSet};
@@ -1417,15 +1423,10 @@ mod imp {
     // -----------------------------------------------------------------------------------------
     // status
 
-    fn status(ctx: &Ctx, json_out: bool) -> Result<()> {
-        let dir = ctx.dir();
+    /// The JSON of `awm team status` (also read by `awm doctor`): `in_team: false` outside a team.
+    pub fn status_value(dir: &Path) -> Result<Value> {
         if !state::configured(dir) {
-            if json_out {
-                println!("{}", json!({ "in_team": false }));
-            } else {
-                println!("not in a team");
-            }
-            return Ok(());
+            return Ok(json!({ "in_team": false }));
         }
         let join = team::finish_join(dir);
         let ident = Identity::load(dir)?;
@@ -1513,8 +1514,62 @@ mod imp {
             verify_trusted(&conn, &ident.ring()?)?.extra_admins_ignored
         };
         let settings = server.as_ref().ok().map(|s| s.settings.clone());
+        // Streams of other devices whose server head is ahead of what this device applied: they
+        // catch up at the next sync, and one that stays behind has a gap (`awm doctor`).
+        let streams_behind = server.as_ref().ok().map(|sr| {
+            let mut head = conn
+                .prepare("SELECT member_id, device_id, tag, head_idx FROM sync_stream")
+                .and_then(|mut q| {
+                    q.query_map([], |r| {
+                        Ok((
+                            (
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, String>(2)?,
+                            ),
+                            r.get::<_, i64>(3)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<BTreeMap<_, _>>>()
+                })
+                .unwrap_or_default();
+            sr.streams
+                .iter()
+                .filter(|h| h.device != ident.team.device_id)
+                .filter(|h| {
+                    let key = (
+                        h.member.to_string(),
+                        h.device.to_string(),
+                        h.tag.as_str().to_string(),
+                    );
+                    h.head > head.remove(&key).unwrap_or(-1)
+                })
+                .count()
+        });
+        let info: Option<Value> = state::get(&conn, state::INFO_JSON)?
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .map(|i: Value| json!({"protocols": i["protocols"], "min_client": i["min_client"]}));
+        let mut dropped = BTreeMap::new();
+        {
+            let mut q =
+                conn.prepare("SELECT key, value FROM sync_state WHERE key LIKE 'dropped.%'")?;
+            for r in q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+                let (k, n) = r?;
+                dropped.insert(
+                    k.trim_start_matches("dropped.").to_string(),
+                    n.parse::<u64>().unwrap_or(0),
+                );
+            }
+        }
         let v = json!({
             "in_team": true,
+            "server_epoch": server.as_ref().ok().map(|s| s.current_epoch),
+            "streams_behind": streams_behind,
+            "info": info,
+            "min_client_block": st.min_client_block,
+            "newer_schema": st.newer_schema,
+            "server_restored_before_join": state::get(&conn, "server_restored_before_join")?.is_some(),
+            "dropped": dropped,
             "server_url": ident.team.server_url,
             "reachable": reachable,
             "server_error": server_error,
@@ -1537,37 +1592,76 @@ mod imp {
             "extra_admins_ignored": extra_ignored,
             "settings": settings,
         });
+        Ok(v)
+    }
+
+    fn status(ctx: &Ctx, json_out: bool) -> Result<()> {
+        let v = status_value(ctx.dir())?;
+        if v["in_team"] == json!(false) {
+            if json_out {
+                println!("{}", json!({ "in_team": false }));
+            } else {
+                println!("not in a team");
+            }
+            return Ok(());
+        }
         if json_out {
             println!("{}", serde_json::to_string_pretty(&v)?);
             return Ok(());
         }
+        let text = |k: &str| v[k].as_str().map(str::to_string);
+        let server_error = text("server_error");
+        let approval = text("approval").unwrap_or_default();
+        let role = text("role").unwrap_or_default();
+        let push_stop = text("push_blocked");
+        let last_error = text("last_error");
+        let server_url = text("server_url").unwrap_or_default();
+        let org_id = text("org_id").unwrap_or_default();
+        let member_id = text("member_id").unwrap_or_default();
+        let handle = text("handle").unwrap_or_default();
+        let device_id = text("device_id").unwrap_or_default();
+        let fingerprint = text("fingerprint").unwrap_or_default();
+        let outbox: BTreeMap<String, i64> = v["outbox"]
+            .as_object()
+            .map(|o| {
+                o.iter()
+                    .map(|(k, n)| (k.clone(), n.as_i64().unwrap_or(0)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let skipped: BTreeMap<String, u64> = v["skipped"]
+            .as_object()
+            .map(|o| {
+                o.iter()
+                    .map(|(k, n)| (k.clone(), n.as_u64().unwrap_or(0)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let pending = v["pending"].as_array().cloned().unwrap_or_default();
+        let trusted_any = v["trusted_admins"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty());
+        let extra_ignored = v["extra_admins_ignored"] == json!(true);
         println!(
             "server        {} ({})",
-            ident.team.server_url,
+            server_url,
             match &server_error {
                 None => "reachable".to_string(),
                 Some(e) => format!("unreachable: {e}"),
             }
         );
-        println!("organisation  {}", ident.team.org_id);
-        println!(
-            "member        @{} ({}), {role}",
-            ident.team.handle, ident.team.member_id
-        );
-        println!(
-            "device        {} (fingerprint {})",
-            ident.team.device_id,
-            ident.device_keys().fingerprint()
-        );
+        println!("organisation  {org_id}");
+        println!("member        @{handle} ({member_id}), {role}");
+        println!("device        {device_id} (fingerprint {fingerprint})");
         println!("approval      {approval}");
         if let Some(p) = &push_stop {
             println!("pushes        stopped: {p}");
         }
         println!(
             "last sync     {}",
-            st.last_ok.map(fmt_ts).unwrap_or_else(|| "never".into())
+            text("last_ok").unwrap_or_else(|| "never".into())
         );
-        if let Some(e) = &st.last_error {
+        if let Some(e) = &last_error {
             println!("last error    {e}");
         }
         let total: i64 = outbox.values().sum();
@@ -1611,20 +1705,21 @@ mod imp {
                 }
             );
         }
-        if !trusted.is_empty() {
+        if trusted_any {
             if extra_ignored {
                 println!("admins        the roster's (trusted server admins are ignored while a verified admin exists)");
             } else {
                 println!("admins        decided by the server operator: no verified admin is left");
             }
         }
-        if let Some(s) = &settings {
-            print!("retention     {} days", s.retention_days);
-            if let Some(p) = &s.pending_retention {
+        let settings = &v["settings"];
+        if let Some(days) = settings["retention_days"].as_u64() {
+            print!("retention     {days} days");
+            if let Some(p) = settings["pending_retention"].as_object() {
                 print!(
                     "; a decrease to {} days applies at {} UTC",
-                    p.retention_days,
-                    fmt_ts(p.effective_at * 1_000)
+                    p.get("retention_days").and_then(Value::as_u64).unwrap_or(0),
+                    fmt_ts(p.get("effective_at").and_then(Value::as_i64).unwrap_or(0) * 1_000)
                 );
             }
             println!();

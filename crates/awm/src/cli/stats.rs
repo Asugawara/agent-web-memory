@@ -28,9 +28,16 @@ pub struct Args {
     /// Estimated time and tokens saved by the notes shown (a counterfactual estimate)
     #[arg(long)]
     pub savings: bool,
-    /// With --savings: only injections created on or after this date (YYYY-MM-DD, UTC)
+    /// With --savings: only injections created on or after this date (YYYY-MM-DD, UTC); with
+    /// --team: the first day summed (default: the last 30 days)
     #[arg(long, value_name = "DATE")]
     pub since: Option<String>,
+    /// With --value: count only the notes from your records or from teammates' records
+    #[arg(long, value_enum)]
+    pub origin: Option<super::log::Origin>,
+    /// Daily totals of the members who share them (shown when at least 3 members reported)
+    #[arg(long)]
+    pub team: bool,
     /// Transcript directory for the quota block (default ~/.claude/projects)
     #[arg(long, value_name = "DIR")]
     pub projects: Option<PathBuf>,
@@ -50,6 +57,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             for (k, val) in map {
                 if k == "savings" {
                     out.push_str(&savings_text(val));
+                } else if k == "team" {
+                    out.push_str(&team_text(val));
                 } else if k == "by_agent" {
                     out.push_str(&by_agent_text(val));
                 } else {
@@ -66,8 +75,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
 /// The selected sections as one object; the default section when no flag is given.
 pub fn collect(conn: &Connection, args: &Args) -> anyhow::Result<Value> {
-    let any =
-        args.latency || args.import || args.status || args.value || args.followups || args.savings;
+    let any = args.latency
+        || args.import
+        || args.status
+        || args.value
+        || args.followups
+        || args.savings
+        || args.team;
     let mut out = Map::new();
     if !any {
         out.insert("by_agent".into(), by_agent(conn)?);
@@ -84,7 +98,7 @@ pub fn collect(conn: &Connection, args: &Args) -> anyhow::Result<Value> {
         out.insert("status".into(), status(conn)?);
     }
     if args.value {
-        out.insert("value".into(), value(conn)?);
+        out.insert("value".into(), value(conn, args.origin)?);
     }
     if args.followups {
         out.insert("followups".into(), followups(conn)?);
@@ -96,6 +110,10 @@ pub fn collect(conn: &Connection, args: &Args) -> anyhow::Result<Value> {
             "savings".into(),
             savings(conn, args.since.as_deref(), &projects)?,
         );
+    }
+    if args.team {
+        let since = args.since.as_deref().map(super::parse_date).transpose()?;
+        out.insert("team".into(), team_totals(conn, since, super::now_ms())?);
     }
     Ok(Value::Object(out))
 }
@@ -121,7 +139,10 @@ fn by_agent(conn: &Connection) -> anyhow::Result<Value> {
     let mut v = json!({"claude": 0, "codex": 0});
     if let (Value::Object(m), Value::Object(found)) = (
         &mut v,
-        grouped(conn, "SELECT agent, COUNT(*) FROM event GROUP BY agent")?,
+        grouped(
+            conn,
+            "SELECT agent, COUNT(*) FROM event WHERE origin = 'local' GROUP BY agent",
+        )?,
     ) {
         m.extend(found);
     }
@@ -301,7 +322,10 @@ fn query_deny(conn: &Connection) -> anyhow::Result<Value> {
     ) {
         m.extend(found);
     }
-    let searches = count(conn, "SELECT COUNT(*) FROM event WHERE tool = 'WebSearch'")?;
+    let searches = count(
+        conn,
+        "SELECT COUNT(*) FROM event WHERE tool = 'WebSearch' AND origin = 'local'",
+    )?;
     let per_100 = (searches > 0)
         .then(|| format!("{:.2}", (shadow + denied) as f64 * 100.0 / searches as f64));
 
@@ -412,32 +436,58 @@ fn import(conn: &Connection) -> anyhow::Result<Value> {
 fn status(conn: &Connection) -> anyhow::Result<Value> {
     grouped(
         conn,
-        "SELECT status, COUNT(*) FROM event GROUP BY status ORDER BY status",
+        "SELECT status, COUNT(*) FROM event WHERE origin = 'local' GROUP BY status ORDER BY status",
     )
+}
+
+/// `meta` key of a review label `L` ("label 2, and it avoided a multi-step research loop"): the
+/// outcome row itself holds label `2` (its CHECK allows no other), this key marks the loop.
+pub(crate) fn loop_key(injection_id: i64, position: i64) -> String {
+    format!("review.loop.{injection_id}.{position}")
 }
 
 /// §8.2 value rate. `label2_over_shown` is the plain share of label-2 items among shown items;
 /// `per_100_captured` is the plan's estimate: per channel, the label-2 share of labelled items
 /// times the items shown, summed, plus label-2 denies, over hook-captured events, times 100.
-fn value(conn: &Connection) -> anyhow::Result<Value> {
+///
+/// "My captures" (the denominator) are the `origin = 'local'` events. `origin` restricts the
+/// numerators to the notes whose item came from your records (`local`) or from teammates'
+/// records (`team`, `injection_item.origin`, kept when the record is deleted); without it every
+/// shown note counts. For `team` there is no per-100 figure (a teammate's capture is not yours);
+/// the line-7 inputs are `labelled`, `labelled_2`, the estimate `label2_estimate` (the label-2
+/// share of labelled notes times the notes shown) and `loop_labelled` (review key `L`).
+fn value(conn: &Connection, origin: Option<super::log::Origin>) -> anyhow::Result<Value> {
+    // `ii` is joined wherever an item's origin is read.
+    let only = origin.map_or(String::new(), |o| {
+        format!(" AND ii.origin = '{}'", o.as_str())
+    });
     let shown = count(
         conn,
-        "SELECT COUNT(*) FROM injection_item ii JOIN injection i ON i.id = ii.injection_id \
-         WHERE i.mode IN ('inject','deny')",
+        &format!(
+            "SELECT COUNT(*) FROM injection_item ii JOIN injection i ON i.id = ii.injection_id \
+             WHERE i.mode IN ('inject','deny'){only}"
+        ),
     )?;
+    let outcomes = "FROM outcome o JOIN injection i ON i.id = o.injection_id \
+        JOIN injection_item ii ON ii.injection_id = o.injection_id AND ii.position = o.position";
     let label2 = count(
         conn,
-        "SELECT COUNT(*) FROM outcome o JOIN injection i ON i.id = o.injection_id \
-         WHERE i.mode IN ('inject','deny') AND o.label = '2'",
+        &format!(
+            "SELECT COUNT(*) {outcomes} WHERE i.mode IN ('inject','deny') AND o.label = '2'{only}"
+        ),
     )?;
-    let mut st = conn.prepare(
+    let labelled = count(
+        conn,
+        &format!("SELECT COUNT(*) {outcomes} WHERE i.mode IN ('inject','deny'){only}"),
+    )?;
+    let mut st = conn.prepare(&format!(
         "SELECT i.channel, \
-                (SELECT COUNT(*) FROM injection_item x JOIN injection j ON j.id = x.injection_id \
-                   WHERE j.mode = 'inject' AND j.channel = i.channel), \
+                (SELECT COUNT(*) FROM injection_item ii JOIN injection j ON j.id = ii.injection_id \
+                   WHERE j.mode = 'inject' AND j.channel = i.channel{only}), \
                 COUNT(*), SUM(o.label = '2') \
-         FROM outcome o JOIN injection i ON i.id = o.injection_id \
-         WHERE i.mode = 'inject' GROUP BY i.channel ORDER BY i.channel",
-    )?;
+         {outcomes} \
+         WHERE i.mode = 'inject'{only} GROUP BY i.channel ORDER BY i.channel"
+    ))?;
     let rows = st.query_map([], |r| {
         Ok((
             r.get::<_, i64>(1)?,
@@ -454,18 +504,122 @@ fn value(conn: &Connection) -> anyhow::Result<Value> {
     }
     let deny2 = count(
         conn,
-        "SELECT COUNT(*) FROM outcome o JOIN injection i ON i.id = o.injection_id \
-         WHERE i.mode = 'deny' AND o.label = '2'",
+        &format!("SELECT COUNT(*) {outcomes} WHERE i.mode = 'deny' AND o.label = '2'{only}"),
     )?;
-    let captured = count(conn, "SELECT COUNT(*) FROM event WHERE source = 'hook'")?;
+    let captured = count(
+        conn,
+        "SELECT COUNT(*) FROM event WHERE source = 'hook' AND origin = 'local'",
+    )?;
     let per_100 = (captured > 0).then(|| (estimate + deny2 as f64) * 100.0 / captured as f64);
-    Ok(json!({
+    let mut v = json!({
+        "origin": origin.map_or("all", super::log::Origin::as_str),
         "shown_items": shown,
         "labelled_2": label2,
         "label2_over_shown": super::pct(label2, shown),
         "captured_events": captured,
         "per_100_captured": per_100.map(|v| format!("{v:.1}")),
-    }))
+    });
+    if origin == Some(super::log::Origin::Team) {
+        let loops = count(
+            conn,
+            &format!(
+                "SELECT COUNT(*) {outcomes} JOIN meta mk \
+                   ON mk.key = 'review.loop.' || o.injection_id || '.' || o.position \
+                 WHERE i.mode IN ('inject','deny') AND o.label = '2'{only}"
+            ),
+        )?;
+        v["per_100_captured"] = Value::Null;
+        v["captured_events"] = Value::Null;
+        v["labelled"] = json!(labelled);
+        v["label2_over_labelled"] = json!(super::pct(label2, labelled));
+        v["label2_estimate"] = json!(format!("{:.1}", estimate + deny2 as f64));
+        v["loop_labelled"] = json!(loops);
+    }
+    Ok(v)
+}
+
+/// A day whose totals count in `--team`.
+const MIN_REPORTERS: usize = 3;
+/// Default window of `--team`, in days.
+const TEAM_WINDOW_DAYS: i64 = 30;
+
+/// `sync_state` key of one member's daily totals, kept by the pull (`sync_state.team_stats.*`).
+#[cfg(feature = "sync")]
+pub(crate) fn team_stats_key(member_id: &str, day: &str) -> String {
+    format!("team_stats.{member_id}.{day}")
+}
+
+/// `--team`: the sum of the daily `stats` records of the members who share them (tag `stats`,
+/// decrypted on pull), over the last 30 days or from `since`. Totals only: the members are
+/// counted, never named, and nothing is shown unless at least [`MIN_REPORTERS`] reported.
+fn team_totals(conn: &Connection, since: Option<i64>, now_ms: i64) -> anyhow::Result<Value> {
+    let from_day = super::fmt_day(since.unwrap_or(now_ms - TEAM_WINDOW_DAYS * 86_400_000));
+    let mut st = conn.prepare("SELECT key, value FROM sync_state WHERE key LIKE 'team_stats.%'")?;
+    let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let active: HashSet<String> = conn
+        .prepare("SELECT member_id FROM team_member WHERE active = 1")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut reporters = HashSet::new();
+    let (mut shown, mut avoided, mut minutes, mut tokens) = (0_u128, 0_u128, 0_u128, 0_u128);
+    let mut days = HashSet::new();
+    for r in rows {
+        let (key, text) = r?;
+        let rest = key.trim_start_matches("team_stats.");
+        let Some((member, day)) = rest.rsplit_once('.') else {
+            continue;
+        };
+        // Members the roster knows and has not removed; with no roster yet, every reporter.
+        if (!active.is_empty() && !active.contains(member)) || day < from_day.as_str() {
+            continue;
+        }
+        let Ok(p) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let get = |k: &str| u128::from(p[k].as_u64().unwrap_or(0));
+        reporters.insert(member.to_string());
+        days.insert(day.to_string());
+        shown += get("shown");
+        avoided += get("avoided");
+        minutes += get("est_minutes");
+        tokens += get("est_tokens");
+    }
+    let n = reporters.len();
+    let mut v = json!({"reported": n, "min_reporters": MIN_REPORTERS, "since": from_day});
+    if n >= MIN_REPORTERS {
+        v["days"] = json!(days.len());
+        v["totals"] = json!({
+            "shown": u64::try_from(shown).unwrap_or(u64::MAX),
+            "avoided": u64::try_from(avoided).unwrap_or(u64::MAX),
+            "est_minutes": u64::try_from(minutes).unwrap_or(u64::MAX),
+            "est_tokens": u64::try_from(tokens).unwrap_or(u64::MAX),
+        });
+    } else {
+        v["totals"] = Value::Null;
+    }
+    Ok(v)
+}
+
+fn team_text(v: &Value) -> String {
+    let reported = v["reported"].as_u64().unwrap_or(0);
+    if v["totals"].is_null() {
+        return format!(
+            "team: {reported} of the members who share their totals reported since {}; totals \
+             appear when at least {MIN_REPORTERS} did.\n",
+            v["since"].as_str().unwrap_or("")
+        );
+    }
+    let t = |k: &str| v["totals"][k].as_u64().unwrap_or(0);
+    format!(
+        "team: {reported} members reported over {} days since {}: {} notes shown, {} follow-ups \
+         avoided, about {} min and {} tokens saved (an estimate, totals only)\n",
+        v["days"].as_u64().unwrap_or(0),
+        v["since"].as_str().unwrap_or(""),
+        t("shown"),
+        t("avoided"),
+        t("est_minutes"),
+        t("est_tokens"),
+    )
 }
 
 fn followups(conn: &Connection) -> anyhow::Result<Value> {
@@ -536,12 +690,16 @@ struct Call {
     summary_chars: i64,
     /// `event.bytes`: size of the fetched page, which the fetch summariser read.
     bytes: Option<i64>,
+    /// `event.origin = 'local'`: a call this machine's agents made.
+    local: bool,
+    /// `event.member`: the author of a team row.
+    member: Option<String>,
 }
 
 fn load_calls(conn: &Connection) -> anyhow::Result<Vec<Call>> {
     let mut st = conn.prepare(
         "SELECT id, tool_use_id, created_at, session_id, agent_id, tool, url_norm, query, status, \
-                duration_ms, COALESCE(length(summary), 0), bytes \
+                duration_ms, COALESCE(length(summary), 0), bytes, origin, member \
          FROM event ORDER BY created_at, id",
     )?;
     let rows = st.query_map([], |r| {
@@ -566,6 +724,8 @@ fn load_calls(conn: &Connection) -> anyhow::Result<Vec<Call>> {
             duration_ms: r.get(9)?,
             summary_chars: r.get(10)?,
             bytes: r.get(11)?,
+            local: r.get::<_, String>(12)? == "local",
+            member: r.get(13)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -594,7 +754,7 @@ fn median_bytes<'a>(calls: impl Iterator<Item = &'a Call>) -> Option<i64> {
 }
 
 /// Time, tokens and page bytes of repeated ok calls: (count, duration ms, summary chars, bytes).
-fn repeats(calls: &[Call], fetch: bool) -> (i64, i64, i64, i64) {
+fn repeats(calls: &[&Call], fetch: bool) -> (i64, i64, i64, i64) {
     let mut seen = HashSet::new();
     let (mut n, mut ms, mut chars, mut bytes) = (0, 0, 0, 0);
     for c in calls.iter().filter(|c| c.ok && c.is_fetch == fetch) {
@@ -623,13 +783,107 @@ fn item_cost(p: &crate::config::Pricing, fetch: bool, bytes: i64, tokens: f64) -
     }
 }
 
-/// Estimated savings. Counterfactual: an avoided item is a shown note whose call was not repeated
-/// by the same session and agent afterwards; its cost is the median of the same call's history.
-fn savings(conn: &Connection, since: Option<&str>, projects: &Path) -> anyhow::Result<Value> {
-    let since_ms = since.map(super::parse_date).transpose()?;
-    let pricing = crate::config::load(&crate::paths::config_path()?)?.pricing;
-    let calls = load_calls(conn)?;
-    let by_id: HashMap<i64, &Call> = calls.iter().map(|c| (c.id, c)).collect();
+/// This machine's member id from `team.toml`; `None` outside a team.
+pub(crate) fn own_member_id() -> Option<String> {
+    let dir = crate::paths::data_dir().ok()?;
+    let text = std::fs::read_to_string(dir.join(super::where_::TEAM_TOML)).ok()?;
+    let v: toml::Value = toml::from_str(&text).ok()?;
+    v.get("member_id")?.as_str().map(str::to_string)
+}
+
+/// Item sums of one origin (or of everything): the fields of `stats --savings`.
+#[derive(Default, Clone)]
+struct Acc {
+    shown: i64,
+    avoided: i64,
+    followed: i64,
+    ms: f64,
+    chars: f64,
+    overhead: f64,
+    bytes: i64,
+    cost: f64,
+    conf_n: i64,
+    conf_ms: f64,
+    conf_chars: f64,
+    conf_bytes: i64,
+    conf_cost: f64,
+}
+
+/// One avoided item's counterfactual: (label 2, ms, tokens, page bytes, cost).
+type ItemCosts = (bool, f64, f64, i64, f64);
+
+impl Acc {
+    fn add(&mut self, costs: &[ItemCosts]) {
+        for &(two, d, t, page, c) in costs {
+            self.cost += c;
+            self.ms += d;
+            self.chars += t;
+            self.bytes += page;
+            if two {
+                self.conf_bytes += page;
+                self.conf_cost += c;
+                self.conf_n += 1;
+                self.conf_ms += d;
+                self.conf_chars += t;
+            }
+        }
+    }
+
+    /// The fields `stats --savings` has always printed for the notes (today's fields).
+    fn json(&self, pricing: &crate::config::Pricing) -> Value {
+        json!({
+            "shown": self.shown,
+            "avoided": self.avoided,
+            "followed_up": self.followed,
+            "time_saved_ms": self.ms,
+            "tokens_saved": self.chars,
+            "overhead_tokens": self.overhead,
+            "net_tokens": self.chars - self.overhead,
+            "est_cost": self.cost,
+            "overhead_cost": self.overhead * pricing.main_input_per_mtok / 1e6,
+            "net_cost": (pricing.main_input_per_mtok > 0.0)
+                .then(|| self.cost - self.overhead * pricing.main_input_per_mtok / 1e6),
+            "est_bytes_not_fetched": self.bytes,
+            "est_summariser_tokens": self.bytes / 4,
+            "confirmed": {
+                "items": self.conf_n,
+                "time_saved_ms": self.conf_ms,
+                "tokens_saved": self.conf_chars,
+                "est_bytes_not_fetched": self.conf_bytes,
+                "est_summariser_tokens": self.conf_bytes / 4,
+                "est_cost": self.conf_cost,
+            },
+        })
+    }
+}
+
+/// What one pass over the shown injections found.
+struct SavingsCore {
+    total: Acc,
+    /// `[from your records, from teammates' records]`.
+    by_origin: [Acc; 2],
+    /// Quota block inputs: the cost of every avoided non-Codex item, and the proven part.
+    quota_estimated: f64,
+    quota_proven: f64,
+    codex: i64,
+    local_calls: Vec<Call>,
+}
+
+/// The counterfactual over the injections created in `[since_ms, until_ms)`. An avoided item is a
+/// shown note whose call was not repeated by the same session and agent afterwards; its cost is the
+/// median of the same call's history among this machine's own calls (`origin = 'local'`: what the
+/// call would have cost here). Each injection is also split by the origin of its items
+/// (`injection_item.origin`; a record of your own other machine counts as yours).
+fn savings_core(
+    conn: &Connection,
+    pricing: &crate::config::Pricing,
+    since_ms: Option<i64>,
+    until_ms: Option<i64>,
+) -> anyhow::Result<SavingsCore> {
+    let own = own_member_id();
+    let all = load_calls(conn)?;
+    let by_id: HashMap<i64, &Call> = all.iter().map(|c| (c.id, c)).collect();
+    let calls: Vec<&Call> = all.iter().filter(|c| c.local).collect();
     let mut by_key: HashMap<&str, Vec<&Call>> = HashMap::new();
     for c in calls.iter().filter(|c| c.ok) {
         if let Some(k) = &c.key {
@@ -650,59 +904,79 @@ fn savings(conn: &Connection, since: Option<&str>, projects: &Path) -> anyhow::R
     let mut st = conn.prepare(
         "SELECT id, created_at, session_id, agent_id, tool_use_id, rendered_chars, mode, \
                 COALESCE(transcript_path LIKE '%/.codex/%' OR tool_use_id LIKE 'exec-%', 0) \
-         FROM injection WHERE mode IN ('inject','deny') AND created_at >= ?1 ORDER BY created_at, id",
+         FROM injection WHERE mode IN ('inject','deny') AND created_at >= ?1 AND created_at < ?2 \
+         ORDER BY created_at, id",
     )?;
     let injections: Vec<ShownInjection> = st
-        .query_map([since_ms.unwrap_or(i64::MIN)], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-                r.get::<_, i64>(7)? != 0,
-            ))
-        })?
+        .query_map(
+            [since_ms.unwrap_or(i64::MIN), until_ms.unwrap_or(i64::MAX)],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get::<_, i64>(7)? != 0,
+                ))
+            },
+        )?
         .collect::<rusqlite::Result<_>>()?;
+    // `event_id` is NULL once the record was deleted (RVT1 m15): the item keeps its origin.
     let mut items = conn.prepare(
-        "SELECT position, event_id FROM injection_item WHERE injection_id = ?1 ORDER BY position",
+        "SELECT position, event_id, origin FROM injection_item WHERE injection_id = ?1 \
+         ORDER BY position",
     )?;
 
-    // Per tool: median over the ok events up to the injection, used only when an item has no
-    // history of its own (the item's own history stops at the injection too, RVQ0 m5).
+    // Per tool: median over this machine's ok events up to the injection, used only when an item
+    // has no history of its own (the item's own history stops at the injection too, RVQ0 m5).
     let fallback = |fetch: bool, at: i64| {
         medians(
             calls
                 .iter()
+                .copied()
                 .filter(|c| c.ok && c.is_fetch == fetch && c.at <= at),
         )
     };
-    let fallback_bytes =
-        |at: i64| median_bytes(calls.iter().filter(|c| c.ok && c.is_fetch && c.at <= at));
+    let fallback_bytes = |at: i64| {
+        median_bytes(
+            calls
+                .iter()
+                .copied()
+                .filter(|c| c.ok && c.is_fetch && c.at <= at),
+        )
+    };
 
-    let (mut avoided, mut followed) = (0_i64, 0_i64);
-    let (mut ms, mut chars) = (0.0_f64, 0.0_f64);
-    let (mut conf_n, mut conf_ms, mut conf_chars) = (0_i64, 0.0_f64, 0.0_f64);
-    let (mut bytes, mut conf_bytes) = (0_i64, 0_i64);
-    let (mut cost, mut conf_cost) = (0.0_f64, 0.0_f64);
-    let mut overhead = 0.0_f64;
-    // Quota block: the cost of every avoided non-Codex item, and the part that was proven.
+    let mut total = Acc::default();
+    let mut by_origin = [Acc::default(), Acc::default()];
     let (mut quota_estimated, mut quota_proven, mut codex) = (0.0_f64, 0.0_f64, 0_i64);
     for (id, at, session, agent, tool_use_id, rendered, mode, is_codex) in &injections {
-        overhead += *rendered as f64 / 4.0;
-        let rows: Vec<(i64, i64)> = items
-            .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        total.shown += 1;
+        total.overhead += *rendered as f64 / 4.0;
+        let rows: Vec<(i64, Option<i64>, String)> = items
+            .query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<rusqlite::Result<_>>()?;
-        let mut costs = Vec::new();
-        let mut recalled = false;
-        for (position, event_id) in rows {
-            let Some(src) = by_id.get(&event_id) else {
+        // (origin index, followed up, costs) per item that still has its record.
+        let mut seen: Vec<(usize, bool, Option<ItemCosts>)> = Vec::new();
+        for (position, event_id, origin) in &rows {
+            let src = event_id.and_then(|e| by_id.get(&e).copied());
+            let mut idx = usize::from(origin == "team");
+            if let (Some(s), Some(me)) = (src, &own) {
+                if s.member.as_deref() == Some(me.as_str()) {
+                    idx = 0;
+                }
+            }
+            let Some(src) = src else {
+                seen.push((idx, false, None));
                 continue;
             };
-            let Some(key) = &src.key else { continue };
-            recalled |= all_calls.get(key.as_str()).is_some_and(|v| {
+            let Some(key) = &src.key else {
+                seen.push((idx, false, None));
+                continue;
+            };
+            let recalled = all_calls.get(key.as_str()).is_some_and(|v| {
                 v.iter().any(|e| {
                     e.session == *session
                         && e.agent == *agent
@@ -717,14 +991,14 @@ fn savings(conn: &Connection, since: Option<&str>, projects: &Path) -> anyhow::R
                 .flatten();
             // Only a fetch has a page the summariser would have read; a search adds 0.
             let page = if src.is_fetch {
-                let own = median_bytes(
+                let own_pages = median_bytes(
                     by_key
                         .get(key.as_str())
                         .map(|v| v.iter().copied().filter(|e| e.at <= *at))
                         .into_iter()
                         .flatten(),
                 );
-                own.or_else(|| fallback_bytes(*at)).unwrap_or(0)
+                own_pages.or_else(|| fallback_bytes(*at)).unwrap_or(0)
             } else {
                 0
             };
@@ -735,42 +1009,103 @@ fn savings(conn: &Connection, since: Option<&str>, projects: &Path) -> anyhow::R
                     (d.or(fb.0), c.or(fb.1))
                 }
             };
-            costs.push((
-                labelled2.contains(&(*id, position)),
-                d.unwrap_or(0) as f64,
-                c.unwrap_or(0) as f64 / 4.0,
-                page,
-                item_cost(&pricing, src.is_fetch, page, c.unwrap_or(0) as f64 / 4.0),
+            seen.push((
+                idx,
+                recalled,
+                Some((
+                    labelled2.contains(&(*id, *position)),
+                    d.unwrap_or(0) as f64,
+                    c.unwrap_or(0) as f64 / 4.0,
+                    page,
+                    item_cost(pricing, src.is_fetch, page, c.unwrap_or(0) as f64 / 4.0),
+                )),
             ));
         }
-        if recalled {
-            followed += 1;
-            continue;
-        }
-        avoided += 1;
-        if *is_codex {
-            codex += 1;
-        }
-        for (two, d, t, page, c) in costs {
-            cost += c;
+        let costs_of = |only: Option<usize>| -> Vec<ItemCosts> {
+            seen.iter()
+                .filter(|(i, _, _)| only.is_none_or(|o| o == *i))
+                .filter_map(|(_, _, c)| *c)
+                .collect()
+        };
+        let recalled_in = |only: Option<usize>| {
+            seen.iter()
+                .any(|(i, r, _)| *r && only.is_none_or(|o| o == *i))
+        };
+        // The injection as a whole.
+        if recalled_in(None) {
+            total.followed += 1;
+        } else {
+            total.avoided += 1;
+            if *is_codex {
+                codex += 1;
+            }
+            let costs = costs_of(None);
+            total.add(&costs);
             if !*is_codex {
-                quota_estimated += c;
-                if two || mode == "deny" {
-                    quota_proven += c;
+                for &(two, _, _, _, c) in &costs {
+                    quota_estimated += c;
+                    if two || mode == "deny" {
+                        quota_proven += c;
+                    }
                 }
             }
-            ms += d;
-            chars += t;
-            bytes += page;
-            if two {
-                conf_bytes += page;
-                conf_cost += c;
-                conf_n += 1;
-                conf_ms += d;
-                conf_chars += t;
+        }
+        // The same injection once per origin it shows; the rendered overhead is shared by items.
+        for (o, acc) in by_origin.iter_mut().enumerate() {
+            let n_o = seen.iter().filter(|(i, _, _)| *i == o).count();
+            if n_o == 0 {
+                continue;
+            }
+            acc.shown += 1;
+            acc.overhead += *rendered as f64 / 4.0 * n_o as f64 / seen.len() as f64;
+            if recalled_in(Some(o)) {
+                acc.followed += 1;
+            } else {
+                acc.avoided += 1;
+                acc.add(&costs_of(Some(o)));
             }
         }
     }
+    Ok(SavingsCore {
+        total,
+        by_origin,
+        quota_estimated,
+        quota_proven,
+        codex,
+        local_calls: all.into_iter().filter(|c| c.local).collect(),
+    })
+}
+
+/// The totals of the shown injections of one UTC day, for the daily `stats` record:
+/// (notes shown, avoided follow-ups, estimated minutes, estimated tokens).
+#[cfg(feature = "sync")]
+pub(crate) fn day_totals(
+    conn: &Connection,
+    pricing: &crate::config::Pricing,
+    day_start_ms: i64,
+) -> anyhow::Result<(u64, u64, u64, u64)> {
+    let core = savings_core(
+        conn,
+        pricing,
+        Some(day_start_ms),
+        Some(day_start_ms + 86_400_000),
+    )?;
+    let t = &core.total;
+    Ok((
+        u64::try_from(t.shown).unwrap_or(0),
+        u64::try_from(t.avoided).unwrap_or(0),
+        (t.ms / 60_000.0).round().max(0.0) as u64,
+        t.chars.round().max(0.0) as u64,
+    ))
+}
+
+/// Estimated savings (see [`savings_core`]), with the ceilings, the quota block and the split by
+/// origin (`by_origin.local`, `by_origin.team`: the fields of the notes, no ceilings).
+fn savings(conn: &Connection, since: Option<&str>, projects: &Path) -> anyhow::Result<Value> {
+    let since_ms = since.map(super::parse_date).transpose()?;
+    let pricing = crate::config::load(&crate::paths::config_path()?)?.pricing;
+    let core = savings_core(conn, &pricing, since_ms, None)?;
+    let calls: Vec<&Call> = core.local_calls.iter().collect();
     let (rf_n, rf_ms, rf_chars, rf_bytes) = repeats(&calls, true);
     let (rs_n, rs_ms, rs_chars, rs_bytes) = repeats(&calls, false);
     let ceiling = |fetch: bool, n: i64, ms: i64, chars: i64, bytes: i64| {
@@ -791,49 +1126,32 @@ fn savings(conn: &Connection, since: Option<&str>, projects: &Path) -> anyhow::R
         })
     };
     let quota = quota_section(
-        quota_estimated,
-        quota_proven,
-        codex,
+        core.quota_estimated,
+        core.quota_proven,
+        core.codex,
         &pricing,
         projects,
         super::now_ms(),
     );
-    Ok(json!({
-        "since": since,
-        "shown": injections.len(),
-        "avoided": avoided,
-        "followed_up": followed,
-        "time_saved_ms": ms,
-        "tokens_saved": chars,
-        "overhead_tokens": overhead,
-        "net_tokens": chars - overhead,
-        "est_cost": cost,
-        "overhead_cost": overhead * pricing.main_input_per_mtok / 1e6,
-        "net_cost": (pricing.main_input_per_mtok > 0.0)
-            .then(|| cost - overhead * pricing.main_input_per_mtok / 1e6),
-        "pricing": {
-            "currency": pricing.currency,
-            "summariser_input_per_mtok": pricing.summariser_input_per_mtok,
-            "summariser_output_per_mtok": pricing.summariser_output_per_mtok,
-            "search_fee_per_call": pricing.search_fee_per_call,
-            "main_input_per_mtok": pricing.main_input_per_mtok,
-        },
-        "est_bytes_not_fetched": bytes,
-        "est_summariser_tokens": bytes / 4,
-        "confirmed": {
-            "items": conf_n,
-            "time_saved_ms": conf_ms,
-            "tokens_saved": conf_chars,
-            "est_bytes_not_fetched": conf_bytes,
-            "est_summariser_tokens": conf_bytes / 4,
-            "est_cost": conf_cost,
-        },
-        "ceiling": {
-            "repeat_fetches": ceiling(true, rf_n, rf_ms, rf_chars, rf_bytes),
-            "repeat_searches": ceiling(false, rs_n, rs_ms, rs_chars, rs_bytes),
-        },
-        "quota": quota,
-    }))
+    let mut out = core.total.json(&pricing);
+    out["since"] = json!(since);
+    out["pricing"] = json!({
+        "currency": pricing.currency,
+        "summariser_input_per_mtok": pricing.summariser_input_per_mtok,
+        "summariser_output_per_mtok": pricing.summariser_output_per_mtok,
+        "search_fee_per_call": pricing.search_fee_per_call,
+        "main_input_per_mtok": pricing.main_input_per_mtok,
+    });
+    out["ceiling"] = json!({
+        "repeat_fetches": ceiling(true, rf_n, rf_ms, rf_chars, rf_bytes),
+        "repeat_searches": ceiling(false, rs_n, rs_ms, rs_chars, rs_bytes),
+    });
+    out["by_origin"] = json!({
+        "local": core.by_origin[0].json(&pricing),
+        "team": core.by_origin[1].json(&pricing),
+    });
+    out["quota"] = quota;
+    Ok(out)
 }
 
 fn num(v: &Value, path: &[&str]) -> f64 {
@@ -992,14 +1310,84 @@ fn savings_text(v: &Value) -> String {
             None,
         ),
     ];
-    let cost_paths: [&[&str]; 4] = [
-        &[],
-        &["confirmed"],
-        &["ceiling", "repeat_fetches"],
-        &["ceiling", "repeat_searches"],
+    let mut cost_paths: Vec<Vec<&str>> = vec![
+        vec![],
+        vec!["confirmed"],
+        vec!["ceiling", "repeat_fetches"],
+        vec!["ceiling", "repeat_searches"],
     ];
-    for (r, path) in rows.iter_mut().zip(cost_paths) {
-        let mut p = path.to_vec();
+    // Notes from teammates' records: the avoided and confirmed lines are split by origin
+    // (without any, the table is the one it always was).
+    if num(v, &["by_origin", "team", "shown"]) > 0.0 {
+        let mut split = Vec::new();
+        let mut split_paths: Vec<Vec<&str>> = Vec::new();
+        for (head, which) in [("avoided", "avoided"), ("confirmed", "confirmed")] {
+            for (name, origin) in [
+                ("from your records", "local"),
+                ("from teammates' records", "team"),
+            ] {
+                let base = ["by_origin", origin];
+                let cells = |path: &[&str]| {
+                    let at = |k: &str| {
+                        let mut p = base.to_vec();
+                        p.extend_from_slice(path);
+                        p.push(k);
+                        num(v, &p)
+                    };
+                    (
+                        minutes(at("time_saved_ms")),
+                        kilo(at("tokens_saved")),
+                        at("est_bytes_not_fetched"),
+                        at("est_summariser_tokens"),
+                    )
+                };
+                let (path, items): (&[&str], f64) = if which == "avoided" {
+                    (&[], num(v, &["by_origin", origin, "avoided"]))
+                } else {
+                    (
+                        &["confirmed"],
+                        num(v, &["by_origin", origin, "confirmed", "items"]),
+                    )
+                };
+                let c = cells(path);
+                split.push(row(
+                    &format!("  {head} {name}"),
+                    items,
+                    &[&c.0, &c.1],
+                    Some((c.2, c.3)),
+                ));
+                let mut p = base.to_vec();
+                p.extend_from_slice(path);
+                split_paths.push(p);
+            }
+        }
+        // After "avoided" and after "confirmed", the two lines of each.
+        let mut it = split.into_iter();
+        let mut pit = split_paths.into_iter();
+        let (a1, a2) = (it.next().unwrap(), it.next().unwrap());
+        let (c1, c2) = (it.next().unwrap(), it.next().unwrap());
+        let (pa1, pa2) = (pit.next().unwrap(), pit.next().unwrap());
+        let (pc1, pc2) = (pit.next().unwrap(), pit.next().unwrap());
+        let tail: Vec<_> = rows.split_off(2);
+        let tail_paths: Vec<_> = cost_paths.split_off(2);
+        rows.truncate(1);
+        cost_paths.truncate(1);
+        rows.extend([a1, a2]);
+        cost_paths.extend([pa1, pa2]);
+        rows.push(row(
+            "confirmed (label 2)",
+            num(v, &["confirmed", "items"]),
+            &[&confirmed.0, &confirmed.1],
+            Some((confirmed.2, confirmed.3)),
+        ));
+        cost_paths.push(vec!["confirmed"]);
+        rows.extend([c1, c2]);
+        cost_paths.extend([pc1, pc2]);
+        rows.extend(tail);
+        cost_paths.extend(tail_paths);
+    }
+    for (r, path) in rows.iter_mut().zip(&cost_paths) {
+        let mut p = path.clone();
         p.push("est_cost");
         r.push(money(num(v, &p), currency));
     }
@@ -1054,6 +1442,12 @@ fn savings_text(v: &Value) -> String {
             ));
         }
         o.push('\n');
+    }
+    if num(v, &["by_origin", "team", "shown"]) > 0.0 {
+        o.push_str(
+            "  by origin: an injection that shows notes from both counts once under each; records \
+             from your other machines count as yours\n",
+        );
     }
     if let Some(d) = v["since"].as_str() {
         o.push_str(&format!("  since {d} (ceilings use the whole record)\n"));
@@ -1306,4 +1700,64 @@ fn quota_text(v: &Value) -> String {
 
 fn int_of(v: &Value, key: &str) -> i64 {
     v[key].as_i64().unwrap_or(0)
+}
+
+/// `sync_state` key: the last UTC day (days since 1970-01-01) whose `stats` record was queued.
+#[cfg(feature = "sync")]
+const STATS_DAY: &str = "stats_day";
+
+/// Queues the daily `stats` record of this member for every finished UTC day since the last one
+/// (at most 7), and keeps the totals in `sync_state.team_stats.{member}.{day}` like a pulled one,
+/// so `awm stats --team` counts this member too. Nothing happens unless the machine is in a team
+/// and `team.share_stats` is on.
+///
+/// Trigger (TM14 decision): `awm sync` calls this before every run, and the `stats_day` marker
+/// makes it queue once per finished day. A trigger inside `awm stats` would report only for
+/// members who happen to run it, and the "at least 3 members reported" rule would rarely be met;
+/// the sync runs without anyone asking, spawned by the hooks. The record covers the previous
+/// complete UTC day, so a day's totals are never sent twice or half-finished.
+#[cfg(feature = "sync")]
+pub fn queue_daily_record(env: &crate::sync::Env) -> anyhow::Result<usize> {
+    use crate::db::{self, Role, VersionCheck};
+    use crate::sync::{push, state};
+
+    let dir = &env.data_dir;
+    if !env.config.team.share_stats || !state::configured(dir) {
+        return Ok(0);
+    }
+    let mut conn = db::open(&dir.join(crate::paths::DB_FILE), Role::Cli)?;
+    if !matches!(db::check_version(&conn)?, VersionCheck::Current) {
+        return Ok(0);
+    }
+    let ident = state::Identity::load(dir)?;
+    if ident.key.epoch_keys.is_empty() {
+        return Ok(0);
+    }
+    let ring = ident.ring()?;
+    let now = env.now_ms.unwrap_or_else(super::now_ms);
+    let today = now.div_euclid(86_400_000);
+    let from = (state::get_i64(&conn, STATS_DAY)?.unwrap_or(today - 2) + 1).max(today - 7);
+    let member = ident.team.member_id.to_string();
+    let mut queued = 0;
+    for day in from..today {
+        let (shown, avoided, est_minutes, est_tokens) =
+            day_totals(&conn, &env.config.pricing, day * 86_400_000)?;
+        let record = awm_proto::wire::StatsPlaintext {
+            schema: crate::sync::payload::SCHEMA,
+            day: super::fmt_day(day * 86_400_000),
+            shown,
+            avoided,
+            est_minutes,
+            est_tokens,
+        };
+        push::queue_stats(&mut conn, &ident, &ring, &record, now)?;
+        state::set(
+            &conn,
+            &team_stats_key(&member, &record.day),
+            &serde_json::to_string(&record)?,
+        )?;
+        state::set(&conn, STATS_DAY, &day.to_string())?;
+        queued += 1;
+    }
+    Ok(queued)
 }

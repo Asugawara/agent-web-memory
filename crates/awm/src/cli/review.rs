@@ -22,15 +22,19 @@ const MAX_CALLS: usize = 5;
 
 #[derive(clap::Args, Debug, Default)]
 pub struct Args {
-    /// Items to label (default review.daily_limit, at most 50)
+    /// Items to label (default review.daily_limit, at most 50; with --origin team no limit)
     #[arg(long)]
     pub limit: Option<u32>,
+    /// Only notes from your own records or only from teammates' records (every one, no daily cap)
+    #[arg(long, value_enum)]
+    pub origin: Option<super::log::Origin>,
 }
 
 struct Item {
     injection_id: i64,
     position: i64,
-    event_id: i64,
+    /// `None` once the record was deleted (RVT1 m15); the item and its label stay.
+    event_id: Option<i64>,
     score: f64,
     ref_id: String,
     created_at: i64,
@@ -44,6 +48,19 @@ struct Item {
     trigger_text: Option<String>,
     cutoff: Option<f64>,
     rendered: Option<String>,
+    /// `injection_item.origin`.
+    origin: String,
+    /// `event.member` of the record, when it still exists.
+    member: Option<String>,
+    /// The roster handle of `member`.
+    handle: Option<String>,
+}
+
+impl Item {
+    /// A note from a teammate: a team item that is not from the member's own other machine.
+    fn teammate(&self, own: Option<&str>) -> bool {
+        self.origin == "team" && (own.is_none() || self.member.as_deref() != own)
+    }
 }
 
 /// What the agent did after a note, read from its transcript.
@@ -56,13 +73,20 @@ pub struct NextSteps {
 pub fn run(args: Args) -> anyhow::Result<()> {
     let conn = super::open_db()?;
     let cfg = config::load(&paths::config_path()?)?;
-    let limit = args
-        .limit
-        .unwrap_or(cfg.review.daily_limit)
-        .clamp(1, MAX_LIMIT);
+    // Teammates' notes have no daily cap (plan-v3-team §4.9): every one is shown in DT1.
+    let limit = match (args.origin, args.limit) {
+        (Some(super::log::Origin::Team), None) => u32::MAX,
+        (_, l) => l.unwrap_or(cfg.review.daily_limit).clamp(1, MAX_LIMIT),
+    };
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    run_with(&conn, limit, &mut stdin.lock(), &mut stdout.lock())
+    run_with_origin(
+        &conn,
+        limit,
+        args.origin,
+        &mut stdin.lock(),
+        &mut stdout.lock(),
+    )
 }
 
 pub fn run_with(
@@ -71,7 +95,18 @@ pub fn run_with(
     input: &mut dyn BufRead,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
-    let items = unlabelled(conn, limit)?;
+    run_with_origin(conn, limit, None, input, out)
+}
+
+pub fn run_with_origin(
+    conn: &Connection,
+    limit: u32,
+    origin: Option<super::log::Origin>,
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+) -> anyhow::Result<()> {
+    let own = super::stats::own_member_id();
+    let items = unlabelled(conn, limit, origin, own.as_deref())?;
     if items.is_empty() {
         writeln!(out, "Nothing to review.")?;
         return Ok(());
@@ -84,13 +119,18 @@ pub fn run_with(
     let mut labelled = 0;
     let mut hinted = false;
     for (i, item) in items.iter().enumerate() {
-        show(conn, item, i + 1, total, out)?;
+        show(conn, item, i + 1, total, own.as_deref(), out)?;
+        let teammate = item.teammate(own.as_deref());
         loop {
             if it_is_query_deny(item) && !hinted {
                 writeln!(out, "(query deny labels: 2 the earlier finding covered what the agent did next, 1 relevant but the agent needed the new results, 0 not the same need, h the earlier finding was wrong or stale)")?;
                 hinted = true;
             }
-            write!(out, "Label [2 changed next step, 1 relevant, 0 not relevant, h harmful, x quarantine, s skip, q quit]: ")?;
+            if teammate {
+                write!(out, "Label [2 changed next step, L label 2 and it avoided a multi-step research loop, 1 relevant, 0 not relevant, h harmful, x quarantine, s skip, q quit]: ")?;
+            } else {
+                write!(out, "Label [2 changed next step, 1 relevant, 0 not relevant, h harmful, x quarantine, s skip, q quit]: ")?;
+            }
             out.flush()?;
             let Some(key) = keys.next() else {
                 writeln!(out)?;
@@ -111,14 +151,42 @@ pub fn run_with(
                         ],
                     )?;
                     labelled += 1;
+                    if key == 'h' && teammate {
+                        if let Some(id) = item.event_id {
+                            writeln!(
+                                out,
+                                "This note came from a teammate. To report it to the team: awm team flag {id}"
+                            )?;
+                        }
+                    }
                     break;
                 }
+                'l' if teammate => {
+                    // Label 2 (the outcome's CHECK allows no other value) plus the loop marker.
+                    conn.execute(
+                        "INSERT INTO outcome (injection_id, position, label, labelled_at) \
+                         VALUES (?1, ?2, '2', ?3)",
+                        params![item.injection_id, item.position, super::now_ms()],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO meta (key, value) VALUES (?1, '1') \
+                         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        [super::stats::loop_key(item.injection_id, item.position)],
+                    )?;
+                    labelled += 1;
+                    break;
+                }
+                'l' => writeln!(out, "Key L is only for notes from teammates.")?,
                 'x' => {
-                    let n = crate::forget::quarantine_events(conn, &[item.event_id], "awm review")?;
+                    let Some(event_id) = item.event_id else {
+                        writeln!(out, "The record was already deleted.")?;
+                        break;
+                    };
+                    let n = crate::forget::quarantine_events(conn, &[event_id], "awm review")?;
                     if n == 0 {
-                        writeln!(out, "Record #{} was already quarantined.", item.event_id)?;
+                        writeln!(out, "Record #{event_id} was already quarantined.")?;
                     } else {
-                        writeln!(out, "Quarantined record #{}.", item.event_id)?;
+                        writeln!(out, "Quarantined record #{event_id}.")?;
                     }
                     break;
                 }
@@ -161,18 +229,37 @@ impl Keys<'_> {
     }
 }
 
-fn unlabelled(conn: &Connection, limit: u32) -> anyhow::Result<Vec<Item>> {
-    let mut st = conn.prepare(
+fn unlabelled(
+    conn: &Connection,
+    limit: u32,
+    origin: Option<super::log::Origin>,
+    own: Option<&str>,
+) -> anyhow::Result<Vec<Item>> {
+    // `?2` is this machine's member id: its other devices' rows count as your own records.
+    let filter = match origin {
+        None => "(?2 IS NULL OR ?2 IS NOT NULL)",
+        Some(super::log::Origin::Local) => {
+            "(ii.origin = 'local' OR (?2 IS NOT NULL AND e.member = ?2))"
+        }
+        Some(super::log::Origin::Team) => {
+            "(ii.origin = 'team' AND (?2 IS NULL OR e.member IS NULL OR e.member != ?2))"
+        }
+    };
+    let mut st = conn.prepare(&format!(
         "SELECT ii.injection_id, ii.position, ii.event_id, ii.score, i.ref, i.created_at, \
                 i.hook, i.channel, i.mode, i.session_id, i.agent_id, i.tool_use_id, \
-                i.transcript_path, i.trigger_text, i.cutoff, i.rendered \
+                i.transcript_path, i.trigger_text, i.cutoff, i.rendered, \
+                ii.origin, e.member, m.handle \
          FROM injection_item ii JOIN injection i ON i.id = ii.injection_id \
+              LEFT JOIN event e ON e.id = ii.event_id \
+              LEFT JOIN team_member m ON m.member_id = e.member \
          WHERE NOT EXISTS (SELECT 1 FROM outcome o \
                            WHERE o.injection_id = ii.injection_id AND o.position = ii.position) \
+           AND {filter} \
          ORDER BY i.created_at DESC, ii.injection_id DESC, ii.position \
-         LIMIT ?1",
-    )?;
-    let rows = st.query_map([limit], |r| {
+         LIMIT ?1"
+    ))?;
+    let rows = st.query_map(params![limit, own], |r| {
         Ok(Item {
             injection_id: r.get(0)?,
             position: r.get(1)?,
@@ -190,6 +277,9 @@ fn unlabelled(conn: &Connection, limit: u32) -> anyhow::Result<Vec<Item>> {
             trigger_text: r.get(13)?,
             cutoff: r.get(14)?,
             rendered: r.get(15)?,
+            origin: r.get(16)?,
+            member: r.get(17)?,
+            handle: r.get(18)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -207,6 +297,7 @@ fn show(
     it: &Item,
     n: usize,
     total: usize,
+    own: Option<&str>,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     let kind = if it.agent_id.is_some() {
@@ -224,6 +315,14 @@ fn show(
         it.mode,
         it.ref_id
     )?;
+    if it.teammate(own) {
+        match &it.handle {
+            Some(h) => writeln!(out, "from: teammate @{h}")?,
+            None => writeln!(out, "from: a teammate")?,
+        }
+    } else if it.origin == "team" {
+        writeln!(out, "from: your other machine")?;
+    }
     if let Some(t) = &it.trigger_text {
         writeln!(out, "trigger: {}", plain(t))?;
     }
@@ -231,7 +330,9 @@ fn show(
         Some(c) => writeln!(out, "score {:.1} against cutoff {c:.1}", it.score)?,
         None => writeln!(out, "score {:.1}", it.score)?,
     }
-    let note_text = if it.hook == "PreToolUse" && it.channel == "query" {
+    let note_text = if it.event_id.is_none() {
+        Some("(the record was deleted; the label is still kept)".to_string())
+    } else if it.hook == "PreToolUse" && it.channel == "query" {
         query_deny_text(conn, it)?
     } else {
         render_item(conn, it)?
@@ -271,7 +372,7 @@ fn query_deny_text(conn: &Connection, it: &Item) -> anyhow::Result<Option<String
     let shadow = it.mode != "deny";
     let who = pre_search::where_text(
         &note,
-        &earlier_agent(conn, it.event_id),
+        &earlier_agent(conn, it.event_id.unwrap_or_default()),
         caller_is_codex(it),
     );
     let ctx = RenderCtx {
@@ -337,7 +438,7 @@ fn item_note(conn: &Connection, it: &Item) -> anyhow::Result<Note> {
         ..MatchOpts::default()
     };
     let hit = Hit {
-        event_id: it.event_id,
+        event_id: it.event_id.unwrap_or_default(),
         score: it.score,
         seen: 1,
     };

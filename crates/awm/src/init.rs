@@ -246,7 +246,7 @@ fn print_result(
 fn top_url(conn: &Connection, now_ms: i64) -> anyhow::Result<Option<String>> {
     Ok(conn
         .query_row(
-            "SELECT url FROM event WHERE tool = 'WebFetch' AND status = 'ok' AND quarantined = 0 \
+            "SELECT url FROM event WHERE tool = 'WebFetch' AND status = 'ok' AND quarantined = 0 AND origin = 'local' \
              AND url LIKE 'https://%' AND created_at >= ?1 \
              GROUP BY url_norm HAVING COUNT(*) >= 2 \
              ORDER BY COUNT(*) DESC, MAX(created_at) DESC LIMIT 1",
@@ -259,7 +259,7 @@ fn top_url(conn: &Connection, now_ms: i64) -> anyhow::Result<Option<String>> {
 fn latest_query(conn: &Connection) -> anyhow::Result<Option<String>> {
     Ok(conn
         .query_row(
-            "SELECT query FROM event WHERE tool = 'WebSearch' AND quarantined = 0 \
+            "SELECT query FROM event WHERE tool = 'WebSearch' AND quarantined = 0 AND origin = 'local' \
              ORDER BY created_at DESC, id DESC LIMIT 1",
             [],
             |r| r.get(0),

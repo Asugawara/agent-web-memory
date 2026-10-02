@@ -297,7 +297,7 @@ fn range(key: &str) -> Option<(u32, u32)> {
         "hooks.deadline_ms" => (100, 2000),
         "review.daily_limit" => (1, 50),
         "quota.retention_days" => (7, 3650),
-        "team.sync_interval_s" => (10, 86400),
+        "team.sync_interval_s" => (0, 86400),
         "team.summary_chars" => (1, 2000),
         "team.push_delay_s" => (0, 86400),
         _ => return None,
@@ -447,6 +447,48 @@ impl Config {
                 .map(str::to_string)
                 .collect()
         }
+        // A list of team handles, `@` optional; the offending value is not echoed.
+        fn handles(key: &str, value: &str) -> anyhow::Result<Vec<String>> {
+            let mut out = Vec::new();
+            for (i, item) in list(value).iter().enumerate() {
+                let h = item.strip_prefix('@').unwrap_or(item);
+                let ok = (1..=24).contains(&h.len())
+                    && h.bytes().all(|b| {
+                        b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-'
+                    });
+                if !ok {
+                    bail!(
+                        "{key}: entry {} is not a handle ([a-z0-9_-], 1-24 characters)",
+                        i + 1
+                    );
+                }
+                out.push(h.to_string());
+            }
+            Ok(out)
+        }
+        // A list of host names: letters, digits, `-` and `.`, no scheme, port or path.
+        fn hosts(key: &str, value: &str) -> anyhow::Result<Vec<String>> {
+            let mut out = Vec::new();
+            for (i, item) in list(value).iter().enumerate() {
+                let h = item.to_ascii_lowercase();
+                let labels_ok = h
+                    .split('.')
+                    .all(|l| !l.is_empty() && !l.starts_with('-') && !l.ends_with('-'));
+                let ok = h.len() <= 253
+                    && labels_ok
+                    && h.bytes().all(|b| {
+                        b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.'
+                    });
+                if !ok {
+                    bail!(
+                        "{key}: entry {} is not a host name (for example docs.example.com)",
+                        i + 1
+                    );
+                }
+                out.push(h);
+            }
+            Ok(out)
+        }
         match key {
             "mode" => self.mode = pick(key, value, Mode::parse(value), "inject, shadow, off")?,
             "notify" => {
@@ -508,9 +550,9 @@ impl Config {
             "team.auto_sync" => self.team.auto_sync = flag(key, value)?,
             "team.sync_interval_s" => self.team.sync_interval_s = number(key, value)?,
             "team.show" => self.team.show = flag(key, value)?,
-            "team.mute" => self.team.mute = list(value),
+            "team.mute" => self.team.mute = handles(key, value)?,
             "team.share_all_projects" => self.team.share_all_projects = flag(key, value)?,
-            "team.exclude_hosts" => self.team.exclude_hosts = list(value),
+            "team.exclude_hosts" => self.team.exclude_hosts = hosts(key, value)?,
             "team.summary_chars" => self.team.summary_chars = number(key, value)?,
             "team.share_stats" => self.team.share_stats = flag(key, value)?,
             "team.auto_approve" => {

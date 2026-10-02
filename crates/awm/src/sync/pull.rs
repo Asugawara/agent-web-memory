@@ -438,8 +438,34 @@ fn prepare_plain(
             }
             Err(_) => Ok(Action::Advance),
         },
-        // `flag` and `stats` records of teammates are read by `awm team status` and
-        // `awm stats --team` (TM14); the engine only advances over them.
+        // A teammate's daily totals (opt-in): kept as `sync_state.team_stats.{member}.{day}` for
+        // `awm stats --team` (TM14); the member is the authenticated author of the stream.
+        "stats" => match decode_plaintext::<awm_proto::wire::StatsPlaintext>(plain) {
+            Ok(Decoded::Known(p)) => {
+                let day_ok = p.day.len() == 10
+                    && p.day.bytes().enumerate().all(|(i, b)| {
+                        if i == 4 || i == 7 {
+                            b == b'-'
+                        } else {
+                            b.is_ascii_digit()
+                        }
+                    });
+                if day_ok {
+                    state::set(
+                        &s.conn,
+                        &format!("team_stats.{}.{}", sr.member, p.day),
+                        &serde_json::to_string(&p)?,
+                    )?;
+                }
+                Ok(Action::Advance)
+            }
+            Ok(Decoded::Newer { .. }) => {
+                state::set(&s.conn, state::NEWER_SCHEMA, "1")?;
+                Ok(Action::Advance)
+            }
+            Err(_) => Ok(Action::Advance),
+        },
+        // `flag` records of teammates are read by `awm team status`; the engine only advances.
         _ => Ok(Action::Advance),
     }
 }

@@ -443,7 +443,7 @@ pub fn run_forget(args: &Args, io: &mut Io<'_>) -> anyhow::Result<Outcome> {
         if target == "last" {
             let rows = rows(
                 &conn,
-                "id = (SELECT id FROM event ORDER BY created_at DESC, id DESC LIMIT 1)",
+                "id = (SELECT id FROM event WHERE origin = 'local' ORDER BY created_at DESC, id DESC LIMIT 1)",
                 [],
             )?;
             (rows, None, "awm forget last".to_string(), None)

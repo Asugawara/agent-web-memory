@@ -1,7 +1,25 @@
 //! `awm log`: recent events, or one injection by `--ref`.
 
 use rusqlite::{params, OptionalExtension};
-use serde_json::json;
+use serde_json::{json, Value};
+
+/// Which records `--origin` keeps (`event.origin`).
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// Records captured on this machine
+    Local,
+    /// Records pulled from teammates
+    Team,
+}
+
+impl Origin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Origin::Local => "local",
+            Origin::Team => "team",
+        }
+    }
+}
 
 #[derive(clap::Args, Debug, Default)]
 pub struct Args {
@@ -14,6 +32,12 @@ pub struct Args {
     /// Show the text of the injection with this ref instead
     #[arg(long = "ref", value_name = "REF")]
     pub ref_id: Option<String>,
+    /// Only your own records or only teammates' records
+    #[arg(long, value_enum)]
+    pub origin: Option<Origin>,
+    /// Only your own records that are on the team server (they have a record id)
+    #[arg(long)]
+    pub shared: bool,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -21,11 +45,20 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     if let Some(r) = &args.ref_id {
         return show_ref(&conn, r);
     }
+    // `--shared` means own records: it cannot be combined with `--origin team`.
+    if args.shared && args.origin == Some(Origin::Team) {
+        anyhow::bail!("--shared lists your own records; it cannot be combined with --origin team");
+    }
+    let origin = args.origin.map(Origin::as_str);
     let mut st = conn.prepare(
-        "SELECT created_at, tool, agent_id, query, url, status, agent FROM event \
-         ORDER BY created_at DESC, id DESC LIMIT ?1",
+        "SELECT e.created_at, e.tool, e.agent_id, e.query, e.url, e.status, e.agent, e.origin, \
+                m.handle \
+         FROM event e LEFT JOIN team_member m ON m.member_id = e.member \
+         WHERE (?2 IS NULL OR e.origin = ?2) \
+           AND (?3 = 0 OR (e.origin = 'local' AND e.sync_id IS NOT NULL)) \
+         ORDER BY e.created_at DESC, e.id DESC LIMIT ?1",
     )?;
-    let rows = st.query_map(params![args.limit], |r| {
+    let rows = st.query_map(params![args.limit, origin, args.shared], |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, String>(1)?,
@@ -34,25 +67,32 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             r.get::<_, Option<String>>(4)?,
             r.get::<_, String>(5)?,
             r.get::<_, String>(6)?,
+            r.get::<_, String>(7)?,
+            r.get::<_, Option<String>>(8)?,
         ))
     })?;
     for row in rows {
-        let (ts, tool, agent, query, url, status, coding_agent) = row?;
+        let (ts, tool, agent, query, url, status, coding_agent, row_origin, handle) = row?;
         let agent_kind = if agent.is_some() { "subagent" } else { "main" };
         let target = url.or(query).unwrap_or_default();
         if args.json {
-            println!(
-                "{}",
-                json!({"ts": ts, "tool": tool, "agent": agent_kind, "coding_agent": coding_agent,
-                       "target": target, "status": status})
-            );
+            let mut line = json!({"ts": ts, "tool": tool, "agent": agent_kind, "coding_agent": coding_agent,
+                       "target": target, "status": status});
+            line["origin"] = Value::from(row_origin.as_str());
+            if row_origin == "team" {
+                line["handle"] = handle.map_or(Value::Null, Value::from);
+            }
+            println!("{line}");
         } else {
             // Claude rows are the default and carry no tag.
-            let tag = if coding_agent == "claude" {
+            let mut tag = if coding_agent == "claude" {
                 String::new()
             } else {
                 format!("[{coding_agent}] ")
             };
+            if row_origin == "team" {
+                tag.push_str(&format!("@{} ", handle.as_deref().unwrap_or("?")));
+            }
             println!(
                 "{}  {tool:<9}  {agent_kind:<8}  {status:<11}  {tag}{}",
                 super::fmt_ts(ts),
