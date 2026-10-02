@@ -3,11 +3,11 @@
 ## What is protected in v0.1
 
 - **Data location**: Research stays on the machine. There is no HTTP client in the codebase; no data leaves your computer.
-- **File permissions**: The data directory is mode 0700 and the database file is mode 0600.
+- **File permissions**: The data directory is mode 0700 and the database file and usage-limit sample files are mode 0600.
 - **Redaction before storage**: API keys, secrets, private IPs, file paths, and email addresses are redacted before being written to disk.
 - **Private hosts never stored**: URLs on private networks (`localhost`, `192.168.*`, `10.*`, etc.) are never recorded.
 - **Injected text is bounded**: Notes are wrapped in XML tags, sanitized, capped at 9,500 characters, and labeled with their source and age. A PreToolUse deny (optional, shadow by default) shows the agent the same sanitised earlier result (up to 8,000 characters) in its reason text, capped at 9,500 characters.
-- **Deletion is verifiable**: `awm forget` deletes the selected records immediately (tombstones stop them coming back); `awm purge` deletes by date or everything.
+- **Deletion is verifiable**: `awm forget` deletes the selected records immediately (tombstones stop them coming back); `awm purge` deletes by date or everything. Usage-limit samples expire after `quota.retention_days` (92 days by default, deleted by whole month); `awm purge --all` deletes them and `awm purge --before` leaves them to retention.
 - **Quarantine for unreliable records**: Mark a note or URL as unreliable with `awm quarantine`; quarantined records are never injected.
 - **Build integrity**: Builds are local for now: `scripts/install-local.sh` builds from source with `--locked`; a committed `Cargo.lock`, no network dependencies (`scripts/check.sh` no-network step) and no telemetry.
 - **No telemetry**: No metrics, counters, or analytics are collected or sent anywhere.

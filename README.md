@@ -42,8 +42,12 @@ This asks whether to record future research and whether to import your past rese
 - Your API keys (redacted before storage)
 - Private network URLs
 
+**With status line samples on (`awm setup --statusline`):**
+- Time, session ID, model, the 5-hour and 7-day usage percentages and reset times, and the session's estimated cost
+- Kept at least 92 days and deleted by whole months (so up to 123 days); `awm purge --all` and `awm uninstall` delete them, `awm purge --before` does not
+
 **Stored in:**
-- One file only: `~/Library/Application Support/agent-web-memory/awm.db` on macOS, `~/.local/share/agent-web-memory/awm.db` on Linux
+- The data directory, ~/Library/Application Support/agent-web-memory/ on macOS or ~/.local/share/agent-web-memory/ on Linux: the database awm.db and, with status line samples on, quota/samples-YYYY-MM.ndjson
 - This machine only; `awm` makes no network requests
 
 **Delete everything at any time:**
@@ -60,14 +64,15 @@ awm purge --all
 | `awm search {query}` | Search stored records |
 | `awm log` | Show recent notes injected into your agents |
 | `awm stats` | Show statistics (records by tool and agent, quarantined count) |
-| `awm stats --savings` | Estimate time and tokens the shown notes saved (`--since YYYY-MM-DD`, `--json`) |
+| `awm stats --savings` | Estimate time and tokens the shown notes saved, and their share of your usage limits (`--since YYYY-MM-DD`, `--json`) |
 | `awm review` | Review and label notes you were shown |
 | `awm forget` | Delete records: `awm forget last`, `awm forget <url>`, `awm forget --id N`, `awm forget --ref REF` (asks first; `--yes` skips the question) |
-| `awm purge` | `awm purge --before YYYY-MM-DD` deletes everything older than the date; `awm purge --all` deletes the whole data directory |
+| `awm purge` | `awm purge --before YYYY-MM-DD` deletes records older than the date (usage-limit samples expire on their own); `awm purge --all` deletes the whole data directory |
 | `awm quarantine` | Mark records as unreliable |
 | `awm unquarantine` | Lift quarantine |
 | `awm calibrate` | Calibrate matching thresholds |
-| `awm setup` | Set up the plugin integration |
+| `awm setup` | Set up the plugin integration (`--statusline` adds usage-limit samples) |
+| `awm statusline` | Record usage-limit samples from Claude Code's status line (`--quiet` prints nothing) |
 | `awm export` | Export records |
 | `awm reindex` | Rebuild the search index |
 | `awm config` | Show or change settings (mode, channels, cutoffs) |
@@ -91,6 +96,12 @@ main_input_per_mtok = 0.0          # your main model's input price; 0 = not pric
 ```
 
 Main-model tokens are priced only when `main_input_per_mtok` is set; the summary line then also shows a net cost after the note overhead. A subscription pays none of this per call, so read the cost as what the same calls would cost on API billing.
+
+### Savings in your usage limits (subscription)
+
+On a Claude Pro or Max subscription the `cost` column is what the same calls would cost on API billing. `awm stats --savings` can also show the savings as a share of your 5-hour and 7-day usage limits. It needs the limit usage that Claude Code passes to your status line, so run `awm setup --statusline` once. When you have no status line, it adds one. When you have your own, it changes nothing and prints one line to paste into your script right after the line that reads stdin; keep the `>/dev/null 2>&1 &` at its end, or Claude Code waits for awm before it draws the status line. The samples stay in `quota/` in the data directory for at least 92 days (`quota.retention_days`, deleted by whole months); `awm purge --all` and `awm uninstall` delete them, `awm purge --before` does not.
+
+In each 5-hour window, awm compares the rise of the usage percentage with the list-price cost that your Claude Code sessions on this machine reported over the same time. The total rise over all windows with at least 10 points and $20 of use, divided by their total cost, is the share of a window per dollar. Accounts are told apart by their 7-day reset, and each account-week gets its own rate once it has 5 such windows on 2 days. The savings in the `cost` column times that rate give the share. Two figures are shown: `estimated` counts every note whose page or search was not repeated afterwards, which is an upper bound because the agent might not have needed it; `proven` counts only calls that were denied and items you labelled 2 in `awm review`. The range comes from how the limits count cached tokens, which Anthropic does not document: from free (the high end) to ten times their list price (the low end). awm reads the cache-read share of your sessions from the totals Claude Code writes at the end of each transcript, and their start times from the first line; nothing from them is stored. The figures leave out the context the notes replaced or added and the requests they saved, and use on claude.ai or on other machines, which the samples cannot see, makes them too high. awm assumes the limits weigh models and other token kinds like list prices, and needs `[pricing]` in USD. Codex calls are not part of these figures; Codex has its own limits.
 
 ### Blocking repeats (short-circuit, optional)
 
@@ -153,7 +164,7 @@ To delete everything:
    ```bash
    awm uninstall
    ```
-   This shows the data directory size and record count, then deletes it after you confirm.
+   This shows the data directory size and record count, then deletes it after you confirm, including usage-limit samples.
 
 2. **Remove the plugin from Claude Code:**
    ```bash
@@ -161,7 +172,9 @@ To delete everything:
    claude plugin marketplace remove agent-web-memory
    ```
 
-3. **Remove the binary:**
+3. **Remove the status line sample capture:** run `awm setup --remove-statusline --yes` if awm wrote your status line, or remove the `awm statusline` line from your status line script.
+
+4. **Remove the binary:**
    ```bash
    bash scripts/uninstall-local.sh
    ```
