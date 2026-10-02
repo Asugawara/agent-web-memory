@@ -33,6 +33,8 @@ pub enum Role {
     Capture,
     /// CLI commands.
     Cli,
+    /// `awm sync` (plan-v3-team §4.6): short write transactions, like `Capture`.
+    Sync,
 }
 
 impl Role {
@@ -40,7 +42,7 @@ impl Role {
     pub fn busy_timeout(self) -> Duration {
         match self {
             Role::HookRead => Duration::from_millis(50),
-            Role::Capture => Duration::from_millis(2_000),
+            Role::Capture | Role::Sync => Duration::from_millis(2_000),
             Role::Cli => Duration::from_millis(5_000),
         }
     }
@@ -408,6 +410,19 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    #[test]
+    fn the_sync_role_waits_two_seconds_and_may_create() {
+        assert_eq!(Role::Sync.busy_timeout(), Duration::from_millis(2_000));
+        assert_eq!(Role::Sync.busy_timeout(), Role::Capture.busy_timeout());
+        assert!(Role::Sync.may_create());
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("awm.db"), Role::Sync).unwrap();
+        let ms: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ms, 2_000);
     }
 
     #[test]

@@ -50,6 +50,16 @@ const KEYS: &[&str] = &[
     "pricing.main_input_per_mtok",
     "quota.capture",
     "quota.retention_days",
+    "team.auto_sync",
+    "team.sync_interval_s",
+    "team.show",
+    "team.mute",
+    "team.share_all_projects",
+    "team.exclude_hosts",
+    "team.summary_chars",
+    "team.share_stats",
+    "team.auto_approve",
+    "team.push_delay_s",
 ];
 
 pub fn run(args: Args) -> anyhow::Result<()> {

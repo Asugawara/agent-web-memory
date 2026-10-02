@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/awm"]
+members = ["crates/awm", "crates/awm-proto", "crates/awm-server"]
 exclude = ["spikes"]
 resolver = "2"
 

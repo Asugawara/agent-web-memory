@@ -27,9 +27,16 @@ toml = "1.1.6"
 time = { version = "0.3.55", features = ["formatting", "parsing", "local-offset", "macros"] }
 walkdir = "2.5.0"
 csv = { version = "1.4.0", optional = true }
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"], optional = true }
+awm-proto = { path = "../awm-proto", optional = true }
+awm-server = { path = "../awm-server", features = ["all"], optional = true }
 
 [dev-dependencies]
 tempfile = "3.27.0"
 
 [features]
 bench = ["dep:csv"]
+# Team sync client (plan-v3-team 4.1): `awm sync` only; the default build has no HTTP client.
+sync = ["dep:ureq", "dep:awm-proto"]
+# `awm serve`: links the server crate.
+serve = ["dep:awm-server", "dep:awm-proto"]

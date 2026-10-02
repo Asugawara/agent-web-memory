@@ -1,5 +1,6 @@
 //! Read-only and maintenance subcommands.
 
+pub mod cloud;
 pub mod config_cmd;
 pub mod doctor;
 pub mod export;
@@ -8,9 +9,13 @@ pub mod reindex;
 pub mod report;
 pub mod review;
 pub mod search;
+#[cfg(feature = "serve")]
+pub mod serve;
 pub mod setup;
 pub mod stats;
 pub mod statusline;
+pub mod sync;
+pub mod team;
 pub mod uninstall;
 pub mod where_;
 
@@ -22,6 +27,12 @@ use serde_json::Value;
 
 use crate::db::{self, Role, VersionCheck};
 use crate::paths;
+
+/// The scaffold commands of the team work (TM1): print a message and exit with status 2.
+pub(crate) fn not_implemented(command: &str) -> ! {
+    eprintln!("awm {command}: not implemented in this build");
+    std::process::exit(2)
+}
 
 /// Opens the existing database for a CLI command. Refuses a missing, older or newer schema.
 pub(crate) fn open_db() -> anyhow::Result<Connection> {
