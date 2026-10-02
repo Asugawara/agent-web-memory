@@ -130,7 +130,7 @@ code = (first 8 bytes of HMAC-SHA256( HKDF(S, "awm code v1"), transcript ) as u6
 
 `awm team approve HANDLE` recomputes both from the pending request and `S`. The invitee reads the code out over the trusted channel; if a thief joined first with the stolen string, the pending request carries the thief's key and its code differs (`a_stolen_invite_alone_yields_no_history_without_an_approval`). Both values are deterministic in the public key and `S` (`fingerprint_and_code_are_deterministic_from_the_key_and_s`). The code has 20 bits: it is a comparison aid against a key the thief did not choose to match, not a password; a thief would have to find a key pair whose code collides with the honest invitee's, which they cannot know in advance.
 
-A stolen string alone gives no history: keys arrive only as wraps made by an approver, and with `team.auto_approve = devices` (the default) a member join waits for that manual comparison.
+A stolen string alone gives no history: keys arrive only as wraps made by an approver, and with `team.auto_approve = none` (the default) a member join waits for that manual comparison.
 
 ## 5. Wraps
 

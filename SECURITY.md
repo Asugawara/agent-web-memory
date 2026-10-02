@@ -9,13 +9,20 @@
 - **Injected text is bounded**: Notes are wrapped in XML tags, sanitized, capped at 9,500 characters, and labeled with their source and age. A PreToolUse deny (optional, shadow by default) shows the agent the same sanitised earlier result (up to 8,000 characters) in its reason text, capped at 9,500 characters.
 - **Deletion is verifiable**: `awm forget` deletes the selected records immediately (tombstones stop them coming back); `awm purge` deletes by date or everything. Usage-limit samples expire after `quota.retention_days` (92 days by default, deleted by whole month); `awm purge --all` deletes them and `awm purge --before` leaves them to retention.
 - **Quarantine for unreliable records**: Mark a note or URL as unreliable with `awm quarantine`; quarantined records are never injected.
-- **Build integrity**: Builds are local for now: `scripts/install-local.sh` builds from source with `--locked`; a committed `Cargo.lock`, no network dependencies (`scripts/check.sh` no-network step) and no telemetry.
+- **Build integrity**: Builds are local for now: `scripts/install-local.sh` builds from source with `--locked`; a committed `Cargo.lock`, the default build has no network dependencies (`scripts/check.sh` no-network step); release builds add `sync` (an HTTP client used only by `awm sync`) and `serve`. No telemetry.
 - **No telemetry**: No metrics, counters, or analytics are collected or sent anywhere.
 
-## What is *not* defended
+## Team sync (optional, v0.2 and later)
+
+When you run `awm team join`, team sync is end-to-end encrypted: the server holds only ciphertext and metadata (which projects are shared, record counts, HTTP status). Encrypted independently with per-organisation keys; the server never sees plaintext research.
+
+**Threats mitigated:** Malicious teammates are bounded by pull-side checks and quarantine (the same rules as your own notes). Leaked device tokens can be revoked and rotated. Leaked invites expire in 7 days and are single-use. Breaches of the server yield only ciphertext (recoverable only if the organisation key leaks separately).
+
+**Explicitly not defended:** A teammate with a valid key can read everything the organisation shares — that is the product. A removed member's local copies stay on their machine. A removed member colluding with the server can forge authorship (key rotation mitigates). The server can withhold the newest records or delay delivery. Compromised clients can push secrets (known shapes are quarantined; others require per-project audits). Prompt injection inside notes is reduced by the same sanitiser as v0.1, not eliminated. For details, see `docs/plan-v3-team.md` §5.2 (threat model) and §5.3 (scope of defence).
+
+## What is *not* defended (local mode, v0.1)
 
 - **Malicious host**: If someone gains access to your machine or user account, the database is a plain SQLite file, not encrypted at rest.
-- **Malicious teammate**: In v0.2, when team sync is added, a teammate could push poisoned research. Bounds are the sanitiser, quarantine, and token revocation.
 - **Prompt injection from web pages**: agent-web-memory shows sanitised earlier results from web pages (up to 8,000 characters per note) to your agents. An agent already reads web pages; this tool bounds the extra exposure by capping notes and limiting context.
 
 ## v0.2 and later

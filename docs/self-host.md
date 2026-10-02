@@ -82,6 +82,8 @@ AWM_ACME_EMAIL=you@example.com
 
 `AWM_DOMAIN` can be a static IP address instead. `AWM_BACKUP` is `gs://`, `s3://` or `file:///PATH`; see [Backup](#backup). If your own TLS proxy sits in front on the same host, leave out `AWM_DOMAIN` and set `AWM_BEHIND_TLS_PROXY=1` and `AWM_TRUSTED_PROXY=127.0.0.1/32` instead; the server then listens on `127.0.0.1:8787` (plain HTTP, the default) and the proxy forwards to it.
 
+**For Postgres**: set `AWM_DATABASE_URL` to your Cloud SQL connector string or database URL. `AWM_DATABASE_INSECURE_NETWORK=1` permits a Postgres host that is not loopback, a private range or the Cloud SQL socket; without it such hosts are refused and `awm serve check` reports `WARN` when it is set.
+
 **4. Create the database and the bootstrap token.** Run this in a terminal; it prints the token once, and never into a log:
 
 ```sh
@@ -137,6 +139,7 @@ docker compose exec awm awm serve check
 - **A named volume starts with the right owner.** If you replace it with a host directory (`./data:/data`), make it owned by uid 65532 with mode 0700: `chown 65532:65532 ./data && chmod 0700 ./data`. The server refuses to start on a data directory that others can read.
 - **HTTP-01 instead of TLS-ALPN-01** (only when something in front of 443 cannot pass the ALPN challenge): in `.env` set `AWM_ACME_CHALLENGE=http-01` and `AWM_ACME_HTTP_LISTEN=0.0.0.0:8080`, and uncomment `"80:8080"` in the compose file.
 - **A team with its own TLS proxy** (Caddy, nginx, a load balancer): in `.env` leave `AWM_DOMAIN` empty and set `AWM_BEHIND_TLS_PROXY=1` and `AWM_TRUSTED_PROXY=` (the proxy's address range, for example `172.18.0.0/16`); in the compose file replace `"443:8443"` by `"127.0.0.1:8443:8443"` (or put the proxy on the same compose network) and point the proxy at `http://127.0.0.1:8443`. The server then speaks plain HTTP to the proxy only, and believes `X-Forwarded-For` only from the range you named. The certificate, HSTS and renewal are the proxy's job.
+- **With Cloud Run's managed proxy**: set `AWM_TRUSTED_PROXY=cloud-run` (requires `K_SERVICE` environment variable to be set by Cloud Run).
 - **The container refuses to start** (and compose restarts it every few seconds) when neither `AWM_DOMAIN` nor `AWM_BEHIND_TLS_PROXY` is set: the log says why (`docker compose logs awm`). That is the safe default, not a bug.
 
 Continue with [Create the team](#create-the-team-first-admin-and-first-member).
@@ -170,12 +173,14 @@ Then do three things today:
 2. **Run `awm serve check`** and fix every `FAIL`; read every `WARN`.
 3. **Run a restore drill** ([Restore](#restore-and-re-seed)) on a scratch host before real notes arrive.
 
+**First backfill with many records:** The default rate limits are 60 requests per minute and 5,000 records per member per day; importing more than 5,000 records as a first backfill takes days. To speed it up as an admin, set higher limits temporarily in `server.toml`: `requests_per_minute = 300` and `records_per_day = 50000` at the top level (not under a `[table]`), then restore the defaults afterwards. Restart the server for the changes to take effect.
+
 ## TLS
 
 - **The default is a Let's Encrypt certificate that the binary gets and renews itself**, for the name in `AWM_DOMAIN` / `--domain`, over TLS-ALPN-01 on port 443. Nothing else needs to be open. It is kept in `{data}/acme/` (`account.json`, `cert.pem`, `key.pem`, mode 0600 in a 0700 directory) so restarts, upgrades and container re-creation never re-issue. Renewal follows the CA's renewal information window; after a failed order the server backs off 1, 10 and 60 minutes. TLS 1.2 and 1.3 only; `Strict-Transport-Security` on every response.
 - **A bare IP address** (`AWM_DOMAIN=203.0.113.7`) gets an IP-address certificate, which Let's Encrypt issues only under its `shortlived` profile (valid about 160 hours, renewed every few days). The address must be static and public. `check` fails when fewer than 2 days remain (7 for a DNS name).
 - **HTTP-01** (`--acme-challenge http-01`, `AWM_ACME_CHALLENGE=http-01`) for hosts where something in front of 443 cannot pass the ALPN challenge. It opens a listener on port 80 (`--acme-http-listen`, default `0.0.0.0:80`) that answers only `/.well-known/acme-challenge/` and redirects everything else to HTTPS. DNS-01 is not offered: it would put DNS credentials on the server.
-- **Your own proxy**: `--behind-tls-proxy` with `--trusted-proxy CIDR` (repeatable). Exclusive with `--domain`.
+- **Your own proxy**: `--behind-tls-proxy` with `--trusted-proxy CIDR` (repeatable). Exclusive with `--domain`. `awm serve` sends `Strict-Transport-Security` on every response whether it terminates TLS itself or the proxy does.
 - **Why `sslip.io`, `nip.io`, `xip.io` and `traefik.me` are refused**: Let's Encrypt limits certificates per registered domain (50 a week), and those services are not on the Public Suffix List, so every user of one shares a single budget; your issuance would fail on someone else's traffic. Use a domain you own (a subdomain of one is fine) or a static IP address.
 - **Rate limits and restores.** A restore onto a new host re-issues the certificate (the certificate and key are never in the backup), which counts against Let's Encrypt's 5 certificates per identical name per week. Drills should use `--acme-staging` (`AWM_ACME_STAGING=1`) or a drill hostname.
 - **A server behind an internal CA**: members pass `--ca-file PEM` to `awm team create` and `awm team join`.
@@ -226,8 +231,9 @@ A restore drill takes minutes; do one before you rely on the server. On a fresh 
 awm serve restore --from gs://example-awm-backup/awm --data /var/lib/awm
 ```
 
-- It picks the latest full snapshot at or before `--at TIME` (Unix seconds or RFC 3339) and the change sets that follow, verifies every object against its manifest and `PRAGMA integrity_check`, writes a **new `generation`** and prints the counts. Nothing is written until every check passes. Corruption exits 3.
-- It refuses a directory that already holds `server.db` (exit 2) unless `--force`, which first renames the old `server.db` to `server.db.pre-restore-TIME`. Stop the server before `--force`: the command does not check for a running one.
+- It picks the latest full snapshot at or before `--at TIME` (Unix seconds or RFC 3339) and the change sets that follow, verifies every object against its manifest and `PRAGMA integrity_check`, writes a **new `generation`** and prints the counts and the date by which the retention task removes the `pre-restore` copy. Nothing is written until every check passes. Corruption exits 3.
+- The server holds `{data}/server.lock` while running. Stop the server (`systemctl stop awm-serve`, `docker compose down`) before `--force`: the command refuses while `{data}/server.lock` is held; that lock is its only check for a running server.
+- It refuses a directory that already holds `server.db` (exit 2) unless `--force`, which first renames the old `server.db` to `server.db.pre-restore-TIME`. After `restore --force`, the `server.db.pre-restore-*` copy (and any `server.db.bak-vN` files from migrations) are removed once they are older than the oldest kept full snapshot, or after 8 days when no backup target is configured.
 - Run it as the service user (`sudo -u awm ...`) so the files are owned correctly. Then start the server (`systemctl start awm-serve`, `docker compose up -d`). Its first snapshot after a restore is written to the target in the new generation; the old generation stays in the lineage, so it is not mistaken for a second writer.
 - A restore onto a new host issues a new certificate (see [TLS](#tls)). Point DNS at the new host first.
 

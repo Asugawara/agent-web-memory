@@ -7,7 +7,7 @@
     {
       "name": "agent-web-memory",
       "source": "./plugin",
-      "description": "Remembers your agents' web research and shows earlier findings before they repeat it. Local only.",
+      "description": "Remembers your agents' web research and shows earlier findings before they repeat it. Local first; optional end-to-end encrypted team sync.",
       "version": "0.1.0"
     }
   ]
