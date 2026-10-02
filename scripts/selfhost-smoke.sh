@@ -7,6 +7,12 @@
 #   next incremental, wipe, restore, start, check (no FAIL), A's sync re-seeds the lost record,
 #   forget on A removes the record from B.
 #
+# team.auto_sync stays on, so the capture hook (TM13) starts `awm sync --once --quiet` in the
+# background and that child, not the smoke's own `awm sync`, usually pushes the captured record.
+# The smoke therefore asserts outcomes, never which process pushed: it syncs A until a run is not
+# locked out by sync.lock (the child has finished) and A's outbox (`awm team status --json`) is
+# empty, then B must pull and see the records. Nothing is killed or wiped before that wait ends.
+#
 # Modes (one per run):
 #   --store sqlite --tls pebble   awm serve --data DIR --domain localhost against a local Pebble
 #                                 ACME server (needs PEBBLE_BIN and openssl); the default
@@ -627,11 +633,19 @@ SQL
   RESTORE_RECORDS="$SEED"
 }
 
-# Runs `awm sync --once` as WHO until a run pushes and pulls nothing; echoes the totals.
+# Runs `awm sync --once` as WHO until a run that held sync.lock pushes and pulls nothing; echoes
+# the totals. A run that finds sync.lock held (the hook-spawned child, TM13) is waited out
+# (200 ms steps, at most 120 s), not counted as an empty run.
 sync_all() {
-  local who=$1 out pushed pulled tp=0 tl=0 i
+  local who=$1 out pushed pulled tp=0 tl=0 i waited=0
   for i in $(seq 1 400); do
     out="$(awm_as "$who" sync --once)"
+    if grep -q 'another awm sync is running' <<<"$out"; then
+      waited=$((waited + 1))
+      [ "$waited" -le 600 ] || die "$who: sync.lock still held after 120 s"
+      sleep 0.2
+      continue
+    fi
     pushed="$(count_of pushed "$out")"
     pulled="$(count_of pulled "$out")"
     : "${pushed:=0}" "${pulled:=0}"
@@ -660,12 +674,29 @@ b_has_handle() {
   grep -qF -- "@ann $1" <<<"$out"
 }
 
+# Rows in A's sync outbox, from `awm team status --json` (0 outside a team).
+outbox_len() {
+  awm_as a team status --json | jq -r '[(.outbox // {}) | to_entries[].value] | add // 0'
+}
+
+# Waits (200 ms steps, at most 10 s after the last sync) until A's outbox is empty and no sync is
+# running: the hook-spawned child, if any, has finished and everything A captured is on the server.
+wait_a_flushed() {
+  local i n=""
+  for i in $(seq 1 50); do
+    sync_all a
+    n="$(outbox_len)"
+    [ "$n" = 0 ] && return 0
+    sleep 0.2
+  done
+  die "A's outbox still holds $n rows after 10 s"
+}
+
 SYNC_PUSHED=0
 SYNC_PULLED=0
 step_push() {
-  sync_all a
-  local want=$((1 + SEED))
-  [ "$SYNC_PUSHED" -ge "$want" ] || die "A pushed $SYNC_PUSHED records, expected at least $want"
+  wait_a_flushed
+  [ "$(outbox_len)" = 0 ] || die "A's outbox is not empty"
 }
 
 step_pull() {
@@ -695,11 +726,11 @@ REC_AFTER_EXTRA=""
 step_extra_record() {
   REC_BEFORE_EXTRA="$(server_rec_count)"
   capture a "$URL2" "The bravo guide: $MARK2 explains the rollback procedure for the team."
-  local out
-  out="$(awm_as a sync --once)"
-  printf '%s\n' "$out"
-  [ "$(count_of pushed "$out")" -ge 1 ] || die "A did not push the extra record"
+  wait_a_flushed
   REC_AFTER_EXTRA="$(server_rec_count)"
+  if [ "$MODE" = sqlite ] && [ "$REC_AFTER_EXTRA" -le "$REC_BEFORE_EXTRA" ]; then
+    die "the extra record did not reach the server ($REC_BEFORE_EXTRA -> $REC_AFTER_EXTRA)"
+  fi
 }
 
 step_kill9() {
@@ -760,6 +791,15 @@ step_check() {
   unexpected="$(printf '%s\n' "$out" | jq -r '.checks[] | select(.level == "WARN") | .name' \
     | grep -vxE 'backup|tokens' || true)"
   [ -z "$unexpected" ] || die "unexpected WARN line(s): $unexpected"
+  # The image's data directory must be 0700 (FT2; `files` reads "/data/awm 0700, server.db 0600, ...").
+  if [ "$MODE" = image ]; then
+    local files
+    files="$(printf '%s\n' "$out" | jq -r '.checks[] | select(.name == "files") | .text')"
+    case "$files" in
+      *" 0700,"*) ;;
+      *) die "awm serve check: the data directory is not 0700 in the image (files: '$files')" ;;
+    esac
+  fi
 }
 
 step_reseed() {
