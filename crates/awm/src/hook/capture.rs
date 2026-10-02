@@ -6,7 +6,7 @@ use super::HookArgs;
 use crate::capture::{self, CaptureOpts, CaptureOutcome};
 use crate::db::{self, Role};
 use crate::matching::calibrate;
-use crate::{config, paths};
+use crate::{config, paths, sync};
 
 /// Never fails: every error path exits 0 (plan-v2 §5.4). With `AWM_DEBUG=1`
 /// errors go to stderr.
@@ -46,10 +46,15 @@ fn capture_stdin() -> anyhow::Result<()> {
     };
     if capture::run(&payload, &opts)? == CaptureOutcome::Captured {
         // §3.3 step 6: the record count has doubled since the last calibration.
-        let conn = db::open(&db_path, Role::Capture)?;
-        if calibrate::should_recalibrate(&conn)? {
-            calibrate::run(&conn)?;
-        }
+        let calibrated = db::open(&db_path, Role::Capture).and_then(|conn| {
+            if calibrate::should_recalibrate(&conn)? {
+                calibrate::run(&conn)?;
+            }
+            Ok(())
+        });
+        // Last, after the commit (RVT0 m11): the child's first write must not compete with ours.
+        sync::spawn::maybe_spawn(&opts.data_dir, &opts.config, super::now_ms());
+        calibrated?;
     }
     Ok(())
 }

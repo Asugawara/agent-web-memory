@@ -325,7 +325,8 @@ impl Env {
         let mut st = conn.prepare_cached(
             "SELECT DISTINCT ii.event_id FROM injection_item ii \
              JOIN injection i ON i.id = ii.injection_id \
-             WHERE i.session_id = ?1 AND i.agent_id IS ?2 AND i.mode IN ('inject', 'deny')",
+             WHERE i.session_id = ?1 AND i.agent_id IS ?2 AND i.mode IN ('inject', 'deny') \
+               AND ii.event_id IS NOT NULL",
         )?;
         let rows = st.query_map(params![self.input.session_id, self.input.agent_id], |r| {
             r.get(0)
@@ -639,7 +640,11 @@ pub fn deliver(env: &Env, conn: &Connection, d: Delivery<'_>) -> Result<Verdict>
     }
     let mut notes = Vec::new();
     for hit in &d.hits {
-        notes.push(matching::to_note(conn, hit, d.opts)?);
+        let note = matching::to_note(conn, hit, d.opts)?;
+        // `team.show` and `team.mute` (plan-v3-team §3.5).
+        if render::team_visible(&note, &env.config.team) {
+            notes.push(note);
+        }
     }
     let ctx = env.render_ctx(d.channel, &ref_id);
     let Some(rendered) = render::render(&notes, &ctx) else {

@@ -40,6 +40,18 @@ pub enum Relation {
     SameProject,
     /// Other session, other `cwd_hash`.
     OtherProject,
+    /// A teammate's record (`event.origin = 'team'`, another member). `handle` is from the
+    /// local roster; `same_repo` compares `repo_key` through the `project` table (§3.5).
+    Teammate { handle: String, same_repo: bool },
+    /// A record of the caller's other machine (`origin = 'team'`, the caller's own member id).
+    OwnDevice,
+}
+
+impl Relation {
+    /// The record came through team sync (`event.origin = 'team'`).
+    pub fn is_team(&self) -> bool {
+        matches!(self, Relation::Teammate { .. } | Relation::OwnDevice)
+    }
 }
 
 /// One matched record, built by `matching::to_note`.
