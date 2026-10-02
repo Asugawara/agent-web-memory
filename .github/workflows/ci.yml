@@ -93,23 +93,11 @@ jobs:
           chmod +x "$bin"
           echo "PEBBLE_BIN=$bin" >> "$GITHUB_ENV"
 
-      # scripts/check.sh runs shellcheck at its default severity, and two older scripts have
-      # info-level findings (redteam-live.sh SC2016, verify-hooks.sh SC2018/SC2019: TM30 report,
-      # F4). Until they are fixed, this step only fails on warnings and errors; the strict run
-      # of the smoke script is its own step below.
+      # check.sh runs awm-server with every feature (RVT2 M6, FT2): the Postgres cases use
+      # AWM_TEST_PG_URL (job env) and the ACME cases PEBBLE_BIN (set above). With CI=true it
+      # fails instead of printing SKIP when either is unset.
       - name: scripts/check.sh
-        env:
-          SHELLCHECK_OPTS: "--severity=warning"
         run: bash scripts/check.sh
-
-      - name: Postgres store tests (TM26)
-        run: |
-          set -euo pipefail
-          cargo test --locked -p awm-server --features pg,sqlite --test store_conformance --test store_pg
-          cargo test --locked -p awm-server --features pg,sqlite --test delete_retention --test authz
-
-      - name: ACME tests against Pebble (TM15)
-        run: cargo test --locked -p awm-server --features all --test serve_tls --test serve_check --test serve_config
 
       - name: Hook without network (TM13)
         run: |
