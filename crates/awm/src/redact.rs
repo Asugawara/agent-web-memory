@@ -10,6 +10,11 @@
 use regex::{Captures, Regex};
 use std::sync::OnceLock;
 
+/// Version of the pattern set. Bump it whenever a pattern is added or widened: the team
+/// pre-push check (plan-v3-team §4.5) re-redacts with the current patterns and reports
+/// this number with every payload it clears (`sync::eligible::Cleared::redact_version`).
+pub const VERSION: u32 = 1;
+
 struct Patterns {
     pem: Regex,
     jwt: Regex,
