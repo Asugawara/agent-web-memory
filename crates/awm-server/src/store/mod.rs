@@ -677,8 +677,9 @@ pub trait Store: Send + Sync + 'static {
 
     /// `POST /v1/members/{id}/remove`: `LastAdmin` for the only active admin; revokes the
     /// member, every device and its open invites, sets `rotation_needed`, with
-    /// `delete_records` deletes every record of the member (deletion-stream entries), audits
-    /// `member.remove`. Idempotent. Returns the number of records deleted.
+    /// `delete_records` deletes every record of the member except its `roster` records
+    /// (deletion-stream entries; TM9 F2), audits `member.remove`. Idempotent. Returns the
+    /// number of records deleted.
     fn remove_member(
         &self,
         member_id: Id,
@@ -783,11 +784,16 @@ pub trait Store: Send + Sync + 'static {
     /// `AllMine` — every held record of `by`'s member; `Member` — every held record of that
     /// member (admin only, `NotFound` for an unknown member). Each newly deleted id gets one
     /// deletion-stream entry; ids already there count in `already`. Audits `delete`.
+    ///
+    /// `roster` records are never deleted (TM9 F2; crypto §7: a joiner verifies the roster
+    /// from the genesis): `AllMine` and `Member` skip them, and `Ids` naming a held roster
+    /// record fails as a whole with `InvalidValue { field: "/ids" }`, nothing deleted.
     fn delete(&self, req: DeleteRequest, by: Actor, now: i64) -> StoreFuture<'_, DeleteResponse>;
 
     /// Retention: deletes at most `limit` records whose `received_at` is before `cutoff`,
-    /// oldest first, each with a deletion-stream entry, in one transaction. Returns how many;
-    /// TM9 loops while it returns `limit` and audits once per run with [`Store::append_audit`].
+    /// oldest first, each with a deletion-stream entry, in one transaction; `roster` records
+    /// are never selected (TM9 F1). Returns how many; TM9 loops while it returns `limit` and
+    /// audits once per run with [`Store::append_audit`].
     fn retention_batch(&self, cutoff: i64, limit: u32, now: i64) -> StoreFuture<'_, u64>;
 
     /// Removes deletion-stream entries deleted before `before` (retention + 30 days, §3.7),

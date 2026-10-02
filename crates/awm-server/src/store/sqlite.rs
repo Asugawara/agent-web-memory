@@ -766,11 +766,14 @@ fn delete_held(conn: &Connection, record_id: &str, owner: &str, now: i64) -> Sto
     Ok(true)
 }
 
-/// Deletes every held record of `member`; returns how many entries were appended.
+/// Deletes every held record of `member` except `roster` records (TM9 F2: the roster must stay
+/// verifiable from the genesis for every later joiner, crypto §7); returns how many entries
+/// were appended.
 fn delete_member_rows(conn: &Connection, member: &str, now: i64) -> StoreResult<u64> {
     let ids: Vec<String> = conn
         .prepare(
             "SELECT id FROM record WHERE member_id = ?1 AND blob IS NOT NULL \
+                AND tag <> 'roster' \
               ORDER BY device_id, tag, idx",
         )?
         .query_map([member], |r| r.get(0))?
@@ -1330,12 +1333,19 @@ fn delete_tx(
                 .collect();
             let mut held = Vec::with_capacity(ids.len());
             for id in &ids {
-                let owner: Option<String> = tx
-                    .prepare_cached("SELECT member_id FROM record WHERE id = ?1")?
-                    .query_row([id], |r| r.get(0))
+                let row: Option<(String, String)> = tx
+                    .prepare_cached("SELECT member_id, tag FROM record WHERE id = ?1")?
+                    .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
                     .optional()?;
+                let owner = row.as_ref().map(|(o, _)| o.clone());
                 if owner.as_deref().is_some_and(|o| o != caller) && !by.admin {
                     return Err(StoreError::Forbidden);
+                }
+                // TM9 F2: a roster record is never deleted (crypto §7); the whole request fails.
+                if row.as_ref().is_some_and(|(_, t)| t == "roster") {
+                    return Err(StoreError::InvalidValue {
+                        field: "/ids".into(),
+                    });
                 }
                 held.push(owner);
             }
@@ -2561,10 +2571,11 @@ impl Store for SqliteStore {
     fn retention_batch(&self, cutoff: i64, limit: u32, now: i64) -> StoreFuture<'_, u64> {
         self.write(move |tx| {
             promote_retention(tx, now)?;
+            // TM9 F1: `roster` records are never deleted by retention (crypto §7).
             let rows: Vec<(String, String)> = tx
                 .prepare(
                     "SELECT id, member_id FROM record \
-                      WHERE blob IS NOT NULL AND received_at < ?1 \
+                      WHERE blob IS NOT NULL AND received_at < ?1 AND tag <> 'roster' \
                       ORDER BY received_at, rowid LIMIT ?2",
                 )?
                 .query_map(params![cutoff, limit], |r| Ok((r.get(0)?, r.get(1)?)))?
