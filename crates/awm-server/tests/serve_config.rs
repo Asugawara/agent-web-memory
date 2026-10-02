@@ -398,9 +398,18 @@ fn behind_a_tls_proxy_the_server_listens_on_port_and_trusts_the_named_proxies() 
         vec!["127.0.0.1:8787".parse::<SocketAddr>().unwrap()]
     );
 
-    // `PORT` alone moves retention into requests, as on Cloud Run.
-    let r = resolve_with(&data_flags(Path::new("/d")), &[("PORT", "9")]).unwrap();
+    // `PORT` with `--behind-tls-proxy` moves retention into requests, as on Cloud Run.
+    let proxied = Flags {
+        data: Some("/d".into()),
+        behind_tls_proxy: true,
+        trusted_proxies: vec!["10.0.0.0/8".into()],
+        ..Flags::default()
+    };
+    let r = resolve_with(&proxied, &[("PORT", "9")]).unwrap();
     assert!(r.request_time_retention);
+    // A stray `PORT` on a host keeps the hourly task and the local sweep (plan §4.8.1).
+    let r = resolve_with(&data_flags(Path::new("/d")), &[("PORT", "9")]).unwrap();
+    assert!(!r.request_time_retention);
 }
 
 #[test]
@@ -546,6 +555,26 @@ fn every_refusal_of_4_8_1_is_exit_2() {
         });
         assert!(!m.contains("hunter2"), "{m}");
     }
+    // A retention period below the 30-day floor, in server.toml.
+    let dir = scratch("retention-floor");
+    let file = dir.join("server.toml");
+    for days in ["0", "7", "29"] {
+        write_private(&file, &format!("retention_days = {days}\n"));
+        let m = refused(&Flags {
+            config: Some(file.clone()),
+            ..base()
+        });
+        assert!(
+            m.contains("server.toml `retention_days` must be at least 30"),
+            "{days}: {m}"
+        );
+    }
+    write_private(&file, "retention_days = 30\n");
+    resolve(&Flags {
+        config: Some(file),
+        ..base()
+    })
+    .unwrap();
     // A listen address that is a host name.
     refused(&Flags {
         listen: Some("localhost:8787".into()),
@@ -1278,12 +1307,50 @@ async fn retention_runs_hourly_on_a_host_and_in_requests_on_cloud_run() {
     assert!(log.text().contains("local database copy"), "{}", log.text());
     server.stop(Duration::from_secs(1)).await;
 
-    // Request-time mode (PORT set): the server spawns no hourly task and the state says so.
+    // Request-time mode (`PORT` with `--behind-tls-proxy`): the server spawns no hourly task and
+    // the state says so.
     let dir = scratch("retention-req");
-    let r = resolve_with(&data_flags(&dir), &[("PORT", "8080")]).unwrap();
+    let flags = Flags {
+        behind_tls_proxy: true,
+        trusted_proxies: vec!["10.0.0.0/8".into()],
+        ..data_flags(&dir)
+    };
+    let r = resolve_with(&flags, &[("PORT", "0")]).unwrap();
     let server = serve::start(&r, &settings(&log)).await.unwrap();
     assert_eq!(server.state.config.retention, RetentionMode::InRequests);
     server.stop(Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn start_waits_a_second_for_a_short_lived_lock_holder_and_then_refuses() {
+    // A restart that races a short-lived holder (a forked child that inherited the descriptor,
+    // a `stop` whose lock drop is still in flight) succeeds; a real holder is exit 2.
+    let log = Arc::new(Capture::default());
+    let dir = scratch("lock-retry");
+    let lock = awm_server::lockfile::try_lock(&dir).unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        drop(lock);
+    });
+    let server = running(&data_flags(&dir), &log).await;
+    release.join().unwrap();
+    server.stop(Duration::from_secs(1)).await;
+
+    let lock = awm_server::lockfile::try_lock(&dir).unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(2));
+        drop(lock);
+    });
+    let e = serve::start(&resolve(&data_flags(&dir)).unwrap(), &settings(&log))
+        .await
+        .err()
+        .expect("a lock held for 2 s is refused");
+    assert_eq!(e.code, 2, "{e}");
+    assert!(
+        e.message.contains("server.lock") && e.message.contains("stop it first"),
+        "{e}"
+    );
+    release.join().unwrap();
 }
 
 fn find_files(dir: &Path, out: &mut Vec<PathBuf>) {

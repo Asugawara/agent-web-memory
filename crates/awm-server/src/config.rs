@@ -811,9 +811,12 @@ pub fn resolve(flags: &Flags, env: Env<'_>) -> Result<Resolved, ConfigError> {
         records_per_day: file.records_per_day,
         request_timeout_s: file.request_timeout_s,
     };
-    if overrides.retention_days == Some(0) {
+    if overrides
+        .retention_days
+        .is_some_and(|d| d < awm_proto::wire::limits::RETENTION_DAYS_MIN)
+    {
         return Err(ConfigError::refused(
-            "server.toml `retention_days` must be at least 1",
+            "server.toml `retention_days` must be at least 30",
         ));
     }
     if overrides.max_members == Some(0) {
@@ -830,7 +833,9 @@ pub fn resolve(flags: &Flags, env: Env<'_>) -> Result<Resolved, ConfigError> {
         }
     }
 
-    let request_time_retention = (behind && cloud_run) || port.is_some();
+    // `PORT` belongs to `--behind-tls-proxy` (plan §4.8.1): a stray one on a host keeps the
+    // hourly task and the local sweep.
+    let request_time_retention = behind && (cloud_run || port.is_some());
     Ok(Resolved {
         store,
         domain,
