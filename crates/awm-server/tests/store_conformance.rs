@@ -1752,6 +1752,97 @@ mod cases {
         // Quota: pushes since a time.
         assert_eq!(s.pushed_since(a.member_id, T0 + 50 * DAY).await.unwrap(), 1);
     }
+
+    /// TM9 F1 and F2: retention, `{all_mine}`, `{member}` and removal with `delete_records`
+    /// never delete `roster` records (crypto §7: every later joiner verifies the roster from
+    /// the genesis), and `{ids}` naming one fails as a whole. Other tags are deleted.
+    pub async fn roster_records_survive_retention_and_bulk_deletes(f: Fixture) {
+        let s = &*f.store;
+        let org = bootstrap(s).await;
+        let a = org.admin;
+        let roy = add_member(s, &org, "roy", 2).await;
+        let kit = add_member(s, &org, "kit", 3).await;
+        let mut roster = Vec::new();
+        for who in [&a, &roy, &kit] {
+            roster.extend(push_n(s, who, "roster", 2).await);
+            push_n(s, who, "rec", 2).await;
+            push_n(s, who, "flag", 1).await;
+        }
+        // `{ids}` naming a roster record: 400 `/ids` for the whole request, nothing deleted.
+        let mine = push_n(s, &roy, "rec", 1).await;
+        for (by, ids) in [
+            (roy, vec![mine[0], roster[2]]),
+            (a, vec![roster[4], Id::new_v4()]),
+        ] {
+            let e = s.delete(DeleteRequest::Ids(ids), by, T0).await.unwrap_err();
+            assert_eq!(
+                e,
+                StoreError::InvalidValue {
+                    field: "/ids".into()
+                }
+            );
+            is_code(&e, ErrorCode::InvalidValue, 400);
+        }
+        assert_eq!(
+            s.deletion_heads().await.unwrap().head,
+            -1,
+            "nothing deleted"
+        );
+        // The bulk scopes skip roster records.
+        let r = s.delete(DeleteRequest::AllMine, roy, T0).await.unwrap();
+        assert_eq!(
+            (r.deleted, r.already),
+            (4, 0),
+            "2 rec + 1 flag + 1 rec, no roster"
+        );
+        let r = s
+            .delete(DeleteRequest::Member(a.member_id), a, T0)
+            .await
+            .unwrap();
+        assert_eq!(r.deleted, 3);
+        assert_eq!(
+            s.remove_member(kit.member_id, true, a, T0).await.unwrap(),
+            3
+        );
+        // Retention, far in the future: nothing left but roster records, and they stay.
+        push_n(s, &a, "stats", 1).await;
+        assert_eq!(
+            s.retention_batch(T0 + 1_000 * DAY, 1_000, T0 + 1_000 * DAY)
+                .await
+                .unwrap(),
+            1,
+            "only the stats record"
+        );
+        let deleted: HashSet<Id> = s
+            .deletions(0, 1_000)
+            .await
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| e.record_id)
+            .collect();
+        assert_eq!(deleted.len(), 11);
+        for who in [&a, &roy, &kit] {
+            let items = all_records(s, who, "roster").await;
+            assert_eq!(items.len(), 2, "the roster stream is complete");
+            for (i, item) in items.iter().enumerate() {
+                match item {
+                    PulledItem::Record(r) => {
+                        assert_eq!(r.idx, i as u64);
+                        assert!(roster.contains(&r.id) && !deleted.contains(&r.id));
+                        assert_eq!(r.blob, blob(&r.id.to_string(), 1), "the blob is kept");
+                    }
+                    PulledItem::Deleted(_) => panic!("a roster record was deleted"),
+                }
+            }
+            for t in ["rec", "flag"] {
+                assert!(all_records(s, who, t)
+                    .await
+                    .iter()
+                    .all(|i| matches!(i, PulledItem::Deleted(_))));
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1776,6 +1867,7 @@ macro_rules! conformance_cases {
             settings_follow_the_retention_and_min_client_rules,
             removal_roles_and_the_last_admin,
             retention_is_bounded_oldest_first_and_prunes_keep_the_head,
+            roster_records_survive_retention_and_bulk_deletes,
         );
     };
     (@each $factory:path; $($case:ident),* $(,)?) => {

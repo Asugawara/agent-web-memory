@@ -1759,11 +1759,9 @@ async fn no_column_holds_a_token_or_secret_in_plaintext() {
 }
 
 /// FT1 hand-off: "retention never deletes `roster` records" (crypto §7: a joiner verifies the
-/// whole chain from the genesis). `Store::retention_batch` (TM6, used by TM9) selects every
-/// record older than the cutoff, roster records included, so this fails today; it is ignored
-/// and handed to TM9 / RVT2 (report "Findings").
+/// whole chain from the genesis). TM7 finding F1, fixed in TM9: `Store::retention_batch`
+/// skips `roster` records.
 #[tokio::test]
-#[ignore = "store gap handed to TM9: retention_batch deletes roster records"]
 async fn retention_never_deletes_roster_records() {
     let env = Env::new("retention");
     let s = env.s();
