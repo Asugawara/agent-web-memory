@@ -183,3 +183,37 @@ fn the_query_deny_keys_set_validate_and_clamp() {
     assert_eq!(loaded.short_circuit.query_window_minutes, 10080);
     assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
 }
+
+#[test]
+fn quota_defaults_ranges_and_set_errors() {
+    let c = Config::default();
+    assert!(c.quota.capture);
+    assert_eq!(c.quota.retention_days, 92);
+    assert_eq!(c.get("quota.capture").unwrap(), "true");
+    assert_eq!(c.get("quota.retention_days").unwrap(), "92");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "[quota]\nretention_days = 5\n").unwrap();
+    let loaded = config::load(&path).unwrap();
+    assert_eq!(loaded.quota.retention_days, 7);
+    assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+    assert!(loaded.warnings[0].contains("quota.retention_days"));
+    assert!(loaded.quota.capture);
+    std::fs::write(&path, "[quota]\nretention_days = 99999\n").unwrap();
+    assert_eq!(config::load(&path).unwrap().quota.retention_days, 3650);
+
+    let mut c = Config::default();
+    c.save(&path).unwrap();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(c.set("quota.retention_days", "3651").is_err());
+    assert!(c.set("quota.retention_days", "6").is_err());
+    assert!(c.set("quota.capture", "maybe").is_err());
+    assert_eq!(c, Config::default());
+    c.set("quota.retention_days", "7").unwrap();
+    c.set("quota.capture", "false").unwrap();
+    assert_eq!(c.get("quota.retention_days").unwrap(), "7");
+    assert_eq!(c.get("quota.capture").unwrap(), "false");
+    // The file the failed sets would have written is untouched (`save` runs after `set`).
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+}

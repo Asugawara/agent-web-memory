@@ -94,6 +94,26 @@ pub struct Review {
     pub daily_limit: u32,
 }
 
+/// Usage-limit samples from `awm statusline` (`[quota]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Quota {
+    /// `false` pauses sample capture (the status line stays installed).
+    pub capture: bool,
+    /// Days a sample is kept at least; whole months are deleted after that.
+    #[serde(deserialize_with = "de_u32")]
+    pub retention_days: u32,
+}
+
+impl Default for Quota {
+    fn default() -> Self {
+        Quota {
+            capture: true,
+            retention_days: 92,
+        }
+    }
+}
+
 /// Prices for `awm stats --savings` (`[pricing]`); never used to bill anything.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -137,6 +157,7 @@ pub struct Config {
     pub capture: CaptureConfig,
     pub review: Review,
     pub pricing: Pricing,
+    pub quota: Quota,
     /// Out-of-range values that [`load`] clamped; never written by [`Config::save`].
     #[serde(skip)]
     pub warnings: Vec<String>,
@@ -198,6 +219,7 @@ impl Default for Config {
             capture: CaptureConfig::default(),
             review: Review::default(),
             pricing: Pricing::default(),
+            quota: Quota::default(),
             warnings: Vec::new(),
         }
     }
@@ -231,6 +253,7 @@ fn range(key: &str) -> Option<(u32, u32)> {
         "inject.max_per_agent" => (0, 100),
         "hooks.deadline_ms" => (100, 2000),
         "review.daily_limit" => (1, 50),
+        "quota.retention_days" => (7, 3650),
         _ => return None,
     })
 }
@@ -268,6 +291,11 @@ impl Config {
         );
         clamp("hooks.deadline_ms", &mut self.hooks.deadline_ms, &mut w);
         clamp("review.daily_limit", &mut self.review.daily_limit, &mut w);
+        clamp(
+            "quota.retention_days",
+            &mut self.quota.retention_days,
+            &mut w,
+        );
         self.warnings.extend(w);
     }
 
@@ -311,6 +339,8 @@ impl Config {
             }
             "pricing.search_fee_per_call" => self.pricing.search_fee_per_call.to_string(),
             "pricing.main_input_per_mtok" => self.pricing.main_input_per_mtok.to_string(),
+            "quota.capture" => self.quota.capture.to_string(),
+            "quota.retention_days" => self.quota.retention_days.to_string(),
             _ => return None,
         })
     }
@@ -410,6 +440,8 @@ impl Config {
             }
             "pricing.search_fee_per_call" => self.pricing.search_fee_per_call = price(key, value)?,
             "pricing.main_input_per_mtok" => self.pricing.main_input_per_mtok = price(key, value)?,
+            "quota.capture" => self.quota.capture = flag(key, value)?,
+            "quota.retention_days" => self.quota.retention_days = number(key, value)?,
             _ => bail!("unknown configuration key: {key}"),
         }
         Ok(())

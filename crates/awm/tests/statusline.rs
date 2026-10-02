@@ -183,6 +183,21 @@ fn writes_nothing_when_mode_is_off() {
 }
 
 #[test]
+fn writes_nothing_when_quota_capture_is_false() {
+    let env = Env::new();
+    std::fs::write(env.home().join("config.toml"), "[quota]\ncapture = false\n").unwrap();
+    let o = env.run(&[], fixture("integer.json").as_bytes(), &[]);
+    assert_eq!(o.code, Some(0));
+    // The status line text is still printed.
+    assert!(o.stdout.starts_with("5h 24% ("), "{}", o.stdout);
+    assert!(!env.quota().exists());
+
+    std::fs::write(env.home().join("config.toml"), "[quota]\ncapture = true\n").unwrap();
+    assert_silent_ok(&env.quiet(&fixture("integer.json")));
+    assert_eq!(env.lines().len(), 1);
+}
+
+#[test]
 fn writes_nothing_when_the_config_does_not_parse() {
     let env = Env::new();
     std::fs::write(env.home().join("config.toml"), "mode = [\n").unwrap();

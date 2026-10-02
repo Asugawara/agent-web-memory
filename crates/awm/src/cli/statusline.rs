@@ -49,14 +49,14 @@ fn read_input() -> Option<Value> {
 }
 
 /// The `quota` directory when a sample may be written: the data dir exists, the
-/// config parses and `mode` is not `off`.
+/// config parses, `mode` is not `off` and `quota.capture` is not `false`.
 fn sample_dir() -> Option<std::path::PathBuf> {
     let data = crate::paths::data_dir().ok()?;
     if !data.is_dir() {
         return None;
     }
     let cfg = config::load(&data.join(crate::paths::CONFIG_FILE)).ok()?;
-    (cfg.mode != Mode::Off).then(|| data.join(quota::DIR))
+    (cfg.mode != Mode::Off && cfg.quota.capture).then(|| data.join(quota::DIR))
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {

@@ -1526,3 +1526,227 @@ fn review_shows_a_query_shadow_deny_with_its_reason_and_accepts_a_label() {
         .unwrap();
     assert_eq!(labels, "12,2h");
 }
+
+fn canonical_exe() -> String {
+    std::fs::canonicalize(env!("CARGO_BIN_EXE_awm"))
+        .unwrap()
+        .display()
+        .to_string()
+}
+
+fn settings_of(env: &Env) -> PathBuf {
+    let p = env.home().join(".claude/settings.json");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    p
+}
+
+#[test]
+fn setup_statusline_prints_the_whole_line_and_leaves_an_existing_status_line_alone() {
+    let env = Env::new();
+    let settings = settings_of(&env);
+    let original = json!({
+        "theme": "dark",
+        "statusLine": {"type": "command", "command": "bash ~/.claude/statusline.sh"}
+    });
+    std::fs::write(&settings, serde_json::to_string_pretty(&original).unwrap()).unwrap();
+    let before = std::fs::read(&settings).unwrap();
+
+    let out = env.awm(&["setup", "--statusline"]);
+    let text = out.ok().to_string();
+    assert_eq!(std::fs::read(&settings).unwrap(), before);
+    assert!(!settings.with_extension("json.awm-backup").exists());
+    assert!(
+        text.starts_with(
+            "You already have a status line (bash ~/.claude/statusline.sh); nothing changed. \
+             To record usage samples, add this line to your status line script right after the \
+             line that reads stdin (keep the redirect and the &):\n"
+        ),
+        "{text}"
+    );
+    let line = text.lines().nth(1).expect("the line follows");
+    let exe = line
+        .strip_prefix("printf '%s' \"$input\" | ")
+        .and_then(|l| l.strip_suffix(" statusline --quiet >/dev/null 2>&1 &"))
+        .unwrap_or_else(|| panic!("unexpected line: {line}"));
+    assert_eq!(
+        std::fs::canonicalize(exe.trim_matches('\'')).unwrap(),
+        std::fs::canonicalize(env!("CARGO_BIN_EXE_awm")).unwrap()
+    );
+    assert_eq!(text.lines().count(), 2, "{text}");
+}
+
+#[test]
+fn setup_statusline_adds_one_when_none_exists() {
+    let env = Env::new();
+    let settings = settings_of(&env);
+    std::fs::write(&settings, r#"{"theme":"dark"}"#).unwrap();
+    env.awm(&["setup", "--statusline", "--yes"]).ok();
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(v["theme"], "dark");
+    assert_eq!(v["statusLine"]["type"], "command");
+    let command = v["statusLine"]["command"].as_str().unwrap();
+    let exe = command.strip_suffix(" statusline").expect(command);
+    assert_eq!(
+        std::fs::canonicalize(exe.trim_matches('\''))
+            .unwrap()
+            .display()
+            .to_string(),
+        canonical_exe()
+    );
+    assert_eq!(v["statusLine"].as_object().unwrap().len(), 2);
+    assert_eq!(
+        std::fs::read_to_string(settings.with_extension("json.awm-backup")).unwrap(),
+        r#"{"theme":"dark"}"#
+    );
+    // A second run finds the status line and changes nothing.
+    let before = std::fs::read(&settings).unwrap();
+    assert!(env
+        .awm(&["setup", "--statusline", "--yes"])
+        .ok()
+        .contains("You already have a status line"));
+    assert_eq!(std::fs::read(&settings).unwrap(), before);
+}
+
+#[test]
+fn setup_statusline_creates_the_settings_file() {
+    let env = Env::new();
+    let settings = env.home().join(".claude/settings.json");
+    env.awm(&["setup", "--statusline", "--yes"]).ok();
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    assert!(v["statusLine"]["command"]
+        .as_str()
+        .unwrap()
+        .ends_with(" statusline"));
+}
+
+#[test]
+fn setup_statusline_refuses_without_a_terminal() {
+    let env = Env::new();
+    let settings = settings_of(&env);
+    std::fs::write(&settings, r#"{"theme":"dark"}"#).unwrap();
+    let out = env.awm(&["setup", "--statusline"]);
+    assert_ne!(out.code, Some(0));
+    assert!(out.stderr.contains("--yes"), "{}", out.stderr);
+    assert_eq!(
+        std::fs::read_to_string(&settings).unwrap(),
+        r#"{"theme":"dark"}"#
+    );
+    assert!(!settings.with_extension("json.awm-backup").exists());
+}
+
+#[test]
+fn setup_remove_statusline_removes_only_awm_s() {
+    let env = Env::new();
+    let settings = settings_of(&env);
+    for command in [
+        format!("{} statusline --quiet", canonical_exe()),
+        format!("'{}' statusline", canonical_exe()),
+        "awm statusline".to_string(),
+    ] {
+        std::fs::write(
+            &settings,
+            json!({"theme": "dark", "statusLine": {"type": "command", "command": command}})
+                .to_string(),
+        )
+        .unwrap();
+        env.awm(&["setup", "--remove-statusline", "--yes"]).ok();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v, json!({"theme": "dark"}), "{command}");
+    }
+
+    for command in [
+        "bash ~/.claude/statusline.sh",
+        "/usr/bin/other statusline",
+        "awm statusline --verbose",
+    ] {
+        let text = json!({"statusLine": {"type": "command", "command": command}}).to_string();
+        std::fs::write(&settings, &text).unwrap();
+        let out = env.awm(&["setup", "--remove-statusline", "--yes"]);
+        assert!(out.ok().contains("is not awm's"), "{}", out.stdout);
+        assert_eq!(
+            std::fs::read_to_string(&settings).unwrap(),
+            text,
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn setup_statusline_conflicts_with_hook_flags() {
+    let env = Env::new();
+    for other in [
+        "--hooks-in-settings",
+        "--remove-hooks",
+        "--codex-hooks",
+        "--remove-codex-hooks",
+    ] {
+        let out = env.awm(&["setup", "--statusline", other, "--yes"]);
+        assert_ne!(out.code, Some(0), "{other}");
+        assert!(out.stderr.contains("cannot be used with"), "{}", out.stderr);
+        let out = env.awm(&["setup", "--remove-statusline", other, "--yes"]);
+        assert_ne!(out.code, Some(0), "{other}");
+    }
+    assert_ne!(
+        env.awm(&["setup", "--statusline", "--remove-statusline", "--yes"])
+            .code,
+        Some(0)
+    );
+    assert!(!env.home().join(".claude/settings.json").exists());
+}
+
+#[test]
+fn doctor_reports_quota_samples() {
+    let env = Env::new();
+    let none = env.awm(&["doctor"]);
+    assert!(
+        none.ok().contains(
+            "quota samples: none in the last 24 h (optional; to enable: awm setup --statusline)"
+        ),
+        "{}",
+        none.stdout
+    );
+
+    let dir = env.awm_home().join("quota");
+    std::fs::create_dir_all(&dir).unwrap();
+    let now = time::OffsetDateTime::now_utc();
+    let t = i64::try_from(now.unix_timestamp_nanos() / 1_000_000).unwrap();
+    let month = now
+        .format(&time::macros::format_description!("[year]-[month]"))
+        .unwrap();
+    let line = |t: i64, sid: &str| {
+        format!("{{\"v\":1,\"t\":{t},\"sid\":\"{sid}\",\"h5\":{{\"p\":1,\"r\":9}}}}\n")
+    };
+    // Two recent lines, one older than 24 h (still in the file's tail).
+    std::fs::write(
+        dir.join(format!("samples-{month}.ndjson")),
+        format!(
+            "{}{}{}",
+            line(t - 48 * 3_600_000, "old"),
+            line(t - 600_000, "a"),
+            line(t - 120_000, "b")
+        ),
+    )
+    .unwrap();
+    let two = env.awm(&["doctor"]);
+    let text = two.ok().to_string();
+    assert!(
+        text.contains("quota samples: 2 in the last 24 h (last 2m ago)"),
+        "{text}"
+    );
+}
+
+#[test]
+fn config_list_shows_quota_keys() {
+    let env = Env::new();
+    let list = env.awm(&["config", "list"]).ok().to_string();
+    assert!(list.contains("quota.capture = true\n"), "{list}");
+    assert!(list.contains("quota.retention_days = 92\n"), "{list}");
+    env.awm(&["config", "set", "quota.capture", "false"]).ok();
+    assert_eq!(env.awm(&["config", "get", "quota.capture"]).ok(), "false\n");
+    let file = env.awm_home().join("config.toml");
+    let saved = std::fs::read_to_string(&file).unwrap();
+    for (key, bad) in [("quota.retention_days", "3651"), ("quota.capture", "maybe")] {
+        assert_ne!(env.awm(&["config", "set", key, bad]).code, Some(0));
+    }
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), saved);
+}

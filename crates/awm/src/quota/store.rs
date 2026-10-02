@@ -85,6 +85,48 @@ pub fn record(dir: &Path, s: &Sample) -> io::Result<Recorded> {
     Ok(Recorded::Written)
 }
 
+/// Samples at or after `since_ms` and the newest `t`, from the last 1 MiB of the two
+/// newest sample files (`awm doctor`).
+pub fn recent(dir: &Path, since_ms: i64) -> (usize, Option<i64>) {
+    const DOCTOR_TAIL: u64 = 1 << 20;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (0, None);
+    };
+    let mut names: Vec<_> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter(|e| e.file_name().to_str().is_some_and(is_sample_file))
+        .map(|e| e.path())
+        .collect();
+    names.sort();
+    let (mut n, mut newest) = (0, None::<i64>);
+    for path in names.iter().rev().take(2) {
+        let Ok(mut f) = std::fs::File::open(path) else {
+            continue;
+        };
+        let len = f.metadata().map_or(0, |m| m.len());
+        let start = len.saturating_sub(DOCTOR_TAIL);
+        let mut buf = Vec::new();
+        if f.seek(SeekFrom::Start(start)).is_err()
+            || f.take(DOCTOR_TAIL).read_to_end(&mut buf).is_err()
+        {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&buf);
+        let mut lines = text.lines();
+        if start > 0 {
+            lines.next();
+        }
+        for s in lines.filter_map(Sample::parse_line) {
+            newest = newest.max(Some(s.t));
+            if s.t >= since_ms {
+                n += 1;
+            }
+        }
+    }
+    (n, newest)
+}
+
 /// Every sample of every sample file, malformed lines skipped, sorted by `t`.
 pub fn read_all(dir: &Path) -> Vec<Sample> {
     let Ok(entries) = std::fs::read_dir(dir) else {

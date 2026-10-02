@@ -48,6 +48,8 @@ const KEYS: &[&str] = &[
     "pricing.summariser_output_per_mtok",
     "pricing.search_fee_per_call",
     "pricing.main_input_per_mtok",
+    "quota.capture",
+    "quota.retention_days",
 ];
 
 pub fn run(args: Args) -> anyhow::Result<()> {
