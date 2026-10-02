@@ -5,6 +5,9 @@
 ### Database migration
 - **Schema version 2** (`0002_event_agent`): adds `event.agent` (`claude` or `codex`); existing records become `claude`. Run `awm doctor` once after upgrading: it writes a backup `awm.db.bak-v1` next to the database and migrates. Until then hooks show nothing and spool their captures, and other commands ask you to run `awm doctor`; `awm doctor` migrates and then ingests the spool, so nothing captured in between is lost. An older `awm` run against the migrated database skips its captures and discards any pending spool files (that binary cannot be fixed), so run `awm doctor` with the new binary before any old one can run, and keep `~/.local/bin/awm` first in `PATH`. Rollback: install the previous `awm`, close every agent session, delete `awm.db-wal` and `awm.db-shm` if present, and copy `awm.db.bak-v1` over `awm.db`.
 
+### Changed
+- **Notes carry the full earlier result**: the `found:` line shows the whole sanitised summary (up to 8,000 characters) instead of a 200-character excerpt, and a note block and a deny reason may be up to 9,500 characters (was 2,200 and 800), under Claude Code's 10,000-character `additionalContext` cap. A note that does not fit is cut to the remaining space or dropped. A shown-but-unused note costs about 2,100 tokens (8,410 characters) instead of about 150; a full block about 2,400 tokens (9,500 characters) instead of about 550.
+
 ### Added
 - **Record web research**: Every WebSearch and WebFetch call in Claude Code (main agent and subagents) is recorded to a local SQLite database.
 - **Exact URL matching**: When an agent fetches a URL it or a sibling subagent fetched before, the earlier result is shown (precision 1.00).
