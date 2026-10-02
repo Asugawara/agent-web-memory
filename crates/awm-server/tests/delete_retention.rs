@@ -95,12 +95,15 @@ async fn sqlite_fixture() -> Option<Fixture> {
 /// per call). The cases do not change.
 #[cfg(feature = "pg")]
 async fn pg_fixture() -> Option<Fixture> {
-    let url = std::env::var("AWM_TEST_PG_URL").ok()?;
-    let _ = awm_server::store::pg::PgStore::connect;
-    panic!(
-        "TM26: build a Fixture over PgStore for AWM_TEST_PG_URL ({} bytes)",
-        url.len()
-    );
+    // A schema of its own per fixture (dropped with it); `store` is a new organisation scope.
+    #[path = "support/pg.rs"]
+    mod support;
+    let env = support::PgEnv::new("delret").await?;
+    let store = env.store.create_org(Id::new_v4()).await.unwrap();
+    Some(Fixture {
+        store,
+        _keep: Box::new(env),
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
