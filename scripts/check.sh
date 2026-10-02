@@ -14,6 +14,8 @@ cargo build -p agent-web-memory --locked --features sync,serve
 echo "step: test"
 cargo test --workspace --locked
 cargo test -p agent-web-memory --locked --features bench
+# awm-server's tests are behind its `sqlite` feature (plan-v3-team §4.1); without it they compile to nothing (TM6).
+cargo test -p awm-server --locked --features sqlite
 
 echo "step: no-network"
 tree_out="$(cargo tree -p agent-web-memory -e normal)"

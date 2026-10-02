@@ -10,6 +10,7 @@ description = "Server for awm team sync (plan-v3-team 4.1, 4.2)"
 awm-proto = { path = "../awm-proto" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha2 = "0.11.0"
 axum = "0.8.9"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "fs", "sync"] }
 tower = { version = "0.5", features = ["limit", "timeout"] }
