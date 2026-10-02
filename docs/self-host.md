@@ -10,8 +10,8 @@ Contents: [Choose a path](#choose-a-path) · [Before you start](#before-you-star
 
 | | path | you run | about | needs |
 |---|---|---|---|---|
-| A | Managed on Google Cloud (recommended) | `scripts/selfhost/gcp/cloudrun.sh --project P` in Cloud Shell | 20 min | a Google account with a billing account; no domain |
-| B | A VM on Google Cloud | `scripts/selfhost/gcp/vm.sh --project P [--domain HOST]` in Cloud Shell | 10 min | the same; a domain is optional |
+| A | Managed on Google Cloud (recommended; **not yet available (TM28)**) | `scripts/selfhost/gcp/cloudrun.sh --project P` in Cloud Shell | 20 min | a Google account with a billing account; no domain |
+| B | A VM on Google Cloud (**not yet available (TM28)**) | `scripts/selfhost/gcp/vm.sh --project P [--domain HOST]` in Cloud Shell | 10 min | the same; a domain is optional |
 | C | Any Linux host | the release binary and `deploy/systemd/awm-serve.service` | 10 min | a host with a public IPv4 address and port 443; a domain or a static address; a bucket or a second disk for backups |
 | D | docker compose on any host | `deploy/compose/docker-compose.yml` and a `.env` | 10 min | a Docker host as in C |
 
@@ -82,7 +82,25 @@ AWM_ACME_EMAIL=you@example.com
 
 `AWM_DOMAIN` can be a static IP address instead. `AWM_BACKUP` is `gs://`, `s3://` or `file:///PATH`; see [Backup](#backup). If your own TLS proxy sits in front on the same host, leave out `AWM_DOMAIN` and set `AWM_BEHIND_TLS_PROXY=1` and `AWM_TRUSTED_PROXY=127.0.0.1/32` instead; the server then listens on `127.0.0.1:8787` (plain HTTP, the default) and the proxy forwards to it.
 
-**For Postgres**: set `AWM_DATABASE_URL` to your Cloud SQL connector string or database URL. `AWM_DATABASE_INSECURE_NETWORK=1` permits a Postgres host that is not loopback, a private range or the Cloud SQL socket; without it such hosts are refused and `awm serve check` reports `WARN` when it is set.
+**For Postgres** (instead of the SQLite database in `/var/lib/awm`): the server does not read the URL from a variable of that name. `AWM_DATABASE_URL_ENV=NAME` names the variable that holds it, so put both in `serve.env`:
+
+```text
+AWM_DATABASE_URL_ENV=PG_URL
+PG_URL=postgres://awm:PASSWORD@HOST/awm
+AWM_DATABASE_URL_OWNER_ENV=PG_OWNER_URL
+PG_OWNER_URL=postgres://awm_owner:PASSWORD@HOST/awm
+AWM_BEHIND_TLS_PROXY=1
+AWM_TRUSTED_PROXY=127.0.0.1/32
+```
+
+`AWM_DATABASE_URL_OWNER_ENV` (optional) names the variable with the URL used for migrations. `--data` and a database URL are exclusive (exit 2), and the shipped unit passes `--data`, so Postgres needs a systemd drop-in that replaces `ExecStart=` with one that has no `--data`; install it in step 5 instead of changing the unit:
+
+```sh
+install -d /etc/systemd/system/awm-serve.service.d
+install -m 0644 deploy/systemd/awm-serve-postgres.conf.example /etc/systemd/system/awm-serve.service.d/postgres.conf
+```
+
+(`systemctl edit awm-serve` with the two lines of that file does the same.) Postgres also means `AWM_BEHIND_TLS_PROXY=1` and your own TLS proxy: `--domain` is refused because the ACME account and certificate live in `{data}/acme`, and there is no data directory. Leave out `AWM_DOMAIN`. In step 4 run `init` without `--data`, with the same settings loaded as in step 6 (`sh -c 'set -a; . /etc/awm/serve.env; exec sudo --preserve-env -u awm awm serve init'`). `AWM_DATABASE_INSECURE_NETWORK=1` permits a Postgres host that is not loopback, a private range or the Cloud SQL socket; without it such hosts are refused and `awm serve check` reports `WARN` when it is set.
 
 **4. Create the database and the bootstrap token.** Run this in a terminal; it prints the token once, and never into a log:
 
@@ -167,6 +185,8 @@ awm team approve alf --code 123456
 
 After the next `awm sync` on `alf`'s machine the member is in. `awm team members` and `awm team status` show the roster and the state on either machine.
 
+A background `awm sync` also runs after your agents capture, so a manual run can print `pushed 0` although everything is on the server. `awm team status` shows the last successful sync and the outbox (0 means nothing is waiting).
+
 Then do three things today:
 
 1. **Make a second admin**, so that losing your laptop is not losing the team: invite one with `awm team invite --handle second --admin`, then approve as above. The `tokens` line of the check warns while there is one admin.
@@ -219,7 +239,7 @@ Add the 30-day lifecycle rule with `gcloud storage buckets update gs://example-a
 
 **`file://`**: the target directory is created 0700, objects 0600. On Docker mount a second disk and use `AWM_BACKUP=file:///backup`; a directory inside the same volume protects against a corrupted database but not against losing the disk.
 
-**Migration copies.** Before a schema migration the server keeps `server.db.bak-vN` next to the database. They hold every record of that moment, including ones deleted later; with a backup target the server removes them after 7 days. Without one, delete them yourself once the upgrade is confirmed.
+**Migration copies.** Before a schema migration the server keeps `server.db.bak-vN` next to the database. They hold every record of that moment, including ones deleted later. The hourly task removes them by the rule under [Restore](#restore-and-re-seed) (once older than the oldest kept full snapshot, or after 8 days without a backup target); there is nothing to delete by hand.
 
 **Disk encryption**: backup objects hold the same ciphertext and metadata as the database and are not encrypted again by awm. Use an encrypted disk for the data directory and a private bucket.
 

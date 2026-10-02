@@ -453,12 +453,10 @@ srv_offline() {
   esac
 }
 
-# The state directory inside the container. The image's own /data is 0755 (the Dockerfile's
-# `COPY --from=builder /data /data` does not keep the 0700 of the builder stage), so a fresh
-# `awm serve check` FAILs on it (report TM30, finding F1). The smoke works around it by letting
-# `awm serve` create a 0700 subdirectory of the volume; AWM_SMOKE_IMAGE_DATA=/data tests the
-# image's layout as shipped.
-IMAGE_DATA="${AWM_SMOKE_IMAGE_DATA:-/data/awm}"
+# The state directory inside the container: the image's own /data, as shipped (the Dockerfile
+# copies it with --chmod=0700, so the `files` line of `awm serve check` is about /data itself).
+# AWM_SMOKE_IMAGE_DATA overrides it.
+IMAGE_DATA="${AWM_SMOKE_IMAGE_DATA:-/data}"
 DOCKER_COMMON=()
 docker_common() {
   DOCKER_COMMON=(--security-opt no-new-privileges:true --cap-drop ALL
@@ -791,7 +789,7 @@ step_check() {
   unexpected="$(printf '%s\n' "$out" | jq -r '.checks[] | select(.level == "WARN") | .name' \
     | grep -vxE 'backup|tokens' || true)"
   [ -z "$unexpected" ] || die "unexpected WARN line(s): $unexpected"
-  # The image's data directory must be 0700 (FT2; `files` reads "/data/awm 0700, server.db 0600, ...").
+  # The image's data directory must be 0700 (FT2; `files` reads "/data 0700, server.db 0600, ...").
   if [ "$MODE" = image ]; then
     local files
     files="$(printf '%s\n' "$out" | jq -r '.checks[] | select(.name == "files") | .text')"

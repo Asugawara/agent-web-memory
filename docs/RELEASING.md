@@ -11,8 +11,9 @@
 3. Tag locally: `git tag vX.Y.Z`.
 
 ## GitHub Releases
-1. Build per target with `cargo build --release --locked --target <triple>`:
+1. Build per target with `cargo build --release --locked --features sync,serve --target <triple>`:
    `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`.
+   The features are required: the default build has no `awm serve` and no `awm team`, and the self-hosting guide tells admins to download exactly this archive.
 2. Package each as `awm-<version>-<triple>.tar.gz` containing the `awm` binary and `LICENSE`.
 3. Write `SHA256SUMS` over all archives (`shasum -a 256 *.tar.gz > SHA256SUMS`).
 4. Push the tag, create the release, upload archives, `SHA256SUMS` and `install.sh`.

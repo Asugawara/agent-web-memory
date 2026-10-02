@@ -79,7 +79,38 @@ if grep -rnE 'sync::(http|push|pull)|ureq|reqwest|hyper|tokio|awm_server|object_
   echo "modules: FAILED (network code in a hook, matching or render module)"
   exit 1
 fi
+# RVT3 F16: an allow-list. In the hook-side sources the only `sync::` path is the detached spawn
+# (`sync::spawn::maybe_spawn` and `sync::spawn` module paths); the sync engine, the team code and
+# the HTTP client are out of reach.
+hook_side=(crates/awm/src/hook crates/awm/src/matching crates/awm/src/render.rs crates/awm/src/note.rs crates/awm/src/db.rs)
+if grep -rnE 'sync::|ureq|crate::team|cli::sync' "${hook_side[@]}" \
+  | sed -E 's/(std|core)::sync:://g; s/sync::spawn//g' \
+  | grep -E 'sync::|ureq|crate::team|cli::sync'; then
+  echo "modules: FAILED (a hook-side source reaches past sync::spawn: sync::, ureq, crate::team or cli::sync)"
+  exit 1
+fi
 echo "modules: ok"
+
+# RVT3 F1: every AWM_* name the operator-facing text mentions is read by the server, the image or
+# the compose file. Names of other tools are allow-listed.
+echo "step: docs-env"
+doc_names="$(grep -rhoE 'AWM_[A-Z_]+' docs/self-host.md deploy README.md | sort -u)"
+known_in="crates/awm/src/cli/serve.rs Dockerfile deploy/compose/docker-compose.yml"
+unknown=""
+for name in $doc_names; do
+  case "$name" in
+    AWM_HOME | AWM_SMOKE_* | AWM_IMAGE | AWM_BIN) continue ;;
+  esac
+  # shellcheck disable=SC2086
+  if ! grep -qw -- "$name" $known_in; then
+    unknown="$unknown $name"
+  fi
+done
+if [ -n "$unknown" ]; then
+  echo "docs-env: FAILED (documented but not read by serve.rs, Dockerfile or the compose file:$unknown)"
+  exit 1
+fi
+echo "docs-env: ok"
 
 echo "step: licenses"
 if command -v cargo-deny >/dev/null 2>&1; then
