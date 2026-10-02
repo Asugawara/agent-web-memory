@@ -261,27 +261,17 @@ pub fn approve_pending(
     Ok(approved)
 }
 
-/// Whether the current epoch's key has reached a device the verified roster now revokes, by the
-/// client's own records rather than the server's `rotation_needed` (`docs/sync-v1.md` §5.2,
-/// RVT2 M3). Either the current epoch's verified `epoch` entry lists a device that is now
-/// revoked (the revocation came after the rotation), or a revocation the verified roster applies
-/// is dated after that entry (`revoked_at` > `created_at`: a device approved after the rotation
-/// got the key with its approval wraps). Under epoch 0 there is no `epoch` entry, so any applied
-/// revocation counts. Both dates are inside sealed roster plaintexts, so the server can neither
-/// forge nor re-date them; it can only withhold them, which this device's own `roster_record`
-/// rows survive. The sealing epoch is no order: a revocation queued before a rotation is re-sealed
-/// under the new epoch when its push meets 409 `stale_epoch` (§9.3).
-pub fn revoked_since_current_epoch(
+/// The dates of the verified roster that decide a rotation: the `created_at` of the current
+/// epoch's applied `epoch` entry (`None` under epoch 0, or when this device never saw it) and the
+/// `revoked_at` of every revocation the verified roster applies (a rejected entry naming an
+/// active member or device does not count).
+fn epoch_dates(
     conn: &Connection,
     ring: &awm_proto::keys::KeyRing,
     roster: &Roster,
-) -> Result<bool> {
+) -> Result<(Option<i64>, Vec<i64>)> {
     let current = ring.current_epoch();
-    let revoked_device = |d| roster.device(d).is_some_and(|d| d.revoked);
     let listed = roster.epoch_devices(current);
-    if listed.is_some_and(|devices| devices.iter().any(|d| revoked_device(*d))) {
-        return Ok(true);
-    }
     let mut epoch_at: Option<i64> = None;
     let mut revoked_at = Vec::new();
     for b in blobs(conn)? {
@@ -316,10 +306,8 @@ pub fn revoked_since_current_epoch(
                 revoked_at: at,
                 ..
             } => {
-                // Only a revocation the verified roster applies counts (a rejected entry naming
-                // an active member or device does not).
                 let applied = match device_id {
-                    Some(d) => revoked_device(d),
+                    Some(d) => roster.device(d).is_some_and(|d| d.revoked),
                     None => roster.member(member_id).is_some_and(|m| m.revoked),
                 };
                 if applied {
@@ -329,12 +317,62 @@ pub fn revoked_since_current_epoch(
             _ => {}
         }
     }
+    Ok((epoch_at, revoked_at))
+}
+
+/// Whether the current epoch's key has reached a device the verified roster now revokes, by the
+/// client's own records rather than the server's `rotation_needed` (`docs/sync-v1.md` §5.2,
+/// RVT2 M3). Either the current epoch's verified `epoch` entry lists a device that is now
+/// revoked (the revocation came after the rotation, whatever its date), or a revocation the
+/// verified roster applies is dated at or after that entry (`revoked_at >= created_at`: a device
+/// approved after the rotation got the key with its approval wraps). Under epoch 0 there is no
+/// `epoch` entry, so any applied revocation counts.
+///
+/// The `>=` relies on the rule of [`rotation_created_at`]: a rotation dates its entry after every
+/// revocation it covers, so a covered revocation is always strictly older than the entry, also
+/// when the revoking admin's clock runs ahead of the rotating admin's (RVT3 F6, §5). Both dates
+/// are inside sealed roster plaintexts, so the server can neither forge nor re-date them; it can
+/// only withhold them, which this device's own `roster_record` rows survive. The sealing epoch is
+/// no order: a revocation queued before a rotation is re-sealed under the new epoch when its push
+/// meets 409 `stale_epoch` (§9.3).
+pub fn revoked_since_current_epoch(
+    conn: &Connection,
+    ring: &awm_proto::keys::KeyRing,
+    roster: &Roster,
+) -> Result<bool> {
+    let current = ring.current_epoch();
+    let revoked_device = |d| roster.device(d).is_some_and(|d| d.revoked);
+    let listed = roster.epoch_devices(current);
+    if listed.is_some_and(|devices| devices.iter().any(|d| revoked_device(*d))) {
+        return Ok(true);
+    }
+    let (epoch_at, revoked_at) = epoch_dates(conn, ring, roster)?;
     Ok(match epoch_at {
-        Some(t) => revoked_at.iter().any(|&at| at > t),
+        Some(t) => revoked_at.iter().any(|&at| at >= t),
         // Epoch 0, or an epoch whose entry this device never saw: the key predates every
         // revocation it holds.
         None => !revoked_at.is_empty(),
     })
+}
+
+/// The `created_at` of a new `epoch` entry: `max(now_s, latest applied revoked_at + 1)`, so every
+/// revocation the verified roster applies (all of which the rotation covers: `plan_rotation`
+/// wraps to no revoked device) is strictly older than the entry, and
+/// [`revoked_since_current_epoch`] can use `>=` without rotating again (`docs/sync-v1.md` §5.2;
+/// RVT3 F6). `awm team remove` revokes and rotates in the same second; a revocation dated ahead
+/// of this device's clock moves the entry's date with it instead of asking for a rotation a
+/// minute until the clock catches up.
+pub fn rotation_created_at(
+    conn: &Connection,
+    ring: &awm_proto::keys::KeyRing,
+    roster: &Roster,
+    now_s: i64,
+) -> Result<i64> {
+    let (_, revoked_at) = epoch_dates(conn, ring, roster)?;
+    Ok(revoked_at
+        .iter()
+        .map(|&at| at.saturating_add(1))
+        .fold(now_s, i64::max))
 }
 
 /// Rotates the epoch key when this device is an admin and either the server says so or the
@@ -387,11 +425,12 @@ pub fn rotate_if_needed(s: &mut Session<'_>) -> Result<bool> {
             crate::sync::state::bump(&s.conn, &format!("dropped.{name}"), n as i64)?;
         }
     }
+    let created_at = rotation_created_at(&s.conn, &s.ring, &s.roster, s.now_ms() / 1_000)?;
     let rotation = rotate(
         &s.ring,
         &plan,
         *s.ident.team.device_id.as_uuid(),
-        s.now_ms() / 1_000,
+        created_at,
     )
     .map_err(|e| anyhow::anyhow!("rotation: {e}"))?;
     let req = RotateRequest {

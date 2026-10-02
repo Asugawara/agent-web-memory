@@ -546,10 +546,11 @@ fn a_thousand_team_rows_change_no_local_metric() {
     let (ca, cb) = (cut(&plain), cut(&loaded));
     assert_eq!(ca, cb);
     assert!(!ca.contains("defaults in use"), "{ca}");
-    // ... and the scratch copy is gone.
-    let leftovers: Vec<_> = std::fs::read_dir(loaded.awm_home())
-        .unwrap()
-        .flatten()
+    // ... and the scratch copy is gone; it was made in tmp/ (RVT3 F7).
+    assert!(loaded.awm_home().join("tmp").is_dir());
+    let leftovers: Vec<_> = [loaded.awm_home(), loaded.awm_home().join("tmp")]
+        .iter()
+        .flat_map(|d| std::fs::read_dir(d).unwrap().flatten())
         .filter(|e| e.file_name().to_string_lossy().contains("calibrate"))
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");

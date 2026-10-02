@@ -219,6 +219,12 @@ pub fn status_report(dir: &std::path::Path) -> anyhow::Result<serde_json::Value>
     imp::status_value(dir)
 }
 
+/// Prints `awm team status [--json]` for `dir` (`awm sync --status` prints the same).
+#[cfg(feature = "sync")]
+pub fn print_status(dir: &std::path::Path, json: bool) -> anyhow::Result<()> {
+    imp::print_status(dir, json)
+}
+
 /// `awm team leave --delete` on `dir`, the first step of `awm purge --all` (TM11, §3.6).
 #[cfg(feature = "sync")]
 pub fn leave_delete(dir: &std::path::Path) -> anyhow::Result<()> {
@@ -301,7 +307,7 @@ mod imp {
                 Some(id) => unshare_record(&ctx, &id),
                 None => unshare(&ctx, path, delete),
             },
-            Sub::Status { json } => status(&ctx, json),
+            Sub::Status { json } => print_status(ctx.dir(), json),
             Sub::Leave { delete } => leave(&ctx, delete),
             Sub::DeleteMine => delete_mine(&ctx),
             Sub::Move { url } => move_to(&ctx, &url),
@@ -1606,8 +1612,8 @@ mod imp {
         Ok(v)
     }
 
-    fn status(ctx: &Ctx, json_out: bool) -> Result<()> {
-        let v = status_value(ctx.dir())?;
+    pub fn print_status(dir: &Path, json_out: bool) -> Result<()> {
+        let v = status_value(dir)?;
         if v["in_team"] == json!(false) {
             if json_out {
                 println!("{}", json!({ "in_team": false }));

@@ -760,8 +760,9 @@ pub enum SendStop {
 
 /// Sends the stored items `keys` in order, in requests of at most 100 items and 1.4 MB, and
 /// does the bookkeeping. Handles 409 `stale_epoch`, 410 `deleted`, 409 `id_conflict` and
-/// 409 `stream_conflict` as `docs/sync-v1.md` §9.3 says; every other failure is returned with
-/// the outbox untouched.
+/// 409 `stream_conflict` as `docs/sync-v1.md` §9.3 says; a single-item request refused with
+/// 400, 403, 413 or 422 drops that item (`dropped.push_rejected`); every other failure is
+/// returned with the outbox untouched.
 pub fn send_keys(
     s: &mut Session<'_>,
     keys: &[(String, u64)],
@@ -795,6 +796,7 @@ pub fn send_keys(
         }
         let batch = &rest[..take];
         let mut tries = 0;
+        let mut rejected = false;
         loop {
             tries += 1;
             let mut records = Vec::with_capacity(batch.len());
@@ -809,7 +811,42 @@ pub fn send_keys(
                         bail!("injected crash after the server acknowledged the push");
                     }
                     finish(s, batch)?;
-                    sent += batch.len();
+                    if !rejected {
+                        sent += batch.len();
+                    }
+                    break;
+                }
+                Err(e) if batch.len() == 1 && matches!(e.status(), Some(400 | 403 | 413 | 422)) => {
+                    // One item the server refuses for good would block every later push of this
+                    // device (RVT3 F17): it is dropped, counted and logged once, and becomes a
+                    // marker at the same idx so the stream stays contiguous (§9.3). A refused
+                    // marker drops the outbox row.
+                    let (tag, idx) = &batch[0];
+                    let p = load_pending(&s.conn, tag, *idx)?;
+                    if !rejected {
+                        rejected = true;
+                        state::bump(&s.conn, "dropped.push_rejected", 1)?;
+                        s.report.rejected += 1;
+                        if !s.opts.quiet {
+                            eprintln!(
+                                "awm sync: the server refused {tag} {idx} (record {}) with {}: dropped",
+                                p.as_ref().map_or_else(|| "-".to_string(), |p| p.id.to_string()),
+                                e.status().unwrap_or(0),
+                            );
+                        }
+                    }
+                    if p.is_some_and(|p| p.blob.is_some()) {
+                        s.conn.execute(
+                            "UPDATE sync_own SET deleted = 1, blob = NULL, epoch = NULL \
+                             WHERE tag = ?1 AND idx = ?2",
+                            params![tag, *idx as i64],
+                        )?;
+                        continue;
+                    }
+                    s.conn.execute(
+                        "DELETE FROM sync_outbox WHERE ref = ?1",
+                        [format!("{tag}:{idx}")],
+                    )?;
                     break;
                 }
                 Err(e) if tries < 4 => match (e.status(), e.code()) {
@@ -1062,6 +1099,8 @@ pub fn run(s: &mut Session<'_>) -> Result<usize> {
     let may_queue = !delayed(s, &scan) && s.report.push_blocked.is_none();
     if may_queue {
         queue_records(s, &mut scan)?;
+    } else {
+        s.report.unqueued = scan.candidates.len();
     }
     state::set_skipped(&s.conn, &scan.counts)?;
     s.report.skipped = scan.counts.clone();

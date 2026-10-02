@@ -1151,8 +1151,8 @@ fn rewrite_event(conn: &Connection, id: i64, u: &UrlTarget) -> anyhow::Result<()
     Ok(())
 }
 
-/// Step 6: backups `{db}.bak-v*` (also unfinished `.tmp` copies) and the
-/// `*.json` files of `spool/`. A `spool` that is not a real directory (a
+/// Step 6: backups `{db}.bak-v*` (also unfinished `.tmp` copies), stale
+/// calibration copies in `tmp/` and the `*.json` files of `spool/`. A `spool` that is not a real directory (a
 /// symlink) is not followed.
 fn cleanup_files(data_dir: &Path, d: &mut Deleted) -> anyhow::Result<()> {
     let prefix = format!("{}.bak-v", paths::DB_FILE);
@@ -1165,6 +1165,9 @@ fn cleanup_files(data_dir: &Path, d: &mut Deleted) -> anyhow::Result<()> {
             }
         }
     }
+    // Calibration copies a killed process left in `tmp/` (RVT3 F7).
+    d.backups
+        .extend(crate::matching::calibrate::sweep_stale_copies(data_dir)?);
     d.backups.sort();
     let spool = data_dir.join(paths::SPOOL_DIR);
     if !std::fs::symlink_metadata(&spool).is_ok_and(|m| m.is_dir()) {
@@ -1188,6 +1191,15 @@ fn spool_file(e: &std::fs::DirEntry) -> bool {
         && Path::new(&e.file_name())
             .extension()
             .is_some_and(|x| x == "json")
+}
+
+/// A calibration copy in `tmp/`: a regular file named `awm.db.calibrate-*`
+/// (with its journal files; RVT3 F7).
+fn tmp_file(e: &std::fs::DirEntry) -> bool {
+    e.file_type().is_ok_and(|t| t.is_file())
+        && e.file_name()
+            .to_str()
+            .is_some_and(crate::matching::calibrate::is_copy_name)
 }
 
 /// A usage sample in `quota/`: a regular file named `samples-YYYY-MM.ndjson`
@@ -1425,13 +1437,15 @@ fn foreign_entries(dir: &Path) -> anyhow::Result<Vec<String>> {
 }
 
 /// The files a real directory of the data dir may hold, by its name: `spool/`
-/// holds [`spool_file`]s and `quota/` holds [`quota_file`]s. `None` for any
-/// other directory, which is foreign.
+/// holds [`spool_file`]s, `quota/` holds [`quota_file`]s and `tmp/` holds
+/// [`tmp_file`]s. `None` for any other directory, which is foreign.
 fn dir_filter(name: &str) -> Option<fn(&std::fs::DirEntry) -> bool> {
     if name == paths::SPOOL_DIR {
         Some(spool_file)
     } else if name == crate::quota::DIR {
         Some(quota_file)
+    } else if name == paths::TMP_DIR {
+        Some(tmp_file)
     } else {
         None
     }

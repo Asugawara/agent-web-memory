@@ -200,13 +200,15 @@ pub fn remove_team_backups(data_dir: &Path) -> Result<Vec<PathBuf>> {
 pub struct Scrub {
     /// Backups deleted (schema 3 or higher).
     pub backups: Vec<PathBuf>,
+    /// Stale calibration copies deleted from `tmp/` (RVT3 F7).
+    pub copies: Vec<PathBuf>,
     /// FTS `optimize` and `wal_checkpoint(TRUNCATE)` ran in this call.
     pub scrubbed: bool,
 }
 
 /// The end of the deleting part of an `awm sync` run. When `deleted` rows went (remote
-/// deletions, retention, a reconcile): the backups taken at schema 3 or higher are deleted and
-/// a scrub is noted as pending. A pending scrub (FTS `optimize`, then
+/// deletions, retention, a reconcile): the backups taken at schema 3 or higher and the stale
+/// calibration copies are deleted and a scrub is noted as pending. A pending scrub (FTS `optimize`, then
 /// `wal_checkpoint(TRUNCATE)`) runs at most once a day ([`LAST_SCRUB`]), never on every run:
 /// `optimize` rewrites the whole index and would hold the write lock the hooks wait for. Marks
 /// older than `retention_days` + 30 days are dropped (no re-seed sends those tombstones).
@@ -220,6 +222,7 @@ pub fn after_deletions(
     let mut out = Scrub::default();
     if deleted > 0 {
         out.backups = remove_team_backups(data_dir)?;
+        out.copies = crate::matching::calibrate::sweep_stale_copies(data_dir)?;
         state::set(conn, SCRUB_PENDING, "1")?;
     }
     if let Some(days) = retention_days {

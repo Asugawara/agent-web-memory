@@ -1827,3 +1827,163 @@ fn purge_all_removes_a_quota_symlink_but_not_its_target() {
         "mine"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Calibration copies in tmp/ (RVT3 F7)
+
+/// 50 local records with query text and one teammate row: calibration then makes its copy.
+fn seed_for_calibration(env: &Env) {
+    let conn = env.conn();
+    for i in 0..50 {
+        let q = format!(
+            "sqlite fts5 bm25 column weights topic{} ranking{}",
+            i % 7,
+            i % 5
+        );
+        conn.execute(
+            "INSERT INTO event (tool_use_id, tool, session_id, cwd_hash, created_at, query, \
+               status, summary, match_text, source) \
+             VALUES (?1, 'WebSearch', 'sess-cal', 'c1', ?2, ?3, 'ok', 'Weights.', ?3, 'hook')",
+            params![format!("toolu_cal_{i}"), NOW - 1_000_000 + i * 1_000, q],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO event (tool_use_id, tool, session_id, cwd_hash, created_at, query, status, \
+           summary, match_text, source, origin, member, sync_id, shareable) \
+         VALUES ('team:1', 'WebSearch', 'team:00000000-0000-4000-8000-0000000000a1', '', ?1, \
+           'sqlite fts5 teammate', 'ok', 'Teammate.', 'sqlite fts5 teammate', 'hook', 'team', \
+           '00000000-0000-4000-8000-0000000000a1', 'sync-1', 'full')",
+        [NOW - 500],
+    )
+    .unwrap();
+}
+
+fn now_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+}
+
+/// The pid of a process that has exited.
+fn dead_pid() -> u32 {
+    let mut child = Command::new("true").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    pid
+}
+
+/// Writes `tmp/awm.db.calibrate-{pid}-{nanos}` (and `suffixes` journal files) with teammate text.
+fn leave_copy(env: &Env, pid: u32, nanos: u128, suffixes: &[&str]) -> Vec<PathBuf> {
+    let dir = env.data().join("tmp");
+    std::fs::create_dir_all(&dir).unwrap();
+    let base = format!("awm.db.calibrate-{pid}-{nanos}");
+    let mut out = Vec::new();
+    for s in std::iter::once(&"").chain(suffixes) {
+        let p = dir.join(format!("{base}{s}"));
+        std::fs::write(&p, "a full copy with sqlite fts5 teammate rows").unwrap();
+        out.push(p);
+    }
+    out
+}
+
+fn tmp_names(env: &Env) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(env.data().join("tmp"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn a_calibration_copy_of_a_dead_process_goes_at_the_next_calibration_and_purge_all_deletes_tmp() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    seed_for_calibration(&env);
+    let dead = leave_copy(&env, dead_pid(), now_nanos(), &["-journal"]);
+    let me = std::process::id();
+    let live = leave_copy(&env, me, now_nanos(), &[]);
+    let old = leave_copy(&env, me, now_nanos() - 2 * 3_600 * 1_000_000_000, &["-wal"]);
+    std::fs::set_permissions(
+        env.data().join("tmp"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    let (code, out, err) = env.awm(&["calibrate"]);
+    assert_eq!(code, Some(0), "{out}{err}");
+    assert!(!out.contains("defaults in use"), "the copy was made: {out}");
+    for p in dead.iter().chain(&old) {
+        assert!(!p.exists(), "stale: {}", p.display());
+    }
+    // A running calibration's copy stays; this run's own copy is gone.
+    assert_eq!(
+        tmp_names(&env),
+        [live[0].file_name().unwrap().to_string_lossy().into_owned()]
+    );
+    let mode = std::fs::metadata(env.data().join("tmp"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o700);
+
+    // purge --all deletes tmp/ and every copy in it, live or not.
+    leave_copy(&env, dead_pid(), now_nanos(), &["-shm"]);
+    let (code, out, err) = env.awm(&["purge", "--all", "--yes"]);
+    assert_eq!(code, Some(0), "{out}{err}");
+    assert!(!out.contains("did not create"), "{out}");
+    assert!(!env.data().exists(), "{out}");
+}
+
+#[test]
+fn uninstall_deletes_the_tmp_directory_with_its_calibration_copies() {
+    let env = Env::new();
+    leave_copy(&env, std::process::id(), now_nanos(), &["-journal"]);
+    let (code, out, err) = env.awm(&["uninstall", "--yes"]);
+    assert_eq!(code, Some(0), "{out}{err}");
+    assert!(!env.data().exists(), "{out}");
+}
+
+#[test]
+fn purge_all_refuses_a_file_in_tmp_that_is_not_a_calibration_copy() {
+    let env = Env::new();
+    std::fs::create_dir_all(env.data().join("tmp")).unwrap();
+    std::fs::write(env.data().join("tmp/notes.txt"), "mine").unwrap();
+    let (code, out, err) = env.awm(&["purge", "--all", "--yes"]);
+    assert_eq!(code, Some(2), "{out}{err}");
+    assert!(
+        out.contains("entries awm did not create: tmp/notes.txt."),
+        "{out}"
+    );
+    assert!(env.db_path().exists());
+}
+
+#[test]
+fn forget_and_a_remote_deletion_remove_stale_calibration_copies_and_keep_a_live_one() {
+    let env = Env::new();
+    let me = std::process::id();
+    let live = leave_copy(&env, me, now_nanos(), &[]);
+    let dead = leave_copy(&env, dead_pid(), now_nanos(), &["-journal"]);
+    let (outcome, out) = env.forget(forget_url(URL));
+    assert_eq!(outcome, Outcome::Done, "{out}");
+    for p in &dead {
+        assert!(!p.exists(), "{}", p.display());
+        assert!(out.contains(&p.display().to_string()), "{out}");
+    }
+    assert!(live[0].exists());
+
+    // The scrub after a remote deletion (`awm sync`) follows the same rule.
+    let dead = leave_copy(&env, dead_pid(), now_nanos(), &[]);
+    let conn = env.conn();
+    let scrub = awm::sync::apply::after_deletions(&conn, &env.data(), 1, None, NOW).unwrap();
+    assert_eq!(scrub.copies, dead);
+    assert!(live[0].exists());
+    // Nothing deleted: nothing swept.
+    let dead = leave_copy(&env, dead_pid(), now_nanos(), &[]);
+    let scrub = awm::sync::apply::after_deletions(&conn, &env.data(), 0, None, NOW).unwrap();
+    assert!(scrub.copies.is_empty());
+    assert!(dead[0].exists());
+}

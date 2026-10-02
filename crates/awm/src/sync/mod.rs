@@ -16,6 +16,9 @@
 //! 7. push: the outbox, the eligible rows, the deletions (`push`);
 //! 8. `sync_state` (`state`): `last_ok` or `last_error` and the backoff.
 //!
+//! `--push-only` skips step 5 and `--pull-only` steps 6 and 7 (`Opts`); the re-seed of step 4
+//! runs in both, as it repairs a restored server rather than sending anything new.
+//!
 //! The reading steps come before the push (the plan lists the push first): a device must hold
 //! the verified roster before it may push content (sync-v1 §5.2, `check_own_approval`), and an
 //! admin that rotates first never meets a 409 `stale_epoch` of its own making.
@@ -102,6 +105,10 @@ mod engine {
         pub backfill: Option<Backfill>,
         /// With `backfill`: count what would be shared, send nothing, open no connection.
         pub dry_run: bool,
+        /// `awm sync --push-only`: skip step 5 (pull, deletion stream, retention).
+        pub push_only: bool,
+        /// `awm sync --pull-only`: skip steps 6 and 7 (approvals, rotation, push).
+        pub pull_only: bool,
         /// Tests: stop after the server acknowledged a push, before `pushed_at` is written.
         #[doc(hidden)]
         pub crash_after_ack: bool,
@@ -134,6 +141,18 @@ mod engine {
         /// Rows of every transaction that applied deletion entries or dropped team rows
         /// (retention, reconcile): at most `apply::CHUNK_ROWS` each (TM11).
         pub delete_tx_rows: Vec<usize>,
+        /// The most rows any write transaction of the record or the deletion path held: at most
+        /// `apply::CHUNK_ROWS` (RVT3 F18).
+        pub max_rows_per_txn: usize,
+        /// Items the server refused for good (400, 403, 413, 422 on a single-item push): dropped
+        /// as markers, counted in `dropped.push_rejected` (RVT3 F17).
+        pub rejected: usize,
+        /// `sync_state.last_ok` before this run (`awm sync` after `pushed 0`, RVT3 F21).
+        pub previous_ok_ms: Option<i64>,
+        /// Rows left in `sync_outbox` when the run finished.
+        pub outbox_left: usize,
+        /// Eligible rows this run did not queue (`team.push_delay_s`, or pushes stopped).
+        pub unqueued: usize,
         pub pull_ms: u64,
     }
 
@@ -289,8 +308,16 @@ mod engine {
             keys_refreshed: false,
             report: Report::default(),
         };
+        let previous_ok = state::get_i64(&s.conn, state::LAST_OK)?;
         match session(&mut s) {
             Ok(()) => {
+                s.report.previous_ok_ms = previous_ok;
+                s.report.outbox_left = s
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM sync_outbox", [], |r| {
+                        r.get::<_, i64>(0)
+                    })?
+                    .max(0) as usize;
                 state::record_success(&s.conn, real_now(env))?;
                 Ok(Outcome::Done(s.report))
             }
@@ -389,20 +416,26 @@ mod engine {
             }
         }
 
-        pull::run(s)?;
-        let before = state::get(&s.conn, "reconciled_notice")?;
-        pull::apply_deletions(s)?;
-        if before.is_none() && state::get(&s.conn, "reconciled_notice")?.is_some() {
-            s.report.reconciled = true;
+        if !s.opts.push_only {
             pull::run(s)?;
+            let before = state::get(&s.conn, "reconciled_notice")?;
+            pull::apply_deletions(s)?;
+            if before.is_none() && state::get(&s.conn, "reconciled_notice")?.is_some() {
+                s.report.reconciled = true;
+                pull::run(s)?;
+            }
+            let expired = pull::prune_retention(s)?;
+            // Backups at schema 3+ go after a remote deletion; FTS optimize at most once a day
+            // (TM11).
+            let deleted = s.report.deletions_applied + expired + usize::from(s.report.reconciled);
+            let days = s.status.as_ref().map(|st| st.settings.retention_days);
+            let now = s.now_ms();
+            crate::sync::apply::after_deletions(&s.conn, &s.env.data_dir, deleted, days, now)?;
+            s.roster = roster::verify_and_store(&s.conn, &s.ring, now)?.0;
         }
-        let expired = pull::prune_retention(s)?;
-        // Backups at schema 3+ go after a remote deletion; FTS optimize at most once a day (TM11).
-        let deleted = s.report.deletions_applied + expired + usize::from(s.report.reconciled);
-        let days = s.status.as_ref().map(|st| st.settings.retention_days);
-        let now = s.now_ms();
-        crate::sync::apply::after_deletions(&s.conn, &s.env.data_dir, deleted, days, now)?;
-        s.roster = roster::verify_and_store(&s.conn, &s.ring, now)?.0;
+        if s.opts.pull_only {
+            return Ok(());
+        }
 
         let decide: ApproveFn = s.opts.approve.unwrap_or(crate::team::auto_approve);
         s.report.approvals += roster::approve_pending(s, &decide)?;

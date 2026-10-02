@@ -1,5 +1,8 @@
-//! `awm sync [--once] [--quiet] [--backfill --since DATE --project P [--dry-run]]`
-//! (plan-v3-team §4.6, §4.8; TM10).
+//! `awm sync [--once] [--quiet] [--push-only | --pull-only] [--status]
+//! [--backfill --since DATE --project P [--dry-run]]` (plan-v3-team §4.6, §4.8; TM10).
+//!
+//! `--push-only` and `--pull-only` skip the other phase of the run (both still take
+//! `sync.lock`); `--status` prints what `awm team status` prints and does not sync (RVT3 F5).
 //!
 //! Exit codes: 0 when the run finished, when another run holds the lock, when a hook-started run
 //! waits out a backoff, and when the database is not at this build's schema in a `--quiet` run;
@@ -14,6 +17,15 @@ pub struct Args {
     /// Print nothing; a failure is only the exit status and `sync_state`
     #[arg(long)]
     pub quiet: bool,
+    /// Send only: skip the pull, the deletion stream and retention
+    #[arg(long, conflicts_with = "pull_only")]
+    pub push_only: bool,
+    /// Receive only: skip approvals, the key rotation and the push
+    #[arg(long)]
+    pub pull_only: bool,
+    /// Print what `awm team status` prints and do not sync
+    #[arg(long, conflicts_with_all = ["push_only", "pull_only", "backfill", "quiet"])]
+    pub status: bool,
     /// Share older records of the projects named with --project (their share rules must exist)
     #[arg(long)]
     pub backfill: bool,
@@ -37,7 +49,12 @@ pub fn run(_args: Args) -> anyhow::Result<()> {
 pub fn run(args: Args) -> anyhow::Result<()> {
     use crate::sync::{self, Backfill, Env, Opts, Outcome};
 
+    if args.status {
+        let env = Env::from_environment()?;
+        return super::team::print_status(&env.data_dir, false);
+    }
     let quiet = args.quiet;
+    let pull_only = args.pull_only;
     let result = (|| -> anyhow::Result<Outcome> {
         let env = Env::from_environment()?;
         let backfill = if args.backfill {
@@ -56,6 +73,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             honour_backoff: quiet,
             backfill,
             dry_run: args.dry_run,
+            push_only: args.push_only,
+            pull_only: args.pull_only,
             ..Opts::default()
         };
         // A joined device takes its keys once approved (TM12); until then there is nothing to do.
@@ -79,7 +98,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         Ok(Outcome::Refused(why)) if !quiet => Err(anyhow::anyhow!(why)),
         Ok(outcome) => {
             if !quiet {
-                print_outcome(&outcome);
+                print_outcome(&outcome, pull_only);
             }
             Ok(())
         }
@@ -114,7 +133,7 @@ fn project_values(projects: &[String]) -> Vec<String> {
 }
 
 #[cfg(feature = "sync")]
-fn print_outcome(outcome: &crate::sync::Outcome) {
+fn print_outcome(outcome: &crate::sync::Outcome, pull_only: bool) {
     use crate::sync::Outcome;
     match outcome {
         Outcome::Locked => println!("another awm sync is running"),
@@ -134,7 +153,7 @@ fn print_outcome(outcome: &crate::sync::Outcome) {
                 return;
             }
             println!(
-                "synced: pushed {}, pulled {}{}{}",
+                "synced: pushed {}, pulled {}{}{}{}",
                 r.pushed,
                 r.pulled,
                 if r.dropped > 0 {
@@ -146,8 +165,32 @@ fn print_outcome(outcome: &crate::sync::Outcome) {
                     format!(", quarantined {} (flags sent)", r.quarantined)
                 } else {
                     String::new()
+                },
+                if r.rejected > 0 {
+                    format!(
+                        ", rejected {} (refused by the server, not sent)",
+                        r.rejected
+                    )
+                } else {
+                    String::new()
                 }
             );
+            // A hook-spawned run has usually pushed already: say so instead of a bare 0 (F21).
+            if r.pushed == 0 && !pull_only {
+                let n = r.outbox_left + r.unqueued;
+                let waiting = if n == 0 {
+                    "nothing waiting".to_string()
+                } else {
+                    format!("{n} item(s) waiting")
+                };
+                match r.previous_ok_ms {
+                    Some(at) => println!(
+                        "{waiting}; last successful sync {} s ago",
+                        ((crate::hook::now_ms() - at) / 1_000).max(0)
+                    ),
+                    None => println!("{waiting}; no successful sync yet"),
+                }
+            }
             if let Some(why) = &r.push_blocked {
                 println!("pushes are stopped: {why}");
             }

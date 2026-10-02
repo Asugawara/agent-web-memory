@@ -21,6 +21,8 @@ pub const DB_FILE: &str = "awm.db";
 pub const CONFIG_FILE: &str = "config.toml";
 /// Spool directory name inside the data dir.
 pub const SPOOL_DIR: &str = "spool";
+/// Scratch directory inside the data dir (mode 0700): calibration's database copies.
+pub const TMP_DIR: &str = "tmp";
 
 /// The data dir, from the process environment.
 pub fn data_dir() -> anyhow::Result<PathBuf> {
