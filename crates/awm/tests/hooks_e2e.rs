@@ -1144,7 +1144,7 @@ fn the_upgrade_window_keeps_captures_until_doctor_migrates() {
     assert!(
         doctor
             .stdout
-            .contains("database upgraded from schema version 1 to 2"),
+            .contains("database upgraded from schema version 1 to 3"),
         "{}",
         doctor.stdout
     );

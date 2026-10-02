@@ -22,6 +22,7 @@ pub const MIGRATIONS: &[(u32, &str, &str)] = &[
         "0002_event_agent",
         include_str!("../migrations/0002_event_agent.sql"),
     ),
+    (3, "0003_team", include_str!("../migrations/0003_team.sql")),
 ];
 
 /// Who opens the database; decides creation and `busy_timeout`.
@@ -186,8 +187,15 @@ pub fn migrate(conn: &mut Connection) -> anyhow::Result<MigrateOutcome> {
 /// Order: FTS5 check; refuse a newer database; verify the checksum of every
 /// applied migration; when the database holds data and migrations are pending,
 /// `VACUUM INTO '{db}.bak-v{from}'` (outside any transaction, as SQLite
-/// requires); `BEGIN IMMEDIATE`, re-check the version, apply each pending file
-/// and insert its `schema_version` row; `COMMIT`; `PRAGMA quick_check`.
+/// requires); `PRAGMA foreign_keys=OFF`; `BEGIN IMMEDIATE`, re-check the
+/// version, apply each pending file and insert its `schema_version` row;
+/// `PRAGMA foreign_key_check` must return no row; `COMMIT`; foreign keys back
+/// on; `PRAGMA quick_check`.
+///
+/// Foreign keys are off during the transaction because a table rebuild
+/// (`0003_team`'s `injection_item`) must not run the `ON DELETE` actions of the
+/// table it drops (SQLite's documented procedure, "Making Other Kinds Of Table
+/// Schema Changes"); the check before `COMMIT` restores the guarantee.
 pub fn migrate_with(
     conn: &mut Connection,
     migrations: &[(u32, &str, &str)],
@@ -216,6 +224,34 @@ pub fn migrate_with(
         None
     };
 
+    let fk_on = foreign_keys(conn)?;
+    if fk_on {
+        set_foreign_keys(conn, false)?;
+    }
+    let applied = apply_pending(conn, migrations, from, &pending);
+    if fk_on {
+        let restored = set_foreign_keys(conn, true);
+        applied?;
+        restored?;
+    } else {
+        applied?;
+    }
+
+    quick_check(conn, backup.as_deref())?;
+    Ok(MigrateOutcome {
+        from,
+        to: binary_version(migrations),
+        backup,
+    })
+}
+
+/// `BEGIN IMMEDIATE` through `COMMIT` of [`migrate_with`]; rolls back on any error.
+fn apply_pending(
+    conn: &mut Connection,
+    migrations: &[(u32, &str, &str)],
+    from: u32,
+    pending: &[&(u32, &str, &str)],
+) -> anyhow::Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // Another process may have migrated between the checks above and the lock.
     let locked_from = verify_applied(&tx, migrations)?;
@@ -225,7 +261,7 @@ pub fn migrate_with(
              run the command again"
         );
     }
-    for (version, name, sql) in &pending {
+    for (version, name, sql) in pending {
         tx.execute_batch(sql)
             .with_context(|| format!("migration {name} failed"))?;
         tx.execute(
@@ -234,14 +270,55 @@ pub fn migrate_with(
         )
         .with_context(|| format!("cannot record migration {name}"))?;
     }
+    foreign_key_check(&tx)?;
     tx.commit()?;
+    Ok(())
+}
 
-    quick_check(conn, backup.as_deref())?;
-    Ok(MigrateOutcome {
-        from,
-        to: binary_version(migrations),
-        backup,
-    })
+fn foreign_keys(conn: &Connection) -> anyhow::Result<bool> {
+    Ok(conn.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0))? == 1)
+}
+
+/// Sets `PRAGMA foreign_keys` and confirms it took effect (it is a no-op inside
+/// a transaction).
+fn set_foreign_keys(conn: &Connection, on: bool) -> anyhow::Result<()> {
+    conn.execute_batch(if on {
+        "PRAGMA foreign_keys=ON"
+    } else {
+        "PRAGMA foreign_keys=OFF"
+    })?;
+    if foreign_keys(conn)? != on {
+        bail!(
+            "cannot set PRAGMA foreign_keys={}",
+            if on { "ON" } else { "OFF" }
+        );
+    }
+    Ok(())
+}
+
+/// Refuses to commit a migration that leaves a row violating a foreign key.
+fn foreign_key_check(conn: &Connection) -> anyhow::Result<()> {
+    let mut st = conn.prepare("PRAGMA foreign_key_check")?;
+    let rows: Vec<String> = st
+        .query_map([], |r| {
+            Ok(format!(
+                "{} rowid {} -> {}",
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<i64>>(1)?
+                    .map_or_else(|| "?".to_string(), |v| v.to_string()),
+                r.get::<_, String>(2)?
+            ))
+        })?
+        .collect::<Result<_, _>>()?;
+    if !rows.is_empty() {
+        let shown: Vec<&str> = rows.iter().take(5).map(String::as_str).collect();
+        bail!(
+            "migration refused: {} row(s) violate a foreign key ({}); nothing was changed",
+            rows.len(),
+            shown.join("; ")
+        );
+    }
+    Ok(())
 }
 
 fn binary_version(migrations: &[(u32, &str, &str)]) -> u32 {
@@ -429,7 +506,7 @@ mod tests {
     fn a_backup_is_refused_when_the_copy_is_not_at_the_expected_version() {
         let dir = tempfile::tempdir().unwrap();
         let mut conn = open(&dir.path().join("awm.db"), Role::Cli).unwrap();
-        migrate(&mut conn).unwrap();
+        migrate_with(&mut conn, &MIGRATIONS[..2]).unwrap();
         assert_eq!(schema_version(&conn).unwrap(), 2);
 
         // `from` was read as 1, but the database is at 2 by the time of `VACUUM INTO`.
