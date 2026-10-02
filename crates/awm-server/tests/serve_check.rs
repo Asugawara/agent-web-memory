@@ -1083,4 +1083,31 @@ async fn pgstore_skips_the_host_lines_and_shows_no_fail() {
         report.render()
     );
     assert_eq!(report.failures(), 0, "{}", report.render());
+
+    // RVT2 M4: with --database-insecure-network the database line warns.
+    let r = config::resolve(
+        &Flags {
+            database_insecure_network: true,
+            ..flags
+        },
+        &|k| {
+            envs.iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        },
+    )
+    .unwrap();
+    let report = check::run(&input(r, SystemClock.now()).await).await;
+    assert_eq!(
+        level_of(&report, "database"),
+        Level::Warn,
+        "{}",
+        report.render()
+    );
+    assert!(
+        text_of(&report, "database").contains("--database-insecure-network"),
+        "{}",
+        report.render()
+    );
+    assert_eq!(report.failures(), 0, "{}", report.render());
 }

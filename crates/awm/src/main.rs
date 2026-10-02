@@ -52,13 +52,22 @@ enum Command {
     Reindex(cli::reindex::Args),
     /// Calibrate matching thresholds
     Calibrate(matching::calibrate::Args),
-    /// Team sync: membership and sharing (not implemented in this build)
+    // The `sync` feature builds `team` and `sync`; without it they are stubs that exit 2.
+    #[cfg_attr(feature = "sync", doc = "Team sync: membership and sharing")]
+    #[cfg_attr(
+        not(feature = "sync"),
+        doc = "Team sync: membership and sharing (not implemented in this build)"
+    )]
     Team(cli::team::Args),
-    /// Sync with the team server (not implemented in this build)
+    #[cfg_attr(feature = "sync", doc = "Sync with the team server")]
+    #[cfg_attr(
+        not(feature = "sync"),
+        doc = "Sync with the team server (not implemented in this build)"
+    )]
     Sync(cli::sync::Args),
     /// Awm cloud account (not implemented in this build)
     Cloud(cli::cloud::Args),
-    /// Run the team server (not implemented in this build)
+    /// Run the team server
     #[cfg(feature = "serve")]
     Serve(cli::serve::Args),
     /// Set up the plugin integration

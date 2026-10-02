@@ -35,10 +35,10 @@ pub(super) async fn create_invite(State(app): State<AppState>, req: Request) -> 
 
 async fn create_invite_inner(app: &AppState, req: Request) -> Result<Response, ApiError> {
     let mut cx = Cx::open(app, req, Client::Required, Class::Token, Cap::Body)?;
+    let caller = cx.authenticate().await?;
     let bytes = cx.bytes(Cap::Body).await?;
     check_handle(&bytes)?;
     let body: InviteRequest = parse_json(&bytes)?;
-    let caller = cx.authenticate().await?;
     cx.restore_gate_for(&caller).await?;
     json(&auth::create_invite(&*app.store, &caller, body, cx.now).await?)
 }
@@ -72,8 +72,8 @@ pub(super) async fn approve_device(
 async fn approve_inner(app: &AppState, id: &str, req: Request) -> Result<Response, ApiError> {
     let mut cx = Cx::open(app, req, Client::Required, Class::Token, Cap::Body)?;
     let id = path_id(id)?;
-    let body: ApproveRequest = cx.json(Cap::Body).await?;
     let caller = cx.authenticate().await?;
+    let body: ApproveRequest = cx.json(Cap::Body).await?;
     cx.restore_gate_for(&caller).await?;
     auth::approve(&*app.store, &caller, id, body, cx.now).await?;
     Ok(no_content())
@@ -108,8 +108,8 @@ pub(super) async fn remove_member(
 async fn remove_inner(app: &AppState, id: &str, req: Request) -> Result<Response, ApiError> {
     let mut cx = Cx::open(app, req, Client::Required, Class::Token, Cap::Body)?;
     let id = path_id(id)?;
-    let body: RemoveRequest = cx.json_or_empty().await?;
     let caller = cx.authenticate().await?;
+    let body: RemoveRequest = cx.json_or_empty().await?;
     delete::remove_member(
         &*app.store,
         &caller,
@@ -133,8 +133,8 @@ pub(super) async fn set_role(
 async fn set_role_inner(app: &AppState, id: &str, req: Request) -> Result<Response, ApiError> {
     let mut cx = Cx::open(app, req, Client::Required, Class::Token, Cap::Body)?;
     let id = path_id(id)?;
-    let body: RoleRequest = cx.json(Cap::Body).await?;
     let caller = cx.authenticate().await?;
+    let body: RoleRequest = cx.json(Cap::Body).await?;
     auth::set_role(&*app.store, &caller, id, body.role, cx.now).await?;
     Ok(no_content())
 }

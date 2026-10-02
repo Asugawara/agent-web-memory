@@ -123,6 +123,10 @@ impl CertInfo {
 /// `UTCTime` (0x17) or `GeneralizedTime` (0x18) as Unix seconds.
 fn time(tag: u8, b: &[u8]) -> Option<i64> {
     let s = std::str::from_utf8(b).ok()?;
+    // The slices below are by byte: a multibyte character would make them panic (RVT2 m7).
+    if !s.is_ascii() {
+        return None;
+    }
     let s = s.strip_suffix('Z')?;
     let (year, rest) = match tag {
         0x17 if s.len() == 12 => {
@@ -198,6 +202,18 @@ mod tests {
         assert_eq!(days_from_civil(2000, 3, 1), 11_017);
         assert_eq!(time(0x17, b"260102030405Z"), Some(1_767_323_045));
         assert_eq!(time(0x18, b"20260102030405Z"), Some(1_767_323_045));
+    }
+
+    #[test]
+    fn a_time_with_a_multibyte_character_is_refused_not_a_panic() {
+        // RVT2 m7: the right number of bytes before the `Z`, with a two-byte character across
+        // the year's slice boundary (byte 2 of a UTCTime, byte 4 of a GeneralizedTime).
+        let utc = "1é102030405Z".as_bytes();
+        assert_eq!(utc.len(), 13);
+        assert_eq!(time(0x17, utc), None);
+        let general = "201é010203040Z".as_bytes();
+        assert_eq!(general.len(), 15);
+        assert_eq!(time(0x18, general), None);
     }
 
     #[test]

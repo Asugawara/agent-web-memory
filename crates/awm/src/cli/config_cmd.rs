@@ -85,11 +85,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             cfg.warnings.clear();
             cfg.save(&path)?;
             println!("{key} = {}", cfg.get(&key).unwrap_or_default());
-            if key == "team.auto_approve" && value == "all" {
-                println!(
-                    "Note: with all, a member who joins is approved without anyone comparing the \
-                     6-digit code."
-                );
+            if key == "team.auto_approve" && matches!(value.as_str(), "devices" | "all") {
+                println!("{}", auto_approve_risk(&value));
             }
             if key == "channels.prompt_bm25" && value != "off" {
                 println!(
@@ -99,4 +96,18 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The one line `awm config set team.auto_approve devices|all` prints (RVT2 m3).
+fn auto_approve_risk(value: &str) -> String {
+    let who = if value == "all" {
+        "a device or member"
+    } else {
+        "a new device of yours"
+    };
+    format!(
+        "Warning: with {value}, {who} that joins is approved at the next sync without anyone \
+         comparing the 6-digit code, so whoever gets a leaked invite string first is let in \
+         and receives every epoch key."
+    )
 }

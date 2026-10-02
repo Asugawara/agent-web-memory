@@ -1012,6 +1012,108 @@ async fn restore_needs_force_over_a_database_and_always_renews_the_generation() 
     assert_eq!(r.digest, Some(s.store.dump().await.unwrap().digest()));
 }
 
+/// Every file under `dir` that holds `needle`.
+fn files_with(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
+    let mut hits = Vec::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                todo.push(p);
+            } else if contains(&std::fs::read(&p).unwrap(), needle) {
+                hits.push(p);
+            }
+        }
+    }
+    hits
+}
+
+/// RVT2 B2: `restore --force` keeps the replaced database as `server.db.pre-restore-{time}`.
+/// A record deleted after the restore must be gone from every file under `--data` within the
+/// backups' window (8 days), with or without `--backup`, and the report says when.
+#[tokio::test]
+async fn a_record_deleted_after_a_forced_restore_is_gone_from_data_within_eight_days() {
+    use awm_server::backup::local;
+    let root = TempDir::new("pre-restore");
+    let bucket = file_bucket(&root.path().join("bucket"));
+    let (s, org) = server(root.path(), "live", &bucket).await;
+    let gone = push_n(&*s.store, &org.admin, 1).await[0];
+    let kept = push_n(&*s.store, &org.admin, 1).await[0];
+    s.backup.tick().await.unwrap();
+    let needle = blob(&gone.to_string(), 1).0[1..49].to_vec();
+    let kept_needle = blob(&kept.to_string(), 1).0[1..49].to_vec();
+    let now = s.clock.now();
+
+    for with_backup in [false, true] {
+        let target = root.path().join(format!("target-{with_backup}"));
+        restore_to(&bucket, &target, None, false, now)
+            .await
+            .unwrap();
+        let made = now + 10;
+        let r = restore_to(&bucket, &target, None, true, made)
+            .await
+            .unwrap();
+        assert!(r.pre_restore.is_some());
+        assert_eq!(r.pre_restore_removed_by, Some(made + KEEP_FULL_S + DAY));
+        assert_eq!(local::removal_date(made), made + 8 * DAY);
+        // The record is deleted on the restored database right away.
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open(&target).unwrap());
+        store
+            .delete(DeleteRequest::Ids(vec![gone]), org.admin, made + 20)
+            .await
+            .unwrap();
+        store.checkpoint().await.unwrap();
+        let live: Vec<PathBuf> = files_with(&target, &needle)
+            .into_iter()
+            .filter(|p| !p.to_string_lossy().contains("pre-restore"))
+            .collect();
+        assert!(live.is_empty(), "the live database holds it: {live:?}");
+        assert!(
+            !files_with(&target, &needle).is_empty(),
+            "the copy holds it"
+        );
+
+        let clock = FakeClock::new(made + 60);
+        let backup = with_backup.then(|| {
+            let b = file_bucket(&root.path().join("bucket-2"));
+            runner(&store, &b, &clock, &target, None)
+        });
+        let mut found_on = Vec::new();
+        for day in 1..=8 {
+            clock.advance(DAY - 120);
+            if let Some(b) = &backup {
+                push_n(&*store, &org.admin, 1).await;
+                b.tick().await.unwrap();
+            }
+            clock.advance(120);
+            // The hourly task of `awm serve` (no target: only the 8-day rule).
+            local::sweep(&*store, &target, clock.now()).await.unwrap();
+            if !files_with(&target, &needle).is_empty() {
+                found_on.push(day);
+            }
+        }
+        // Without a target the copy stays for 7 days and goes on day 8 (the date the report
+        // printed). With one it goes once no kept snapshot is older than it: here the new
+        // chain's first one, so at once; within 8 days in both cases.
+        if with_backup {
+            assert_eq!(found_on, Vec::<u32>::new(), "{found_on:?}");
+        } else {
+            assert_eq!(found_on, (1..=7).collect::<Vec<u32>>());
+        }
+        assert!(clock.now() >= r.pre_restore_removed_by.unwrap());
+        let left = files_with(&target, &needle);
+        assert!(left.is_empty(), "with_backup={with_backup}: {left:?}");
+        // The live database and what it holds are untouched.
+        assert!(!files_with(&target, &kept_needle).is_empty());
+        integrity_ok(&target.join(DB_FILE));
+        assert!(std::fs::read_dir(&target)
+            .unwrap()
+            .flatten()
+            .all(|e| !e.file_name().to_string_lossy().contains("pre-restore")));
+    }
+}
+
 /// TM27 row: `kill -9` during an upload leaves a restorable chain: an upload cut off after its
 /// data object and before its manifest is ignored by restore, and the restarted server
 /// replaces it and goes on.

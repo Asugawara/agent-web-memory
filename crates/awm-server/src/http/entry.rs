@@ -1,7 +1,10 @@
 //! The endpoints a device meets first: `info`, `bootstrap`, `join`, and `status` (the cursor
 //! source of every sync run).
 
-use awm_proto::wire::{BootstrapRequest, ErrorCode, InfoResponse, JoinRequest, PROTOCOL_VERSION};
+use awm_proto::wire::{
+    limits, BootstrapRequest, DeletionHeads, ErrorCode, InfoResponse, JoinRequest, OrgSettings,
+    StatusResponse, PROTOCOL_VERSION,
+};
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderValue};
 use axum::response::Response;
@@ -111,5 +114,40 @@ async fn status_inner(app: &AppState, req: Request) -> Result<Response, ApiError
         .device()
         .ok_or(ApiError::new(ErrorCode::Unauthenticated, "no device"))?;
     let status = app.store.status(device.device_id, cx.now).await?;
+    if matches!(caller, Caller::Pending(_)) {
+        return json(&for_pending(status));
+    }
     json(&status)
+}
+
+/// The status a pending (unapproved) device gets (`docs/sync-v1.md` §6, RVT2 M2): `approved`,
+/// `generation`, `current_epoch`, `min_client`, its own ids and role, and its own pending
+/// entry. The response keeps its schema, so what a pending device may not see is empty or
+/// neutral: no streams, an empty deletion stream, `rotation_needed` and `restore_pending`
+/// false, no other pending device, and settings whose only real value is `min_client`
+/// (`retention_days` the protocol minimum, `max_members` 0, no pending decrease). A client
+/// reads only `approved` and `min_client` until it is approved.
+pub(crate) fn for_pending(s: StatusResponse) -> StatusResponse {
+    let own = s.device_id;
+    StatusResponse {
+        rotation_needed: false,
+        restore_pending: false,
+        settings: OrgSettings {
+            retention_days: limits::RETENTION_DAYS_MIN,
+            min_client: s.settings.min_client,
+            max_members: 0,
+            pending_retention: None,
+        },
+        streams: Vec::new(),
+        deletions: DeletionHeads {
+            head: -1,
+            oldest: 0,
+        },
+        pending: s
+            .pending
+            .into_iter()
+            .filter(|p| p.device_id == own)
+            .collect(),
+        ..s
+    }
 }

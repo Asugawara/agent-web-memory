@@ -211,5 +211,12 @@ BEGIN
   EXECUTE format('GRANT USAGE ON SCHEMA %I TO %I', current_schema(), app);
   EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON org, member, device, invite, record, '
                  'deletion, wrap, audit, meta, claim TO %I', app);
+  -- Before PostgreSQL 15 every role may create in `public` (RVT2 m11). A role that is not the
+  -- schema's owner only gets a warning here; the owner of `public` should run it once too.
+  EXECUTE format('REVOKE CREATE ON SCHEMA %I FROM PUBLIC', current_schema());
+  EXECUTE format('REVOKE CREATE ON SCHEMA %I FROM %I', current_schema(), app);
+  IF current_schema() <> 'public' AND to_regnamespace('public') IS NOT NULL THEN
+    EXECUTE 'REVOKE CREATE ON SCHEMA public FROM PUBLIC';
+  END IF;
 END
 $$;

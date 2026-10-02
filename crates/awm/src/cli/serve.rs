@@ -44,6 +44,9 @@ pub struct Fields {
     /// Name of the environment variable that holds the owner URL (migrations)
     #[arg(long, global = true, value_name = "NAME")]
     pub database_url_owner_env: Option<String>,
+    /// Allow a PgStore host outside loopback and the private ranges (no TLS to Postgres)
+    #[arg(long, global = true)]
+    pub database_insecure_network: bool,
     /// Built-in TLS: obtain and renew a certificate for HOST (a DNS name or an IP address)
     #[arg(long, global = true, value_name = "HOST")]
     pub domain: Option<String>,
@@ -167,6 +170,8 @@ impl Fields {
                 &self.database_url_owner_env,
                 "AWM_DATABASE_URL_OWNER_ENV",
             ),
+            database_insecure_network: self.database_insecure_network
+                || env("AWM_DATABASE_INSECURE_NETWORK").is_some_and(|v| truthy(&v)),
             domain: from_env(&self.domain, "AWM_DOMAIN"),
             backup: from_env(&self.backup, "AWM_BACKUP"),
             behind_tls_proxy: self.behind_tls_proxy

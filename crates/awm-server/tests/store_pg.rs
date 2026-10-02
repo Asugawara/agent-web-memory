@@ -530,6 +530,56 @@ async fn concurrent_migrators_apply_the_schema_once() {
     }
 }
 
+/// RVT2 m11: before PostgreSQL 15 every role may create in `public`. The migration revokes
+/// `CREATE` from `PUBLIC` on the schema it migrates (and on `public` when its owner runs it),
+/// so the application role can create nothing even where `PUBLIC` was granted it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_migration_takes_create_on_its_schema_away_from_public() {
+    let Some(env) = PgEnv::new("m11").await else {
+        return eprintln!("skipped: AWM_TEST_PG_URL not set");
+    };
+    let admin = env.admin().await;
+    let schema = format!("{}_pub", env.schema);
+    // A schema as `public` is before PostgreSQL 15: CREATE for every role.
+    admin
+        .batch_execute(&format!(
+            "CREATE SCHEMA {schema} AUTHORIZATION {OWNER}; GRANT CREATE ON SCHEMA {schema} TO PUBLIC"
+        ))
+        .await
+        .unwrap();
+    let app_url = support::url_for(&env.admin_url, APP, Some(&schema));
+    let can_create = |role: &'static str| {
+        let admin = &admin;
+        let schema = schema.clone();
+        async move {
+            admin
+                .query_one(
+                    "SELECT has_schema_privilege($1, $2, 'CREATE')",
+                    &[&role, &schema],
+                )
+                .await
+                .unwrap()
+                .get::<_, bool>(0)
+        }
+    };
+    assert!(can_create(APP).await, "the grant above applies");
+    let owner = parse_url(&support::url_for(&env.admin_url, OWNER, Some(&schema))).unwrap();
+    migrate(&owner, APP).await.unwrap();
+    assert!(!can_create(APP).await);
+    let app = support::connect(&app_url).await;
+    let e = app
+        .batch_execute(&format!("CREATE TABLE {schema}.planted (a int)"))
+        .await
+        .unwrap_err();
+    assert_eq!(sqlstate(&e), "42501", "{e:?}");
+    // The store still connects: its role owns nothing.
+    PgStore::connect(&app_url, None, 1).await.unwrap();
+    admin
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}
+
 // ---------------------------------------------------------------------------------------------
 // Roles and catalog
 

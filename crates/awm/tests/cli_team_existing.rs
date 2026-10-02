@@ -1106,7 +1106,7 @@ fn config_list_shows_every_team_key_with_its_default() {
         "team.exclude_hosts = ",
         "team.summary_chars = 1000",
         "team.share_stats = false",
-        "team.auto_approve = devices",
+        "team.auto_approve = none",
         "team.push_delay_s = 0",
     ] {
         assert!(
@@ -1174,13 +1174,19 @@ fn config_set_team_keys_validates_and_a_bad_value_writes_nothing() {
         );
         assert_eq!(env.awm(&["config", "get", key]).ok().trim(), shown);
     }
-    // `all` carries a note: joins are approved without the code comparison.
-    let out = env.awm(&["config", "set", "team.auto_approve", "all"]);
-    assert!(
-        out.ok().contains("without anyone comparing"),
-        "{}",
-        out.stdout
-    );
+    // `devices` and `all` carry one warning line on that set: a leaked invite string is let in
+    // without the code comparison (RVT2 m3); `none`, the default, prints none.
+    for value in ["devices", "all"] {
+        let out = env.awm(&["config", "set", "team.auto_approve", value]);
+        let text = out.ok().to_string();
+        let warnings: Vec<_> = text.lines().filter(|l| l.starts_with("Warning:")).collect();
+        assert_eq!(warnings.len(), 1, "{value}: {text}");
+        assert!(warnings[0].contains("without anyone comparing"), "{text}");
+        assert!(warnings[0].contains("leaked invite string"), "{text}");
+    }
+    let out = env.awm(&["config", "set", "team.auto_approve", "none"]);
+    let text = out.ok().to_string();
+    assert_eq!(text.trim(), "team.auto_approve = none", "{text}");
 }
 
 // ---------------------------------------------------------------------------------------------

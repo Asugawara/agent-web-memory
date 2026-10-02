@@ -16,7 +16,8 @@
 //! 3. Otherwise an **incremental** change set when `backup_log` grew; none when it did not.
 //!    `backup_cursor` moves only after both objects are stored.
 //! 4. **Hourly**: the foreign-writer check, retention ([`retention`]) and the removal of
-//!    `{db}.bak-v*` files older than the oldest kept full snapshot (TM9's caveat).
+//!    `{db}.bak-v*` and `{db}.pre-restore-*` files older than the oldest kept full snapshot,
+//!    or 8 days old at most (TM9's caveat, RVT2 B2; [`super::local`]).
 //! 5. **Weekly**: [`super::restore::verify`].
 //!
 //! Two servers on one prefix (§6.2: "fail loudly instead of interleaving"): uploads are
@@ -50,7 +51,6 @@ use super::{
     keys, list_all, parse_lineage, read_manifest, BackupError, Clock, FOREIGN_RECENT_S,
     FULL_INTERVAL_S, INCR_INTERVAL_S, KEEP_FULL_S, RETENTION_INTERVAL_S, VERIFY_INTERVAL_S,
 };
-use crate::store::sqlite::DB_FILE;
 use crate::store::{AuditEntry, Store};
 
 /// The audit action of the row that moves an unchanged head before a full snapshot.
@@ -661,8 +661,14 @@ impl Backup {
             .ok_or_else(|| BackupError::Io("no generation".into()))?;
         let gens = scope(&*self.store, generation).await?;
         let mut r = retention(&*self.bucket, now, &gens).await?;
-        if let (Some(dir), Some(before)) = (&self.opts.data_dir, r.oldest_kept) {
-            r.bak_removed = remove_bak_files(dir, before)?;
+        if let Some(t) = r.oldest_kept {
+            self.store
+                .meta_set(keys::OLDEST_KEPT.into(), t.to_string())
+                .await?;
+        }
+        if let Some(dir) = &self.opts.data_dir {
+            let before = super::local::cutoff(now, r.oldest_kept);
+            r.bak_removed = super::local::remove_before(dir, before)?;
         }
         Ok(r)
     }
@@ -766,35 +772,10 @@ pub async fn retention(
     })
 }
 
-/// Removes `{dir}/server.db.bak-v*` files (migration backups, TM9) last modified before
-/// `before` (Unix seconds): they hold every blob of their moment, deleted ones included, so
-/// they follow the backups' window (§5.6).
+/// Removes `{dir}/server.db.bak-v*` (migration backups, TM9) and `server.db.pre-restore-*`
+/// files (RVT2 B2) made before `before` (Unix seconds): they hold every blob of their moment,
+/// deleted ones included, so they follow the backups' window (§5.6). [`super::local`] has the
+/// rule; this name stays for its callers.
 pub fn remove_bak_files(dir: &Path, before: i64) -> Result<Vec<PathBuf>, BackupError> {
-    let prefix = format!("{DB_FILE}.bak-v");
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(super::full::io("cannot list", dir, e)),
-    };
-    let mut removed = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.starts_with(&prefix) {
-            continue;
-        }
-        let modified = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-        if modified.is_some_and(|t| t < before) {
-            let path = entry.path();
-            std::fs::remove_file(&path).map_err(|e| super::full::io("cannot remove", &path, e))?;
-            removed.push(path);
-        }
-    }
-    removed.sort();
-    Ok(removed)
+    super::local::remove_before(dir, before)
 }

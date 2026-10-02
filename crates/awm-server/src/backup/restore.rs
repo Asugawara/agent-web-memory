@@ -19,7 +19,9 @@
 //! `Store::renew_generation`, the backup state reset, the restored generation appended to the
 //! lineage, a WAL checkpoint, `PRAGMA integrity_check` again) and only then moved to
 //! `server.db`; an existing database is refused unless `--force`, which first renames it (and
-//! its `-wal` and `-shm` files) to `server.db.pre-restore-{time}`. Into a `PgStore`
+//! its `-wal` and `-shm` files) to `server.db.pre-restore-{time}`, which the hourly retention
+//! of `awm serve` removes after the backups' window ([`super::local`], RVT2 B2). A data
+//! directory whose `server.lock` a running server holds is refused (RVT2 M5). Into a `PgStore`
 //! organisation, the assembled database is exported in the canonical format and imported into
 //! the (empty) organisation, then given a new `generation`. `--mark-restored` only renews the
 //! `generation` (after a Cloud SQL restore or clone).
@@ -40,6 +42,7 @@ use super::full::{blocking, integrity_check, io, mkdir_private, write_private, T
 use super::manifest::{Kind, Manifest};
 use super::target::{Bucket, Target};
 use super::{keys, list_all, parse_lineage, read_manifest, BackupError};
+use crate::lockfile::{self, DataLock, LockError};
 use crate::store::sqlite::{SqliteStore, DB_FILE};
 use crate::store::{LogicalDump, Store, StoreError};
 
@@ -452,6 +455,9 @@ pub struct RestoreReport {
     pub path: Option<PathBuf>,
     /// Where `--force` moved the previous database.
     pub pre_restore: Option<PathBuf>,
+    /// When `awm serve` removes that copy at the latest ([`super::local::removal_date`]; earlier
+    /// once every backup older than it has expired).
+    pub pre_restore_removed_by: Option<i64>,
 }
 
 /// Renews the generation of `store` and resets its backup state, recording `from` in the
@@ -552,6 +558,7 @@ async fn mark_restored(req: RestoreRequest) -> Result<RestoreReport, BackupError
             "--mark-restored takes no --from and no --at: it only renews the generation".into(),
         ));
     }
+    let mut _lock = None;
     let (store, path): (Arc<dyn Store>, Option<PathBuf>) = match &req.dest {
         RestoreDest::Data(dir) => {
             let db = dir.join(DB_FILE);
@@ -561,6 +568,7 @@ async fn mark_restored(req: RestoreRequest) -> Result<RestoreReport, BackupError
                     db.display()
                 )));
             }
+            _lock = Some(lock_dir(dir)?);
             let d = dir.clone();
             let s = blocking(move || {
                 SqliteStore::open(&d).map_err(|e| BackupError::Unusable(e.to_string()))
@@ -582,6 +590,20 @@ async fn mark_restored(req: RestoreRequest) -> Result<RestoreReport, BackupError
         digest: None,
         path,
         pre_restore: None,
+        pre_restore_removed_by: None,
+    })
+}
+
+/// `{dir}/server.lock` for the restore (RVT2 M5): refused (exit 2) while a server holds it, and
+/// held until the restore returns, so no server starts on a half-restored directory.
+fn lock_dir(dir: &Path) -> Result<DataLock, BackupError> {
+    lockfile::try_lock(dir).map_err(|e| match e {
+        LockError::Held(p) => BackupError::Refused(format!(
+            "{} is held: a server is running on {}; stop the server first",
+            p.display(),
+            dir.display()
+        )),
+        LockError::Io(m) => BackupError::Io(m),
     })
 }
 
@@ -596,6 +618,7 @@ async fn restore_data(req: &RestoreRequest, dir: &Path) -> Result<RestoreReport,
         )));
     }
     mkdir_private(dir)?;
+    let _lock = lock_dir(dir)?;
     let staging = TempDir::new(dir, "restore")?;
     let a = assemble_source(&req.source, req.at, staging.path()).await?;
     let dump = a.store.dump().await?;
@@ -634,6 +657,9 @@ async fn restore_data(req: &RestoreRequest, dir: &Path) -> Result<RestoreReport,
         counts: counts_of(&dump),
         digest: Some(dump.digest()),
         path: Some(db),
+        pre_restore_removed_by: pre_restore
+            .as_ref()
+            .map(|_| super::local::removal_date(req.now)),
         pre_restore,
     })
 }
@@ -678,5 +704,6 @@ async fn restore_store(
         digest: Some(dump.digest()),
         path: None,
         pre_restore: None,
+        pre_restore_removed_by: None,
     })
 }

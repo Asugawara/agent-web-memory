@@ -1130,7 +1130,7 @@ mod cases {
         let s = &*f.store;
         let org = bootstrap(s).await;
         let a = org.admin;
-        push_n(s, &a, "rec", 2).await;
+        let held = push_n(s, &a, "rec", 2).await;
         // A marker for an index whose record the writer deleted before a restore.
         let gone = Id::new_v4();
         let r = push(s, &a, vec![marker("rec", 2, gone)]).await.unwrap();
@@ -1175,8 +1175,58 @@ mod cases {
         );
         assert!(matches!(items[2], PulledItem::Deleted(_)));
         assert!(matches!(items[5], PulledItem::Record(_)));
-        // Markers do not count against the daily quota; records and pre-deletions do.
-        assert_eq!(s.pushed_since(a.member_id, T0).await.unwrap(), 3);
+        // Records, pre-deletions and markers with a new id count against the daily quota (RVT2
+        // M1): three records, `pre`, and the markers of `gone` and of index 4. The marker of
+        // `pre` adds nothing: its id was counted when it was pre-deleted.
+        assert_eq!(s.pushed_since(a.member_id, T0).await.unwrap(), 6);
+        // Deleting a record the server holds adds nothing.
+        s.delete(DeleteRequest::Ids(vec![held[0]]), a, T0)
+            .await
+            .unwrap();
+        assert_eq!(s.pushed_since(a.member_id, T0).await.unwrap(), 6);
+    }
+
+    /// RVT2 m12: a claim is a compare-and-set in the store, so two instances on one database
+    /// (two servers, or a server and a restarted one) never both hold an interval.
+    pub async fn a_claim_is_held_once_across_instances(f: Fixture) {
+        let s = Arc::clone(&f.store);
+        bootstrap(&*s).await;
+        let other = (f.reopen)().await;
+        let n = || "bulk_delete.x".to_string();
+        assert!(s.claim(n(), T0, 3_600).await.unwrap());
+        // The same run may claim again; another run inside the interval may not.
+        assert!(s.claim(n(), T0, 3_600).await.unwrap());
+        assert!(!other.claim(n(), T0 + 1, 3_600).await.unwrap());
+        assert!(!other.claim(n(), T0 - 3_599, 3_600).await.unwrap());
+        // Another name is free.
+        assert!(other
+            .claim("bulk_delete.y".into(), T0 + 1, 3_600)
+            .await
+            .unwrap());
+        assert!(other.claim(n(), T0 + 3_600, 3_600).await.unwrap());
+        // Concurrent claims of one interval from two instances: exactly one wins.
+        let tasks: Vec<_> = (0..16)
+            .map(|i| {
+                let st = if i % 2 == 0 {
+                    Arc::clone(&s)
+                } else {
+                    Arc::clone(&other)
+                };
+                tokio::spawn(async move { st.claim(n(), T0 + 10_000 + i, 3_600).await.unwrap() })
+            })
+            .collect();
+        let mut won = 0;
+        for t in tasks {
+            won += usize::from(t.await.unwrap());
+        }
+        assert_eq!(won, 1);
+        // A claim is not data: a dump carries none of it.
+        let dump = format!("{:?}", s.dump().await.unwrap());
+        assert!(!dump.contains("bulk_delete"), "{dump}");
+        let file = f.scratch.join("claim.canonical");
+        s.export_canonical(file.clone()).await.unwrap();
+        let bytes = std::fs::read(&file).unwrap();
+        assert!(!bytes.windows(11).any(|w| w == b"bulk_delete"));
     }
 
     pub async fn pull_by_cursor_returns_the_right_rows_across_streams(f: Fixture) {
@@ -1954,6 +2004,7 @@ macro_rules! conformance_cases {
             a_deletion_leaves_a_marker_and_one_deletion_entry,
             a_reseed_marker_at_head_plus_one_is_accepted,
             pull_by_cursor_returns_the_right_rows_across_streams,
+            a_claim_is_held_once_across_instances,
             export_and_import_give_identical_logical_dumps,
             generation_changes_on_renew_and_survives_reopen,
             settings_follow_the_retention_and_min_client_rules,

@@ -53,7 +53,7 @@ P_SUBDENY="Use the Agent tool with a general-purpose subagent to fetch https://e
 # run <name> <prompt> <deny 0|1>: sets $sid $nonce $stream $final $tfile (main transcript) $sub (subagents dir)
 run() {
   local name="$1" prompt="$2" deny="$3" args=()
-  sid="$(uuidgen | tr 'A-Z' 'a-z')"
+  sid="$(uuidgen | tr '[:upper:]' '[:lower:]')"
   nonce="$(openssl rand -hex 3)"
   stream="$tmp/$name.stream.json"
   [ "$mode" = plugin-dir ] && args=(--plugin-dir "$plugin_dir")

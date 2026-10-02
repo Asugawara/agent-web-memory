@@ -1198,6 +1198,89 @@ mod cases {
         assert_eq!(got, want);
     }
 
+    /// RVT2 m12: the hourly limit of a bulk delete is a claim in the store, so concurrent
+    /// requests of one token (on one instance or several) run it once.
+    pub async fn concurrent_bulk_deletes_of_one_token_run_once(f: Fixture) {
+        let s = Arc::clone(&f.store);
+        let org = bootstrap(&*s).await;
+        let roy = add_member(&*s, &org, "roy", 2).await;
+        push_at(&*s, &roy, "rec", 5, T0).await;
+        let t = T0 + DAY;
+        let c = org.caller(roy);
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let s = Arc::clone(&s);
+                tokio::spawn(async move { delete::run(&*s, &c, DeleteRequest::AllMine, t).await })
+            })
+            .collect();
+        let mut ok = 0;
+        for task in tasks {
+            match task.await.unwrap() {
+                Ok(_) => ok += 1,
+                Err(e) => is_status(&e, 429, ErrorCode::RateLimited),
+            }
+        }
+        assert_eq!(ok, 1);
+        let notices = audit_rows(&*s)
+            .await
+            .into_iter()
+            .filter(|r| r.action == NOTICE_ACTION)
+            .count();
+        assert_eq!(notices, 1);
+        // The claim is per token, and an hour later the token may again.
+        let e = delete::run(&*s, &c, DeleteRequest::AllMine, t + HOUR - 1)
+            .await
+            .unwrap_err();
+        assert_eq!(e.retry_after(), Some(1));
+        delete::run(&*s, &c, DeleteRequest::AllMine, t + HOUR)
+            .await
+            .unwrap();
+    }
+
+    /// RVT2 m2: only an invite's creator approves its join, so removing the creator revokes the
+    /// joins still pending on its invites, and a member that never had an approved device.
+    pub async fn removing_an_inviter_revokes_the_joins_only_it_could_approve(f: Fixture) {
+        let s = &*f.store;
+        let org = bootstrap(s).await;
+        let a = org.admin;
+        let mut roy = add_member(s, &org, "roy", 2).await;
+        s.set_role(roy.member_id, Role::Admin, Some(a), T0)
+            .await
+            .unwrap();
+        roy.admin = true;
+        let kit = join(s, roy, InviteKind::Member, "kit", 4).await;
+        // A pending join on another admin's invite is not affected.
+        let mia = join(s, a, InviteKind::Member, "mia", 5).await;
+        s.remove_member(roy.member_id, false, a, T0 + 600)
+            .await
+            .unwrap();
+        let auth = |d: Id| s.auth_device(h(&format!("device-{d}")));
+        let k = auth(kit.device_id).await.unwrap().unwrap();
+        assert!(k.device_revoked && k.member_revoked, "{k:?}");
+        let m = auth(mia.device_id).await.unwrap().unwrap();
+        assert!(!m.device_revoked && !m.member_revoked, "{m:?}");
+        let members = s.members().await.unwrap();
+        assert!(
+            !members
+                .iter()
+                .find(|x| x.member_id == kit.member_id)
+                .unwrap()
+                .active
+        );
+        assert!(
+            members
+                .iter()
+                .find(|x| x.member_id == mia.member_id)
+                .unwrap()
+                .active
+        );
+        let pending = s.status(a.device_id, T0 + 700).await.unwrap().pending;
+        assert_eq!(
+            pending.iter().map(|p| p.device_id).collect::<Vec<_>>(),
+            [mia.device_id]
+        );
+    }
+
     /// `retention::hourly` with an injected clock: does nothing before the organisation
     /// exists, runs at start when the last run is an hour old, then every hour, and stops on
     /// shutdown.
@@ -1451,6 +1534,8 @@ macro_rules! delete_retention_cases {
             hourly_waits_for_the_rest_of_the_hour_after_a_recent_run,
             no_path_deletes_a_record_row_or_reaches_another_organisation,
             audit_rows_and_errors_hold_no_blob_and_no_handle,
+            concurrent_bulk_deletes_of_one_token_run_once,
+            removing_an_inviter_revokes_the_joins_only_it_could_approve,
         );
     };
     (@each $factory:path; $($case:ident),* $(,)?) => {

@@ -14,8 +14,33 @@ cargo build -p agent-web-memory --locked --features sync,serve
 echo "step: test"
 cargo test --workspace --locked
 cargo test -p agent-web-memory --locked --features bench
-# awm-server's tests are behind its `sqlite` feature (plan-v3-team §4.1); without it they compile to nothing (TM6).
-cargo test -p awm-server --locked --features sqlite
+# awm-server with every feature (RVT2 M6): its tests are behind features (plan-v3-team §4.1, TM6),
+# and the Postgres and ACME cases need AWM_TEST_PG_URL and PEBBLE_BIN. Without them those cases
+# print a SKIP line and pass: counted here, a printed SKIP locally, a failure in CI.
+server_log="$(mktemp)"
+trap 'rm -f "$server_log"' EXIT
+if ! cargo test -p awm-server --locked --features all -- --show-output >"$server_log" 2>&1; then
+  cat "$server_log"
+  echo "test (awm-server --features all): FAILED"
+  exit 1
+fi
+grep -E '^ *Running |^test result:' "$server_log"
+# Distinct tests (binary and name) whose output says that `$1` is not set.
+skipped_cases() {
+  awk -v var="$1" '
+    /^ *Running / { bin = $2 }
+    /^---- .* stdout ----$/ { name = $2 }
+    index($0, var) && /SKIP|skipped/ && name != "" { seen[bin "/" name] = 1 }
+    END { n = 0; for (k in seen) n++; print n }
+  ' "$server_log"
+}
+if [ -z "${AWM_TEST_PG_URL:-}" ] || [ -z "${PEBBLE_BIN:-}" ]; then
+  echo "SKIP: $(skipped_cases AWM_TEST_PG_URL) Postgres / $(skipped_cases PEBBLE_BIN) ACME cases not run (set AWM_TEST_PG_URL and PEBBLE_BIN)"
+  if [ "${CI:-}" = "true" ]; then
+    echo "test (awm-server): FAILED (CI must set AWM_TEST_PG_URL and PEBBLE_BIN)"
+    exit 1
+  fi
+fi
 
 echo "step: no-network"
 tree_out="$(cargo tree -p agent-web-memory -e normal)"

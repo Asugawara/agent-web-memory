@@ -5,8 +5,9 @@
 //! two and builds the state; no handler lives anywhere else.
 //!
 //! Every handler follows one order (`docs/sync-v1.md` §9.1 for a push, the same shape for the
-//! rest): [`Cx::open`] (headers, body size, `Awm-Client`, address rate limit), the body or
-//! query parse, [`Cx::authenticate`] (`auth::authenticate` and the per-token limit), then
+//! rest): [`Cx::open`] (headers, declared body size, `Awm-Client`, address rate limit),
+//! [`Cx::authenticate`] (the failed-token address limit, `auth::authenticate` and the
+//! per-device limit) before the body is read (RVT2 B1), the body or query parse, then
 //! `auth::authorise` / an `auth` operation, which call `authz::require`. Handlers never look at a
 //! role: permissions are `authz`'s alone.
 
@@ -40,6 +41,7 @@ mod records;
 
 pub use ctx::{Cx, LogCell};
 pub use error::{parse_json, ApiError};
+pub use health::HEALTH_CACHE;
 pub use net::{client_ip, last_forwarded_entry, IpNet};
 
 // ---------------------------------------------------------------------------------------------
@@ -145,6 +147,8 @@ pub struct AppState {
     pub(crate) limiter: Arc<RateLimiter>,
     retention_runner: RetentionRunner,
     retention_last: Arc<Mutex<Option<i64>>>,
+    /// The last answer of `GET /healthz` and when it was read (RVT2 m6).
+    health: Arc<Mutex<Option<(Instant, bool)>>>,
 }
 
 impl AppState {
@@ -164,6 +168,7 @@ impl AppState {
             limiter: Arc::new(RateLimiter::new()),
             retention_runner,
             retention_last: Arc::new(Mutex::new(None)),
+            health: Arc::new(Mutex::new(None)),
         }
     }
 

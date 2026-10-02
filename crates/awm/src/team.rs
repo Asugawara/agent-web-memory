@@ -17,12 +17,16 @@ use crate::config::AutoApprove;
 /// Whether a pending join or device is approved automatically under `policy`.
 ///
 /// `is_own_device` is true for a new device of the caller's own member whose MAC verifies.
-/// `devices` approves only those; `all` also approves member joins (plan-v3-team §4.7
-/// `team.auto_approve`). The caller has already verified the join MAC; this decides policy only.
+/// `none` (the default) approves nothing: every join waits for `awm team approve --code N`,
+/// because a MAC that verifies proves only that the joiner holds the invite string, which may
+/// have leaked (RVT2 m3). `devices` approves the caller's own new devices; `all` also approves
+/// member joins (plan-v3-team §4.7 `team.auto_approve`). The caller has already verified the join
+/// MAC; this decides policy only.
 pub fn auto_approve(policy: AutoApprove, is_own_device: bool) -> bool {
     match policy {
         AutoApprove::All => true,
         AutoApprove::Devices => is_own_device,
+        AutoApprove::None => false,
     }
 }
 
@@ -375,6 +379,13 @@ mod tests {
         assert!(!auto_approve(AutoApprove::Devices, false));
         assert!(auto_approve(AutoApprove::All, true));
         assert!(auto_approve(AutoApprove::All, false));
+        // The default approves nothing, not even one's own new device (RVT2 m3).
+        assert_eq!(
+            crate::config::Config::default().team.auto_approve,
+            AutoApprove::None
+        );
+        assert!(!auto_approve(AutoApprove::None, true));
+        assert!(!auto_approve(AutoApprove::None, false));
     }
 
     #[test]

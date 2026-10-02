@@ -134,8 +134,10 @@ pub struct Team {
 }
 
 string_enum!(
-    /// `team.auto_approve`.
-    AutoApprove { Devices => "devices", All => "all" }
+    /// `team.auto_approve`. `none` (the default, RVT2 m3): every join, a new device of one's
+    /// own included, waits for `awm team approve --code N` on an existing device. `devices` and
+    /// `all` are opt-ins that let a leaked invite string in without the code.
+    AutoApprove { None => "none", Devices => "devices", All => "all" }
 );
 
 impl Default for Team {
@@ -149,7 +151,7 @@ impl Default for Team {
             exclude_hosts: Vec::new(),
             summary_chars: 1000,
             share_stats: false,
-            auto_approve: AutoApprove::Devices,
+            auto_approve: AutoApprove::None,
             push_delay_s: 0,
         }
     }
@@ -557,7 +559,7 @@ impl Config {
             "team.share_stats" => self.team.share_stats = flag(key, value)?,
             "team.auto_approve" => {
                 self.team.auto_approve =
-                    pick(key, value, AutoApprove::parse(value), "devices, all")?
+                    pick(key, value, AutoApprove::parse(value), "none, devices, all")?
             }
             "team.push_delay_s" => self.team.push_delay_s = number(key, value)?,
             _ => bail!("unknown configuration key: {key}"),

@@ -31,6 +31,7 @@ use awm_proto::wire::{limits, DeleteRequest, DeleteResponse, ErrorBody, ErrorCod
 
 use crate::auth::{self, AuthError, Caller};
 use crate::authz::{Action, DeleteScope, Refusal};
+use crate::quota::{self, Quota};
 use crate::store::{AuditEntry, Store, StoreError};
 
 /// `{all_mine}` and `{member}` are limited to one per this many seconds per token (§4.3.5).
@@ -57,6 +58,9 @@ pub enum DeleteError {
     TooManyIds { count: usize },
     /// 429 `rate_limited`: a bulk delete by this token within the hour.
     RateLimited { retry_after_s: u32 },
+    /// 429 `rate_limited` with `limit: records_per_day`: the pre-deletions would exceed the
+    /// member's daily quota (RVT2 M1); `Retry-After` until 00:00 UTC.
+    Quota { retry_after_s: u32 },
 }
 
 impl DeleteError {
@@ -65,7 +69,7 @@ impl DeleteError {
             DeleteError::Refused(r) => r.status(),
             DeleteError::Store(e) => e.status(),
             DeleteError::TooManyIds { .. } => 413,
-            DeleteError::RateLimited { .. } => 429,
+            DeleteError::RateLimited { .. } | DeleteError::Quota { .. } => 429,
         }
     }
 
@@ -86,13 +90,21 @@ impl DeleteError {
                 b.retry_after_s = Some(*retry_after_s);
                 Some(b)
             }
+            DeleteError::Quota { retry_after_s } => {
+                let mut b = ErrorBody::new(ErrorCode::RateLimited, self.to_string());
+                b.retry_after_s = Some(*retry_after_s);
+                b.limit = Some("records_per_day".into());
+                Some(b)
+            }
         }
     }
 
     /// The `Retry-After` header value in seconds, for a 429.
     pub fn retry_after(&self) -> Option<u32> {
         match self {
-            DeleteError::RateLimited { retry_after_s } => Some(*retry_after_s),
+            DeleteError::RateLimited { retry_after_s } | DeleteError::Quota { retry_after_s } => {
+                Some(*retry_after_s)
+            }
             _ => None,
         }
     }
@@ -111,6 +123,11 @@ impl fmt::Display for DeleteError {
             DeleteError::RateLimited { retry_after_s } => write!(
                 f,
                 "one delete of all_mine or member per hour per token; retry in {retry_after_s} s"
+            ),
+            DeleteError::Quota { retry_after_s } => write!(
+                f,
+                "the member's daily record quota is used (ids the server does not hold count); \
+                 retry in {retry_after_s} s"
             ),
         }
     }
@@ -156,15 +173,30 @@ pub fn delete_record(_record_id: &str) -> Result<(), crate::store::StoreError> {
 // ---------------------------------------------------------------------------------------------
 // POST /v1/delete
 
-/// `POST /v1/delete` for `caller` (`docs/sync-v1.md` §10.1). Checks, in order: the matrix
-/// (401, 403), the caller's organisation (401), more than 1,000 ids (413), the bulk limit
-/// (429); then `Store::delete` (ownership 403, unknown member 404, roster 400, idempotent by
-/// id, pre-deletion of unknown ids), the notice row for a bulk delete, and the checkpoint.
+/// `POST /v1/delete` for `caller` (`docs/sync-v1.md` §10.1) with the default daily quota
+/// ([`limits::RECORDS_PER_DAY`]); [`run_with_quota`] takes the server's.
 pub async fn run(
     store: &dyn Store,
     caller: &Caller,
     req: DeleteRequest,
     now: i64,
+) -> Result<DeleteResponse, DeleteError> {
+    run_with_quota(store, caller, req, now, limits::RECORDS_PER_DAY).await
+}
+
+/// `POST /v1/delete` for `caller` (`docs/sync-v1.md` §10.1). Checks, in order: the matrix
+/// (401, 403), the caller's organisation (401), more than 1,000 ids (413), for `{ids}` the
+/// member's daily quota over the ids the store has never seen (429 `records_per_day`: a
+/// pre-deletion grows the deletion stream like a push, RVT2 M1; ids it holds do not count),
+/// the bulk limit (429); then `Store::delete` (ownership 403, unknown member 404, roster 400,
+/// idempotent by id, pre-deletion of unknown ids), the notice row for a bulk delete, and the
+/// checkpoint.
+pub async fn run_with_quota(
+    store: &dyn Store,
+    caller: &Caller,
+    req: DeleteRequest,
+    now: i64,
+    records_per_day: u32,
 ) -> Result<DeleteResponse, DeleteError> {
     let scope = match &req {
         DeleteRequest::Ids(_) => DeleteScope::Ids,
@@ -179,6 +211,12 @@ pub async fn run(
     if let DeleteRequest::Ids(ids) = &req {
         if ids.len() > limits::DELETE_IDS {
             return Err(DeleteError::TooManyIds { count: ids.len() });
+        }
+        let new = store.unknown_ids(ids.clone()).await?;
+        if let Quota::Exceeded { retry_after_s } =
+            quota::check(store, by.member_id, new, records_per_day, now).await?
+        {
+            return Err(DeleteError::Quota { retry_after_s });
         }
     }
     if scope == DeleteScope::Ids {
@@ -198,11 +236,30 @@ pub async fn run(
             retry_after_s: retry_after(last, now),
         });
     }
+    // Across instances on one database (TM9 P2, RVT2 m12): the store's claim of this device's
+    // hour; the in-process claim above and the audit read cover one instance and a restart.
+    if !store
+        .claim(bulk_claim_name(device.device_id), now, BULK_INTERVAL_S)
+        .await?
+    {
+        return Err(DeleteError::RateLimited {
+            retry_after_s: BULK_INTERVAL_S as u32,
+        });
+    }
     let detail_scope = match &req {
         DeleteRequest::Member(m) => format!("scope=member member={m}"),
         _ => "scope=all_mine".to_string(),
     };
-    let res = store.delete(req, by, now).await?;
+    let res = match store.delete(req, by, now).await {
+        Ok(res) => res,
+        Err(e) => {
+            // A bulk delete that fails does not use the hour: move the claim back by one.
+            let _ = store
+                .claim(bulk_claim_name(device.device_id), now - BULK_INTERVAL_S, 0)
+                .await;
+            return Err(e.into());
+        }
+    };
     store.checkpoint().await?;
     store
         .append_audit(AuditEntry {
@@ -281,6 +338,11 @@ async fn last_bulk_delete(
         end = from - 1;
     }
     Ok(None)
+}
+
+/// The [`Store::claim`] name of a device's bulk-delete hour.
+fn bulk_claim_name(device: Id) -> String {
+    format!("bulk_delete.{device}")
 }
 
 fn retry_after(last: i64, now: i64) -> u32 {

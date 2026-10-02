@@ -1748,7 +1748,7 @@ fn config_list_shows_team_keys() {
         "team.exclude_hosts = \n",
         "team.summary_chars = 1000\n",
         "team.share_stats = false\n",
-        "team.auto_approve = devices\n",
+        "team.auto_approve = none\n",
         "team.push_delay_s = 0\n",
     ] {
         assert!(list.contains(line), "{line:?} missing from {list}");

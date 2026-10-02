@@ -1,5 +1,7 @@
 //! `GET /healthz` and the internal retention route.
 
+use std::time::{Duration, Instant};
+
 use axum::extract::{Request, State};
 use axum::http::{header, StatusCode};
 use axum::response::Response;
@@ -11,11 +13,27 @@ use super::{json, reply, AppState};
 use crate::auth;
 use awm_proto::wire::ErrorCode;
 
+/// How long `GET /healthz` reuses the store's answer.
+pub const HEALTH_CACHE: Duration = Duration::from_secs(1);
+
 /// `GET /healthz`: 200 when the store answers, 503 when it does not; no auth, no body details,
 /// and outside the protocol (no `Awm-Client`, no rate limit, so a probe never competes with
-/// members).
+/// members). The store's answer is kept for [`HEALTH_CACHE`], so requests at line rate cost one
+/// store read a second (RVT2 m6).
 pub(super) async fn healthz(State(app): State<AppState>) -> Response {
-    let ok = app.store.restore_state().await.is_ok();
+    let cached = {
+        let c = app.health.lock().unwrap_or_else(|p| p.into_inner());
+        c.filter(|(at, _)| at.elapsed() < HEALTH_CACHE)
+            .map(|(_, ok)| ok)
+    };
+    let ok = match cached {
+        Some(ok) => ok,
+        None => {
+            let ok = app.store.restore_state().await.is_ok();
+            *app.health.lock().unwrap_or_else(|p| p.into_inner()) = Some((Instant::now(), ok));
+            ok
+        }
+    };
     let mut r = Response::new(axum::body::Body::from(if ok {
         "ok"
     } else {

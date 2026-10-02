@@ -33,9 +33,11 @@
 //! Reads run in one REPEATABLE READ, READ ONLY transaction each, so `status` and `pull` read one
 //! snapshot. The pool holds at most [`MAX_POOL_SIZE`] connections (§4.2, W31). TLS is not
 //! built in: connect over the Cloud SQL Unix socket (`host=/cloudsql/...`, W31), localhost or a
-//! private network.
+//! private network; any other TCP host is refused unless the operator accepts the risk
+//! (`--database-insecure-network`, RVT2 M4; TLS to Postgres is a later dependency decision).
 
 use std::collections::{BTreeMap, HashSet};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -218,6 +220,68 @@ pub fn stream_lock_key(org: Id, member: Id, device: Id, tag: &str) -> i64 {
 /// The advisory-lock key the migration runner holds for its transaction.
 pub fn migration_lock_key() -> i64 {
     lock_key(&["awm.migrate"])
+}
+
+/// Whether `ip` is this host's or a private network's: loopback, RFC 1918, IPv6 unique local
+/// (`fc00::/7`) or link-local (`169.254.0.0/16`, `fe80::/10`).
+pub fn private_ip(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(v) => v.is_loopback() || v.is_private() || v.is_link_local(),
+        IpAddr::V6(v) => {
+            let s = v.segments()[0];
+            v.is_loopback() || (s & 0xfe00) == 0xfc00 || (s & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// RVT2 M4: the connections have no TLS (`NoTls`), so a host outside this machine and the
+/// private ranges would carry the metadata and ciphertext, and accept changed rows, over a
+/// network anyone on the path can read and write. Returns the first such host of `cfg`, or
+/// `None` when every host is a Unix socket (the Cloud SQL socket), an address [`private_ip`]
+/// accepts, or a name that resolves only to such addresses (`localhost`, a compose service).
+/// A name that does not resolve is returned too.
+pub async fn public_host(cfg: &Config) -> Option<String> {
+    use tokio_postgres::config::Host;
+    let port = cfg.get_ports().first().copied().unwrap_or(5432);
+    for ip in cfg.get_hostaddrs() {
+        if !private_ip(*ip) {
+            return Some(ip.to_string());
+        }
+    }
+    if !cfg.get_hostaddrs().is_empty() {
+        // `hostaddr` is what the connection uses; `host` then only names the server.
+        return None;
+    }
+    for h in cfg.get_hosts() {
+        let Host::Tcp(name) = h else { continue };
+        if let Ok(ip) = name.parse::<IpAddr>() {
+            if !private_ip(ip) {
+                return Some(name.clone());
+            }
+            continue;
+        }
+        match tokio::net::lookup_host((name.as_str(), port)).await {
+            Ok(addrs) => {
+                let addrs: Vec<_> = addrs.collect();
+                if addrs.is_empty() || addrs.iter().any(|a| !private_ip(a.ip())) {
+                    return Some(name.clone());
+                }
+            }
+            Err(_) => return Some(name.clone()),
+        }
+    }
+    None
+}
+
+/// The refusal of [`public_host`] (`awm serve` exits 2 with it).
+pub fn public_host_refusal(host: &str) -> String {
+    format!(
+        "the database host {host} is not loopback, a private address (RFC 1918, ULA, \
+         link-local) or a Unix socket, and the connection has no TLS: anyone on the path could \
+         read and change the data. Connect over a private network or the Cloud SQL socket \
+         (host=/cloudsql/...), or accept the risk with --database-insecure-network \
+         (server.toml database_insecure_network = true)"
+    )
 }
 
 async fn connect_one(cfg: &Config) -> StoreResult<tokio_postgres::Client> {
@@ -442,11 +506,24 @@ impl PgStore {
     /// `--database-url-owner-env` names) it first runs the migrations as the owner role.
     /// Then it refuses to serve when the application role is a superuser, has `BYPASSRLS`, or
     /// owns (or may act as the owner of) any table of the schema, and when the schema is not at
-    /// this binary's version with matching checksums.
+    /// this binary's version with matching checksums. A TCP host outside loopback and the
+    /// private ranges is refused before anything is sent ([`public_host`]); see
+    /// [`PgStore::connect_with`].
     pub async fn connect(
         url: &str,
         owner_url: Option<&str>,
         pool_size: usize,
+    ) -> StoreResult<PgStore> {
+        PgStore::connect_with(url, owner_url, pool_size, false).await
+    }
+
+    /// [`PgStore::connect`]; `insecure_network` (`--database-insecure-network`) accepts a host
+    /// that [`public_host`] refuses.
+    pub async fn connect_with(
+        url: &str,
+        owner_url: Option<&str>,
+        pool_size: usize,
+        insecure_network: bool,
     ) -> StoreResult<PgStore> {
         if pool_size == 0 {
             return Err(StoreError::Backend("pool size must be at least 1".into()));
@@ -457,6 +534,13 @@ impl PgStore {
             .ok_or_else(|| StoreError::Backend("the database URL names no user".into()))?
             .to_string();
         let owner = owner_url.map(parse_url).transpose()?;
+        if !insecure_network {
+            for cfg in std::iter::once(&app).chain(owner.as_ref()) {
+                if let Some(host) = public_host(cfg).await {
+                    return Err(StoreError::Backend(public_host_refusal(&host)));
+                }
+            }
+        }
         if let Some(o) = &owner {
             migrate(o, &app_role).await?;
         }
@@ -2054,6 +2138,26 @@ impl PgOrg {
                 &[&id, &now],
             )
             .await?;
+            // RVT2 m2, as `SqliteStore::remove_member`.
+            tx.exec(
+                "UPDATE member SET revoked_at = $2 \
+                  WHERE revoked_at IS NULL AND id IN \
+                        (SELECT d.member_id FROM device d JOIN invite i ON i.id = d.invite_id \
+                          WHERE i.kind = 'member' AND d.approved = 0 \
+                            AND i.created_by IN (SELECT id FROM device WHERE member_id = $1)) \
+                    AND NOT EXISTS (SELECT 1 FROM device x \
+                                     WHERE x.member_id = member.id AND x.approved = 1)",
+                &[&id, &now],
+            )
+            .await?;
+            tx.exec(
+                "UPDATE device SET revoked_at = $2 \
+                  WHERE approved = 0 AND revoked_at IS NULL AND invite_id IN \
+                        (SELECT id FROM invite WHERE created_by IN \
+                                (SELECT id FROM device WHERE member_id = $1))",
+                &[&id, &now],
+            )
+            .await?;
             tx.exec(
                 "UPDATE org SET rotation_needed = 1 WHERE rotation_needed = 0",
                 &[],
@@ -2704,13 +2808,34 @@ impl PgOrg {
                           WHERE member_id = $1 AND epoch IS NOT NULL AND received_at >= $2) \
                       + (SELECT COUNT(*) FROM deletion d \
                           WHERE d.member_id = $1 AND d.deleted_at >= $2 \
-                            AND NOT EXISTS (SELECT 1 FROM record r WHERE r.id = d.record_id))",
+                            AND NOT EXISTS (SELECT 1 FROM record r \
+                                             WHERE r.id = d.record_id AND r.epoch IS NOT NULL))",
                 &[&member_id.to_string(), &hour(since)],
             )
             .await?;
         let n: i64 = col(&r, 0)?;
         tx.commit().await?;
         Ok(u64::try_from(n).unwrap_or(0))
+    }
+
+    async fn unknown_ids_impl(&self, ids: Vec<Id>) -> StoreResult<u64> {
+        let mut c = self.client().await?;
+        let tx = self.begin(&mut c, Mode::Read).await?;
+        let mut seen = HashSet::new();
+        let mut n = 0u64;
+        for id in ids.iter().filter(|id| seen.insert(**id)) {
+            let r = tx
+                .one(
+                    "SELECT EXISTS (SELECT 1 FROM record WHERE id = $1) \
+                         OR EXISTS (SELECT 1 FROM deletion WHERE record_id = $1)",
+                    &[&id.to_string()],
+                )
+                .await?;
+            let known: bool = col(&r, 0)?;
+            n += u64::from(!known);
+        }
+        tx.commit().await?;
+        Ok(n)
     }
 
     async fn delete_impl(
@@ -3254,6 +3379,12 @@ impl Store for PgOrg {
     }
     fn pushed_since(&self, member_id: Id, since: i64) -> StoreFuture<'_, u64> {
         Box::pin(self.pushed_since_impl(member_id, since))
+    }
+    fn unknown_ids(&self, ids: Vec<Id>) -> StoreFuture<'_, u64> {
+        Box::pin(self.unknown_ids_impl(ids))
+    }
+    fn claim(&self, name: String, at: i64, interval_s: i64) -> StoreFuture<'_, bool> {
+        Box::pin(async move { PgOrg::claim(self, &name, at, interval_s).await })
     }
     fn delete(&self, req: DeleteRequest, by: Actor, now: i64) -> StoreFuture<'_, DeleteResponse> {
         Box::pin(self.delete_impl(req, by, now))

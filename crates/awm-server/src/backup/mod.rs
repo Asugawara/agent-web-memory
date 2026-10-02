@@ -42,6 +42,8 @@ pub mod full;
 #[cfg(feature = "sqlite")]
 pub mod incr;
 #[cfg(feature = "sqlite")]
+pub mod local;
+#[cfg(feature = "sqlite")]
 pub mod restore;
 #[cfg(feature = "sqlite")]
 pub mod run;
@@ -94,9 +96,13 @@ pub mod keys {
     /// Generations this database was restored from, newest last (comma-separated): their
     /// objects are this server's history, kept and expired by its retention.
     pub const LINEAGE: &str = "backup_lineage";
+    /// Unix seconds of the oldest full snapshot the last backup retention kept: local copies
+    /// of the database older than it go ([`super::local`], RVT2 B2).
+    pub const OLDEST_KEPT: &str = "backup_oldest_kept";
 
     /// Every key a restore resets (all but [`LINEAGE`], which it extends).
     pub const STATE: &[&str] = &[
+        OLDEST_KEPT,
         CURSOR,
         LAST_OK_AT,
         LAST_OBJECT,
