@@ -21,12 +21,12 @@ use awm::config::{AutoApprove, Config};
 use awm::db::{self, Role};
 use awm::record::sha256_hex;
 use awm::sync::http::{own_version, Client};
-use awm::sync::push;
 use awm::sync::state::{self, Identity, PendingInvite, TeamKey, TeamToml};
+use awm::sync::{push, roster};
 use awm::sync::{Env, Opts, Outcome, Report};
-use awm_proto::crypto::seal_record;
-use awm_proto::keys::{accept_join, DeviceKeys, Invite, KeyRing, RosterEntry, Wrap};
-use awm_proto::wire::{Id, Key32, KeysResponse, B64};
+use awm_proto::crypto::{open_record, seal_record, RecordAd};
+use awm_proto::keys::{accept_join, DeviceKeys, Invite, KeyRing, RosterEntry, Wrap, ROSTER_TAG};
+use awm_proto::wire::{Id, Key32, KeysResponse, RosterPlaintext, B64};
 use awm_server::auth;
 use awm_server::http::embedded::{self, Embedded};
 use awm_server::http::{AppState, LogSink, ServerConfig};
@@ -589,7 +589,17 @@ const URL_A: &str = "https://docs.example.org/guide/start";
 
 /// The roster side of `awm team remove`: the server call and the signed `revoke` entry.
 fn remove_member(admin: &Node, member: Id) {
+    remove_member_at(admin, member, unix_secs());
+}
+
+/// [`remove_member`] with the revocation dated `revoked_at` (the revoking admin's clock).
+fn remove_member_at(admin: &Node, member: Id, revoked_at: i64) {
     admin.client().remove_member(member).unwrap();
+    queue_revoke(admin, member, revoked_at);
+}
+
+/// Only the signed `revoke` entry, dated `revoked_at`.
+fn queue_revoke(admin: &Node, member: Id, revoked_at: i64) {
     let ident = admin.ident();
     let ring = ident.ring().unwrap();
     let mut conn = admin.conn();
@@ -600,12 +610,61 @@ fn remove_member(admin: &Node, member: Id) {
         &RosterEntry::Revoke {
             member_id: *member.as_uuid(),
             device_id: None,
-            revoked_at: unix_secs(),
+            revoked_at,
             by_device_id: *ident.team.device_id.as_uuid(),
         },
         now_ms(),
     )
     .unwrap();
+}
+
+/// The `created_at` of the `epoch` entry for `epoch` in a node's stored roster records.
+fn epoch_created_at(node: &Node, epoch: u32) -> Option<i64> {
+    let ring = node.ident().ring().unwrap();
+    for b in roster::blobs(&node.conn()).unwrap() {
+        let ad = RecordAd {
+            org: ring.org(),
+            member: b.member,
+            device: b.device,
+            tag: ROSTER_TAG.to_string(),
+            idx: b.idx,
+            record_id: b.record_id,
+            epoch: b.epoch,
+        };
+        let Ok(plain) = open_record(&ring, &ad, &b.blob) else {
+            continue;
+        };
+        let p: RosterPlaintext = serde_json::from_slice(&plain).unwrap();
+        if let RosterEntry::Epoch {
+            epoch: e,
+            created_at,
+            ..
+        } = p.entry
+        {
+            if e == epoch {
+                return Some(created_at);
+            }
+        }
+    }
+    None
+}
+
+/// The epochs the server holds a wrap of for `device`.
+fn wrap_epochs(srv: &Srv, device: Id) -> Vec<u32> {
+    let mut v: Vec<u32> = embedded::block_on(srv.store.keys(device))
+        .unwrap()
+        .wraps
+        .iter()
+        .map(|w| w.epoch)
+        .collect();
+    v.sort_unstable();
+    v
+}
+
+/// A run of the admin against a server that withholds `rotation_needed`.
+fn sync_withheld(srv: &Srv, node: &Node) -> Report {
+    srv.withhold_rotation();
+    node.sync()
 }
 
 fn rows_of(conn: &Connection, sql: &str) -> Vec<String> {
@@ -1090,6 +1149,197 @@ fn an_admin_rotates_after_a_removal_even_when_the_server_never_sets_rotation_nee
     assert!(!b.sync().rotated);
 }
 
+// FT3a (RVT3 F2, F6, §5): the client's own rotation check at epoch 1 and later. Each test
+// withholds `rotation_needed`, so only `roster::revoked_since_current_epoch` decides.
+
+/// (a) A device the epoch-1 entry lists is revoked afterwards, by an admin whose clock is ten
+/// minutes behind: the revocation is dated before the entry, and the listed-device rule rotates.
+#[test]
+fn a_revoked_device_of_the_current_epoch_entry_rotates_whatever_the_revocations_date() {
+    let (srv, a, b) = org_of_two();
+    let c = add_member(&srv, &a, "carol", "member");
+    c.sync();
+    remove_member(&a, c.ident().team.member_id);
+    assert!(sync_withheld(&srv, &a).rotated);
+    let at = epoch_created_at(&a, 1).expect("the epoch-1 entry");
+    b.sync();
+    assert_eq!(wrap_epochs(&srv, b.ident().team.device_id), [0, 1]);
+
+    remove_member_at(&a, b.ident().team.member_id, at - 600);
+    let r = sync_withheld(&srv, &a);
+    assert!(r.rotated, "bob is in the epoch-1 entry: {r:?}");
+    assert_eq!(a.ident().ring().unwrap().current_epoch(), 2);
+    assert_eq!(
+        wrap_epochs(&srv, b.ident().team.device_id),
+        [0, 1],
+        "no wrap of epoch 2 for bob"
+    );
+    assert!(!sync_withheld(&srv, &a).rotated, "the next run is quiet");
+    assert_eq!(a.ident().ring().unwrap().current_epoch(), 2);
+}
+
+/// (b) A device approved after the epoch-1 entry (it got epoch 1 with its approval wraps, the
+/// entry does not list it) is revoked: the revocation is dated at or after the entry and rotates.
+#[test]
+fn a_device_approved_after_the_epoch_entry_and_revoked_rotates() {
+    let (srv, a, b) = org_of_two();
+    let c = add_member(&srv, &a, "carol", "member");
+    c.sync();
+    remove_member_at(&a, c.ident().team.member_id, unix_secs() - 10);
+    assert!(sync_withheld(&srv, &a).rotated);
+    let at = epoch_created_at(&a, 1).expect("the epoch-1 entry");
+    b.sync();
+
+    let d = add_member(&srv, &a, "dave", "member");
+    assert_eq!(
+        d.ident().ring().unwrap().current_epoch(),
+        1,
+        "dave holds epoch 1"
+    );
+    d.sync();
+    remove_member(&a, d.ident().team.member_id);
+    assert!(unix_secs() >= at);
+    let r = sync_withheld(&srv, &a);
+    assert!(r.rotated, "dave held the current key: {r:?}");
+    assert_eq!(a.ident().ring().unwrap().current_epoch(), 2);
+    assert_eq!(wrap_epochs(&srv, d.ident().team.device_id), [0, 1]);
+    assert!(wrap_epochs(&srv, b.ident().team.device_id).contains(&2));
+    assert!(!sync_withheld(&srv, &a).rotated, "the next run is quiet");
+}
+
+/// (c) A revocation that reaches the admin after the rotation but is dated before the epoch
+/// entry, of a device the entry does not list: the key never reached that device, no rotation.
+#[test]
+fn a_revocation_dated_before_the_current_epoch_entry_asks_for_no_rotation() {
+    let (srv, a, b) = org_of_two();
+    let c = add_member(&srv, &a, "carol", "member");
+    c.sync();
+    let cm = c.ident().team.member_id;
+    // The server removes carol and asks for the rotation; the signed revocation comes later.
+    a.client().remove_member(cm).unwrap();
+    assert!(a.sync().rotated);
+    let at = epoch_created_at(&a, 1).expect("the epoch-1 entry");
+    assert_eq!(wrap_epochs(&srv, c.ident().team.device_id), [0]);
+
+    queue_revoke(&a, cm, at - 600);
+    let r = sync_withheld(&srv, &a);
+    assert!(!r.rotated, "{r:?}");
+    assert_eq!(
+        a.count("SELECT COUNT(*) FROM team_member WHERE handle = 'carol' AND active = 0"),
+        1,
+        "the revocation is applied"
+    );
+    assert_eq!(a.ident().ring().unwrap().current_epoch(), 1);
+    assert!(!sync_withheld(&srv, &b).rotated);
+}
+
+/// (d) RVT3 F6: a revocation dated ten minutes ahead of the rotating admin's clock rotates once;
+/// the entry is dated after it, so the next run is quiet instead of rotating every run.
+#[test]
+fn a_revocation_dated_ahead_of_the_rotating_admins_clock_rotates_exactly_once() {
+    let (srv, a, b) = org_of_two();
+    let c = add_member(&srv, &a, "carol", "member");
+    c.sync();
+    let ahead = unix_secs() + 600;
+    remove_member_at(&a, c.ident().team.member_id, ahead);
+    let r = a.sync();
+    assert!(r.rotated, "{r:?}");
+    assert_eq!(epoch_created_at(&a, 1), Some(ahead + 1));
+    for _ in 0..2 {
+        assert!(!sync_withheld(&srv, &a).rotated, "no second rotation");
+    }
+    assert_eq!(a.ident().ring().unwrap().current_epoch(), 1);
+    b.sync();
+    assert_eq!(b.ident().ring().unwrap().current_epoch(), 1);
+    assert!(!sync_withheld(&srv, &b).rotated);
+}
+
+// FT3a (RVT3 F3): `roster_record` is only ever added to.
+#[test]
+fn a_stored_roster_record_is_never_replaced_by_a_later_one_at_the_same_place() {
+    let n = Node::blank("ann");
+    let conn = n.conn();
+    let (m, d) = (Id::new_v4().to_string(), Id::new_v4().to_string());
+    let first = Id::new_v4().to_string();
+    assert!(roster::store_record(&conn, &m, &d, 0, &first, 0, b"first blob").unwrap());
+    let other = Id::new_v4().to_string();
+    assert!(!roster::store_record(&conn, &m, &d, 0, &other, 1, b"second blob").unwrap());
+    let (id, epoch, blob): (String, u32, Vec<u8>) = conn
+        .query_row(
+            "SELECT record_id, epoch, blob FROM roster_record WHERE member_id = ?1 AND device_id = ?2 AND idx = 0",
+            [&m, &d],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((id, epoch, blob), (first, 0, b"first blob".to_vec()));
+    assert_eq!(n.count("SELECT COUNT(*) FROM roster_record"), 1);
+}
+
+// FT3a (RVT3 F4): the reading steps come before the push.
+#[test]
+fn a_new_devices_first_run_stores_the_roster_before_it_pushes_a_record() {
+    let srv = Srv::start();
+    let a = create_org(&srv, "ann");
+    a.sync();
+    let b = add_member(&srv, &a, "bob", "member");
+    assert_eq!(b.count("SELECT COUNT(*) FROM roster_record"), 0);
+    b.capture_fetch(1, URL_A, "p", "bob's first record");
+    let from = srv.logs.0.lock().unwrap().len();
+    let r = b.sync();
+    assert_eq!(r.pushed, 1, "{r:?}");
+    assert!(r.push_blocked.is_none(), "{r:?}");
+    assert!(b.count("SELECT COUNT(*) FROM roster_record") > 0);
+    let member = format!("member={}", b.ident().team.member_id);
+    let lines: Vec<String> = srv.logs.0.lock().unwrap()[from..]
+        .iter()
+        .filter(|l| l.contains(&member))
+        .cloned()
+        .collect();
+    let at = |path: &str| {
+        lines
+            .iter()
+            .position(|l| l.contains(&format!("path={path} ")))
+    };
+    let records = at("/v1/records").unwrap_or_else(|| panic!("no push: {lines:#?}"));
+    let pull = at("/v1/pull").unwrap_or_else(|| panic!("no pull: {lines:#?}"));
+    assert!(pull < records, "{lines:#?}");
+    if let Some(keys) = at("/v1/keys") {
+        assert!(keys < records, "{lines:#?}");
+    }
+}
+
+// FT3a (RVT3 F18): no write transaction of the record path holds more than 25 rows.
+#[test]
+fn a_pull_of_200_records_writes_at_most_25_rows_per_transaction() {
+    let (srv, a, b) = org_of_two();
+    let m = forger(&srv, &a);
+    let ident = m.ident();
+    let ring = ident.ring().unwrap();
+    let now = unix_secs();
+    let items: Vec<(u64, Id, Vec<u8>)> = (0..200u64)
+        .map(|i| {
+            let id = Id::new_v4();
+            let plain = serde_json::to_vec(&rec_plaintext(
+                &format!("https://rows.example.org/p/{i}"),
+                &format!("record {i} about transaction sizes"),
+                now,
+            ))
+            .unwrap();
+            (i, id, seal_forged(&ident, &ring, i, id, &plain))
+        })
+        .collect();
+    for chunk in items.chunks(100) {
+        push_blobs(&m, chunk.to_vec());
+    }
+    let r = b.sync();
+    assert_eq!(r.pulled, 200, "{r:?}");
+    assert!(
+        (1..=awm::sync::apply::CHUNK_ROWS).contains(&r.max_rows_per_txn),
+        "{r:?}"
+    );
+    assert!(r.apply_ms.len() >= 8, "{r:?}");
+}
+
 #[test]
 fn a_pending_device_is_left_alone_when_the_decision_says_no() {
     let srv = Srv::start();
@@ -1392,5 +1642,10 @@ fn applying_10000_pulled_rows_loses_no_injection_row_of_200_concurrent_hook_runs
     assert!(
         report.apply_p95_ms().unwrap() <= 20 + 15,
         "short transactions"
+    );
+    assert!(
+        (1..=25).contains(&report.max_rows_per_txn),
+        "at most 25 rows per transaction (RVT3 F18): {}",
+        report.max_rows_per_txn
     );
 }

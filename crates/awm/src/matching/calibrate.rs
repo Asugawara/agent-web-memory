@@ -1,6 +1,7 @@
 //! Cutoff calibration (plan-v2 §3.3).
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -58,13 +59,98 @@ fn record_count(conn: &Connection) -> Result<i64> {
 /// A copy of the database without teammates' rows, for the scores: BM25 weighs a term by how
 /// rare it is among all indexed documents, so teammates' text would move the cutoff even if
 /// their rows could never be a hit. Deleted with its journal files when dropped.
+///
+/// The copy holds every teammate row until they are deleted from it, so a process killed in
+/// between (a hook timeout, a session end) leaves one behind: it lives in `{data}/tmp/` (mode
+/// 0700) as `awm.db.calibrate-{pid}-{nanos}`, the next calibration, `awm forget` and a remote
+/// deletion remove the stale ones ([`sweep_stale_copies`]), and `awm purge --all` and
+/// `awm uninstall` delete the directory (RVT3 F7).
 struct LocalCopy {
     path: std::path::PathBuf,
     conn: Connection,
 }
 
+/// The name prefix of a calibration copy in `{data}/tmp/`.
+pub const COPY_PREFIX: &str = "awm.db.calibrate-";
+/// A copy older than this is stale whatever its process.
+const COPY_MAX_AGE: Duration = Duration::from_secs(3_600);
+
+/// Whether `name` is a calibration copy or one of its journal files.
+pub fn is_copy_name(name: &str) -> bool {
+    name.starts_with(COPY_PREFIX)
+}
+
+/// The pid and creation time (Unix nanoseconds) in a copy's name, journal suffixes included.
+fn copy_parts(name: &str) -> Option<(u32, u128)> {
+    let mut it = name.strip_prefix(COPY_PREFIX)?.split('-');
+    let pid = it.next()?.parse().ok()?;
+    let nanos = it.next()?.parse().ok()?;
+    Some((pid, nanos))
+}
+
+/// Whether process `pid` still runs (on unix, `kill -0`; elsewhere assumed to run, so only the
+/// age rule applies).
+fn pid_alive(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    if Path::new("/proc/self").is_dir() {
+        return Path::new("/proc").join(pid.to_string()).exists();
+    }
+    #[cfg(unix)]
+    {
+        // A failure to ask counts as alive: the copy then goes after an hour.
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_or(true, |s| s.success())
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Deletes the stale calibration copies in `{data_dir}/tmp/`: those whose process no longer
+/// runs, those older than an hour, and names that do not parse. Returns the deleted paths. A
+/// missing directory, or a `tmp` that is not a real directory, deletes nothing.
+pub fn sweep_stale_copies(data_dir: &Path) -> Result<Vec<PathBuf>> {
+    let dir = data_dir.join(paths::TMP_DIR);
+    let mut gone = Vec::new();
+    if !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+        return Ok(gone);
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let mut alive: std::collections::HashMap<u32, bool> = std::collections::HashMap::new();
+    for e in std::fs::read_dir(&dir)?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !is_copy_name(&name) || !e.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let stale = match copy_parts(&name) {
+            Some((pid, nanos)) => {
+                now.saturating_sub(nanos) > COPY_MAX_AGE.as_nanos()
+                    || !*alive.entry(pid).or_insert_with(|| pid_alive(pid))
+            }
+            None => true,
+        };
+        if stale {
+            std::fs::remove_file(e.path())?;
+            gone.push(e.path());
+        }
+    }
+    gone.sort();
+    Ok(gone)
+}
+
 impl LocalCopy {
-    /// `None` when the database holds no teammate row (the scores then use the database itself).
+    /// `None` when the database holds no teammate row (the scores then use the database itself),
+    /// or when `{data}/tmp` exists but is not a real directory.
     fn of(conn: &Connection) -> Result<Option<LocalCopy>> {
         let team: Option<i64> = conn
             .query_row(
@@ -76,15 +162,28 @@ impl LocalCopy {
         if team.is_none() {
             return Ok(None);
         }
-        let Some(db_path) = conn.path().map(std::path::PathBuf::from) else {
+        let Some(db_path) = conn.path().map(PathBuf::from) else {
             return Ok(None);
         };
+        let Some(data_dir) = db_path.parent() else {
+            return Ok(None);
+        };
+        let dir = data_dir.join(paths::TMP_DIR);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => return Ok(None),
+            Err(_) => paths::ensure_private_dir(&dir)?,
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        sweep_stale_copies(data_dir)?;
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        let mut name = db_path.clone().into_os_string();
-        name.push(format!(".calibrate-{}-{nanos}", std::process::id()));
-        let path = std::path::PathBuf::from(name);
+        let path = dir.join(format!("{COPY_PREFIX}{}-{nanos}", std::process::id()));
         // An empty private file: `VACUUM INTO` accepts it, and the copy is never world-readable.
         let mut open = std::fs::OpenOptions::new();
         open.write(true).create_new(true);

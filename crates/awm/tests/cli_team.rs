@@ -1820,3 +1820,243 @@ fn the_help_of_team_sync_and_serve_does_not_call_them_unimplemented() {
         assert_eq!(help.lines().next(), Some(first), "{help}");
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// FT3a: awm sync --push-only, --pull-only, --status (RVT3 F5), rejected items (F17), the line
+// after `pushed 0` (F21), one rotation per removal (F6)
+
+/// Request paths of the server log from `from` on, for `member`.
+fn paths_since(srv: &Srv, from: usize, member: Id) -> Vec<String> {
+    let tag = format!("member={member}");
+    srv.logs.0.lock().unwrap()[from..]
+        .iter()
+        .filter(|l| l.contains(&tag))
+        .filter_map(|l| {
+            let method = l.split("method=").nth(1)?.split(' ').next()?;
+            let path = l.split("path=").nth(1)?.split(' ').next()?;
+            Some(format!("{method} {path}"))
+        })
+        .collect()
+}
+
+#[test]
+fn sync_push_only_and_pull_only_skip_the_other_phase_and_exclude_each_other() {
+    let srv = Srv::start();
+    let a = create(&srv, "ann");
+    a.ok(&["sync"]);
+    let b = member(&srv, &a, "bob");
+    share(&a);
+    share(&b);
+    b.capture(1, "https://docs.example.org/bob", "Bob's note.");
+    b.ok(&["sync"]);
+    a.capture(1, "https://docs.example.org/ann", "Ann's note.");
+
+    // --push-only: Ann's record goes out, Bob's stays on the server.
+    let from = srv.log_len();
+    let out = a.ok(&["sync", "--push-only"]);
+    assert!(out.contains("synced: pushed 1, pulled 0"), "{out}");
+    let paths = paths_since(&srv, from, a.member());
+    assert!(paths.contains(&"POST /v1/records".to_string()), "{paths:?}");
+    assert!(
+        !paths
+            .iter()
+            .any(|p| p.contains("/v1/pull") || p.contains("/v1/deletions")),
+        "{paths:?}"
+    );
+    assert_eq!(
+        a.count("SELECT COUNT(*) FROM event WHERE origin = 'team'"),
+        0
+    );
+
+    // --pull-only: Bob's record comes in, Ann's new one stays queued here.
+    a.capture(2, "https://docs.example.org/ann2", "Ann's second note.");
+    let from = srv.log_len();
+    let out = a.ok(&["sync", "--pull-only"]);
+    assert!(out.contains("synced: pushed 0, pulled 1"), "{out}");
+    let paths = paths_since(&srv, from, a.member());
+    assert!(paths.contains(&"POST /v1/pull".to_string()), "{paths:?}");
+    assert!(
+        !paths
+            .iter()
+            .any(|p| p.contains("/v1/records") || p.contains("/v1/keys/rotate")),
+        "{paths:?}"
+    );
+    assert_eq!(
+        a.count("SELECT COUNT(*) FROM event WHERE origin = 'team'"),
+        1
+    );
+    assert_eq!(
+        a.count("SELECT COUNT(*) FROM event WHERE origin = 'local' AND pushed_at IS NULL"),
+        1
+    );
+
+    // Both take the lock.
+    let lock = std::fs::File::options()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(a.path().join("sync.lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    for flag in ["--push-only", "--pull-only"] {
+        let out = a.ok(&["sync", "--once", flag]);
+        assert!(out.contains("another awm sync is running"), "{flag}: {out}");
+    }
+    drop(lock);
+
+    // Not both, and --status with neither.
+    for args in [
+        &["sync", "--push-only", "--pull-only"][..],
+        &["sync", "--status", "--push-only"][..],
+        &["sync", "--status", "--pull-only"][..],
+    ] {
+        let o = a.run(args);
+        assert_eq!(o.code, Some(2), "{args:?}: {}", o.stdout);
+        assert!(
+            o.stderr.contains("cannot be used with"),
+            "{args:?}: {}",
+            o.stderr
+        );
+    }
+}
+
+#[test]
+fn sync_status_prints_what_team_status_prints_and_does_not_sync() {
+    let srv = Srv::start();
+    let a = create(&srv, "ann");
+    a.ok(&["sync"]);
+    share(&a);
+    a.capture(1, "https://docs.example.org/waiting", "Waiting.");
+    let last_ok = a.state("last_ok");
+    let from = srv.log_len();
+    let via_sync = a.ok(&["sync", "--status"]);
+    let via_team = a.ok(&["team", "status"]);
+    assert_eq!(via_sync, via_team);
+    assert!(via_sync.contains("last sync "), "{via_sync}");
+    let paths = paths_since(&srv, from, a.member());
+    assert!(
+        paths.iter().all(|p| p == "GET /v1/status"),
+        "no sync: {paths:?}"
+    );
+    assert_eq!(a.state("last_ok"), last_ok);
+    assert_eq!(
+        a.count("SELECT COUNT(*) FROM event WHERE pushed_at IS NOT NULL"),
+        0
+    );
+    // Outside a team: the same text too.
+    let n = Node::new();
+    assert_eq!(n.ok(&["sync", "--status"]), n.ok(&["team", "status"]));
+}
+
+#[test]
+fn a_single_item_the_server_refuses_is_dropped_counted_and_the_next_item_is_pushed() {
+    let srv = Srv::start();
+    let a = create(&srv, "ann");
+    a.ok(&["sync"]);
+    share(&a);
+    // A stored item too large to ever go out (413 `too_large`, `blob`), queued before a normal
+    // record: a flag whose stored blob was replaced by 1.1 MB (alone in its request).
+    let ident = a.ident();
+    let ring = ident.ring().unwrap();
+    awm::sync::push::queue_item(
+        &mut a.conn(),
+        &ident,
+        &ring,
+        "flag",
+        "flag",
+        b"{}",
+        now_ms(),
+    )
+    .unwrap();
+    a.conn()
+        .execute(
+            "UPDATE sync_own SET blob = zeroblob(1100000) WHERE tag = 'flag' AND idx = 0",
+            [],
+        )
+        .unwrap();
+    let e = a.capture(1, "https://docs.example.org/after-the-big-one", "After.");
+    let o = a.run(&["sync"]);
+    assert_eq!(o.code, Some(0), "{}{}", o.stdout, o.stderr);
+    assert!(
+        o.stdout.contains("synced: pushed 1, pulled 0, rejected 1"),
+        "{}",
+        o.stdout
+    );
+    assert!(
+        o.stderr.contains("the server refused flag 0") && o.stderr.contains("with 413"),
+        "{}",
+        o.stderr
+    );
+    assert!(
+        a.count(&format!(
+            "SELECT COUNT(*) FROM event WHERE id = {e} AND pushed_at IS NOT NULL"
+        )) == 1
+    );
+    assert_eq!(a.count("SELECT COUNT(*) FROM sync_outbox"), 0);
+    assert_eq!(a.status()["dropped"]["push_rejected"], 1);
+    // The flag stream holds a marker at idx 0, so the stream stays contiguous.
+    let deleted: i64 = srv
+        .raw()
+        .query_row(
+            "SELECT COUNT(*) FROM record WHERE member_id = ?1 AND tag = 'flag' AND idx = 0 AND blob IS NULL",
+            [a.member().to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(deleted, 1);
+    // The next run is clean.
+    let out = a.ok(&["sync"]);
+    assert!(!out.contains("rejected"), "{out}");
+}
+
+#[test]
+fn a_run_that_pushed_nothing_says_whether_anything_waits_and_when_the_last_sync_was() {
+    let srv = Srv::start();
+    let a = create(&srv, "ann");
+    let out = a.ok(&["sync"]);
+    assert!(out.contains("synced: pushed 1"), "the genesis: {out}");
+    assert!(!out.contains("nothing waiting"), "{out}");
+    let out = a.ok(&["sync"]);
+    let line = out
+        .lines()
+        .find(|l| l.starts_with("nothing waiting; last successful sync "))
+        .unwrap_or_else(|| panic!("{out}"));
+    let secs: i64 = line
+        .trim_start_matches("nothing waiting; last successful sync ")
+        .trim_end_matches(" s ago")
+        .parse()
+        .unwrap_or_else(|_| panic!("{line}"));
+    assert!((0..60).contains(&secs), "{line}");
+
+    // A member's first run pushes nothing: no earlier sync.
+    let t = invite(&srv, &a, "bob");
+    let (b, code) = join(&srv, &t);
+    a.ok(&["team", "approve", "bob", "--code", &code]);
+    let out = b.ok(&["sync"]);
+    assert!(
+        out.contains("nothing waiting; no successful sync yet"),
+        "{out}"
+    );
+}
+
+#[test]
+fn remove_rotates_exactly_once_and_a_later_sync_does_not_rotate_again() {
+    let srv = Srv::start();
+    let a = create(&srv, "ann");
+    a.ok(&["sync"]);
+    let b = member(&srv, &a, "bob");
+    let _c = member(&srv, &a, "cat");
+    a.ok(&["sync"]);
+    let out = a.ok(&["team", "remove", "@cat"]);
+    assert!(out.contains("rotated to epoch 1"), "{out}");
+    for _ in 0..2 {
+        // A server that withholds `rotation_needed`: only the client's own check decides.
+        srv.raw()
+            .execute("UPDATE org SET rotation_needed = 0", [])
+            .unwrap();
+        let out = a.ok(&["sync"]);
+        assert!(!out.contains("rotated"), "{out}");
+    }
+    assert_eq!(TeamKey::load(a.path()).unwrap().epoch_keys.len(), 2);
+    assert_eq!(srv.wrap_epochs(b.device()), [0, 1]);
+}

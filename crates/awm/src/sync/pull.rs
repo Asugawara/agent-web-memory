@@ -30,8 +30,9 @@ use crate::sync::payload::{
 use crate::sync::state;
 use crate::sync::{apply, push, roster, Session};
 
-/// Rows per write transaction (plan-v3-team §4.6 step 6).
-pub const CHUNK_ROWS: usize = 25;
+/// Rows per write transaction (plan-v3-team §4.6 step 6): the one constant of the record and the
+/// deletion paths (RVT3 F18).
+pub use crate::sync::apply::CHUNK_ROWS;
 /// Time per write transaction.
 pub const CHUNK_TIME: Duration = Duration::from_millis(20);
 /// Records per `POST /v1/pull`.
@@ -596,6 +597,7 @@ fn apply(s: &mut Session<'_>, items: Vec<Prepared>) -> Result<usize> {
         tx.commit()?;
         let took = started.elapsed();
         s.report.apply_ms.push(took.as_millis() as u64);
+        s.report.max_rows_per_txn = s.report.max_rows_per_txn.max(n);
         if i < items.len() {
             // Leave the write lock free long enough for a waiting hook to take it: SQLite's
             // busy handler polls at 1, 3, 8, 18, 33 ms.
@@ -783,6 +785,7 @@ pub fn apply_deletions(s: &mut Session<'_>) -> Result<usize> {
             state::set(&tx, state::DELETION_HEAD, &head.to_string())?;
             tx.commit()?;
             s.report.delete_tx_rows.push(chunk.len());
+            s.report.max_rows_per_txn = s.report.max_rows_per_txn.max(chunk.len());
             if n + 1 < last {
                 std::thread::sleep(Duration::from_millis(15));
             }
@@ -799,6 +802,7 @@ pub fn apply_deletions(s: &mut Session<'_>) -> Result<usize> {
 /// to -1, so the next pull reads them again from 0.
 fn reconcile(s: &mut Session<'_>) -> Result<()> {
     apply::drop_team_rows(&mut s.conn, None, &mut s.report.delete_tx_rows)?;
+    note_delete_rows(s);
     s.conn.execute(
         "UPDATE sync_stream SET head_idx = -1 WHERE device_id <> ?1 AND tag <> 'roster'",
         [s.ident.team.device_id.to_string()],
@@ -814,7 +818,15 @@ pub fn prune_retention(s: &mut Session<'_>) -> Result<usize> {
         return Ok(0);
     };
     let cutoff = s.now_ms() - i64::from(status.settings.retention_days) * 86_400_000;
-    apply::drop_team_rows(&mut s.conn, Some(cutoff), &mut s.report.delete_tx_rows)
+    let n = apply::drop_team_rows(&mut s.conn, Some(cutoff), &mut s.report.delete_tx_rows)?;
+    note_delete_rows(s);
+    Ok(n)
+}
+
+/// Folds the deletion transactions into `Report::max_rows_per_txn`.
+fn note_delete_rows(s: &mut Session<'_>) {
+    let max = s.report.delete_tx_rows.iter().copied().max().unwrap_or(0);
+    s.report.max_rows_per_txn = s.report.max_rows_per_txn.max(max);
 }
 
 /// A count of teammates' rows by author, for the report and the tests.
