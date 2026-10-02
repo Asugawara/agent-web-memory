@@ -248,20 +248,50 @@ fn only_session_start_and_capture_call_the_spawn() {
     }
 }
 
+fn rust_files(path: &Path, out: &mut Vec<PathBuf>) {
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path).unwrap() {
+            rust_files(&entry.unwrap().path(), out);
+        }
+    } else if path.extension().is_some_and(|e| e == "rs") {
+        out.push(path.to_path_buf());
+    }
+}
+
+/// An allow-list (RVT3 F16): in the hook-side sources the only `sync::` path is the detached
+/// spawn (`sync::spawn::maybe_spawn` and `sync::spawn` module paths). The sync engine, the team
+/// code, the CLI and the HTTP client are out of reach.
 #[test]
 fn no_hook_source_reaches_the_network_modules() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    for file in ["hook", "matching"] {
-        for entry in std::fs::read_dir(src.join(file)).unwrap() {
-            let path = entry.unwrap().path();
-            if path.extension().is_some_and(|e| e == "rs") {
-                let text = std::fs::read_to_string(&path).unwrap();
-                assert!(
-                    !text.contains("sync::http") && !text.contains("ureq"),
-                    "{} must not reach the network",
-                    path.display()
-                );
+    let mut files = Vec::new();
+    for part in ["hook", "matching", "render.rs", "note.rs", "db.rs"] {
+        rust_files(&src.join(part), &mut files);
+    }
+    assert!(files.len() > 5, "the walk found {} files", files.len());
+    for path in files {
+        let text = std::fs::read_to_string(&path).unwrap();
+        for forbidden in ["ureq", "crate::team", "cli::sync"] {
+            assert!(
+                !text.contains(forbidden),
+                "{} must not mention `{forbidden}`",
+                path.display()
+            );
+        }
+        for (at, _) in text.match_indices("sync::") {
+            // `std::sync::...` is the standard library, not ours.
+            if text[..at].ends_with("std::") || text[..at].ends_with("core::") {
+                continue;
             }
+            assert!(
+                text[at + "sync::".len()..].starts_with("spawn"),
+                "{}: only `sync::spawn` may be used here, found `{}`",
+                path.display(),
+                text[at..(at + 24).min(text.len())]
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+            );
         }
     }
     let text = std::fs::read_to_string(src.join("sync/spawn.rs")).unwrap();
@@ -280,13 +310,15 @@ mod binary {
 
     use serde_json::{json, Value};
 
-    /// A stand-in for `awm sync --once --quiet`: records its arguments at once and a marker one
-    /// second later, and keeps nothing of its parent's stdio.
+    /// A stand-in for `awm sync --once --quiet`: records its arguments at once and a marker five
+    /// seconds later, and keeps nothing of its parent's stdio. It is run once with `--warm`
+    /// before it is returned: the first exec of a freshly written script can take a second on
+    /// macOS, which must not count against the hook's bound.
     fn stand_in(home: &Home) -> PathBuf {
         let path = home.path().join("fake-sync.sh");
         let marker = home.path().join("marker");
         let script = format!(
-            "#!/bin/sh\necho \"$@\" > '{m}.args'\nps -o ppid= -p $$ > '{m}.ppid'\nsleep 1\necho done > '{m}.done'\n",
+            "#!/bin/sh\n[ \"$1\" = --warm ] && exit 0\necho \"$@\" > '{m}.args'\nps -o ppid= -p $$ > '{m}.ppid'\nsleep 5\necho done > '{m}.done'\n",
             m = marker.display()
         );
         let mut f = std::fs::File::create(&path).unwrap();
@@ -294,6 +326,11 @@ mod binary {
         f.sync_all().unwrap();
         drop(f);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(Command::new(&path)
+            .arg("--warm")
+            .status()
+            .unwrap()
+            .success());
         path
     }
 
@@ -314,10 +351,12 @@ mod binary {
             .take()
             .unwrap()
             .write_all(payload.to_string().as_bytes());
-        // Waits for EOF on stdout and stderr: a child that kept them would hold this for a second.
+        // Waits for EOF on stdout and stderr: a child that kept them would hold this for five seconds.
         let out = child.wait_with_output().unwrap();
         assert_eq!(out.status.code(), Some(0));
-        start.elapsed()
+        let elapsed = start.elapsed();
+        eprintln!("hook {hook}: wall-clock {elapsed:?}");
+        elapsed
     }
 
     fn fixture(name: &str) -> Value {
@@ -348,7 +387,7 @@ mod binary {
         let script = stand_in(&home);
         let elapsed = run_hook(&home, "session-start", &session_start_payload(), &script);
         assert!(
-            elapsed < Duration::from_millis(900),
+            elapsed < Duration::from_millis(2500),
             "the hook waited for the child: {elapsed:?}"
         );
         assert!(
@@ -356,7 +395,7 @@ mod binary {
             "the child was already done when the hook returned"
         );
         // The hook has exited; the child still finishes.
-        assert!(wait_for(&home.path().join("marker.done"), 10));
+        assert!(wait_for(&home.path().join("marker.done"), 20));
         let args = std::fs::read_to_string(home.path().join("marker.args")).unwrap();
         assert_eq!(args.trim(), "sync --once --quiet");
         let ppid = std::fs::read_to_string(home.path().join("marker.ppid")).unwrap();
@@ -373,14 +412,14 @@ mod binary {
         let script = stand_in(&home);
         let payload = fixture("PostToolUse-WebFetch-plugin-3.json");
         let elapsed = run_hook(&home, "capture", &payload, &script);
-        assert!(elapsed < Duration::from_millis(900), "{elapsed:?}");
+        assert!(elapsed < Duration::from_millis(2500), "{elapsed:?}");
         assert_eq!(
             home.conn()
                 .query_row("SELECT COUNT(*) FROM event", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
             1
         );
-        assert!(wait_for(&home.path().join("marker.done"), 10));
+        assert!(wait_for(&home.path().join("marker.done"), 20));
         assert!(home.last_spawn().is_some());
     }
 
@@ -431,7 +470,7 @@ mod binary {
         let home = Home::new(true);
         let script = stand_in(&home);
         run_hook(&home, "session-start", &session_start_payload(), &script);
-        assert!(wait_for(&home.path().join("marker.done"), 10));
+        assert!(wait_for(&home.path().join("marker.done"), 20));
         std::fs::remove_file(home.path().join("marker.args")).unwrap();
         run_hook(&home, "session-start", &session_start_payload(), &script);
         std::thread::sleep(Duration::from_millis(300));

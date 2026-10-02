@@ -1,7 +1,7 @@
 # CI (plan-v3-team §9.1, §6.5). `release.yml` is P-GH's; the weekly `cargo deny` job is TM25's.
 #
-# Ubuntu: scripts/check.sh, the Postgres and Pebble test lines, hook-nonet (when TM13 has landed
-# it), the systemd unit checks, the container image, the three self-hosting smoke modes (and the
+# Ubuntu: scripts/check.sh, the Postgres and Pebble test lines, hook-nonet (self-test and run),
+# the systemd unit checks, the container image, the three self-hosting smoke modes (and the
 # seeded restore), shellcheck. macOS: scripts/check.sh only.
 #
 # No secrets are used anywhere: the Postgres service container has throw-away credentials and
@@ -62,7 +62,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends jq sqlite3 curl openssl postgresql-client shellcheck
+          sudo apt-get install -y --no-install-recommends jq sqlite3 curl openssl postgresql-client shellcheck strace
 
       - name: Rust toolchain (rust-toolchain.toml)
         run: |
@@ -99,14 +99,11 @@ jobs:
       - name: scripts/check.sh
         run: bash scripts/check.sh
 
+      - name: Hook without network, self-test (TM13)
+        run: bash scripts/hook-nonet.sh --self-test
+
       - name: Hook without network (TM13)
-        run: |
-          set -euo pipefail
-          if [ -f scripts/hook-nonet.sh ]; then
-            bash scripts/hook-nonet.sh
-          else
-            echo "scripts/hook-nonet.sh does not exist yet (TM13): skipped"
-          fi
+        run: bash scripts/hook-nonet.sh
 
       - name: Release binary
         run: cargo build --release --locked -p agent-web-memory --features sync,serve

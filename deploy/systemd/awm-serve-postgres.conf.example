@@ -1,0 +1,19 @@
+# Drop-in for awm-serve.service when the server uses Postgres instead of SQLite
+# (docs/self-host.md, path C, "For Postgres").
+#
+#   install -d /etc/systemd/system/awm-serve.service.d
+#   install -m 0644 awm-serve-postgres.conf.example /etc/systemd/system/awm-serve.service.d/postgres.conf
+#   systemctl daemon-reload && systemctl restart awm-serve
+#
+# or `systemctl edit awm-serve` and paste the two lines below.
+#
+# `--data` and a database URL are exclusive (the server exits 2), so the unit's ExecStart is
+# replaced by one without `--data`. The URL itself comes from /etc/awm/serve.env:
+#   AWM_DATABASE_URL_ENV=PG_URL          # the NAME of the variable that holds the URL
+#   PG_URL=postgres://awm:...@HOST/awm
+#   AWM_DATABASE_URL_OWNER_ENV=PG_OWNER_URL   # optional: the URL used for migrations
+#   AWM_BEHIND_TLS_PROXY=1                   # Postgres has no --domain (the ACME cache needs --data)
+#   AWM_TRUSTED_PROXY=127.0.0.1/32
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/awm serve

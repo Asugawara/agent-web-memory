@@ -336,7 +336,7 @@ All sizes are bytes. Body limits are measured on the encoded JSON body as receiv
 | deletions page | ≤ 5,000 entries | |
 | ids per `POST /v1/delete` | ≤ 1,000 | 413 `delete_ids` |
 | audit page | ≤ 1,000 rows | |
-| records pushed per member per UTC day | ≤ 5,000: records, pre-deleted ids (`POST /v1/delete {ids}` naming ids the server has never seen) and markers with a new id count; deletions of held records, markers for known ids, and everything within 24 h of a new generation do not (§10.3, RVT2 M1) | 429 `records_per_day` on push and on `delete {ids}`, `Retry-After` until 00:00 UTC |
+| records pushed per member per UTC day | ≤ 5,000: records, pre-deleted ids (`POST /v1/delete {ids}` naming ids the server has never seen) and markers with a new id count; deletions of held records, markers for known ids, and everything within 24 h of a new generation do not (§10.3, RVT2 M1) | 429 `rate_limited` (`limit: records_per_day`) on push and on `delete {ids}`, `Retry-After` until 00:00 UTC |
 | requests per token | 60 per minute, burst 120 | 429 |
 | `delete` by `all_mine` or `member` | 1 per hour per token, audited | 429 |
 | unauthenticated requests per IP (an IPv6 address counts as its /64) | 30 per minute, failed tokens included; joins 10 per hour | 429 |

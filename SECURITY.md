@@ -14,7 +14,7 @@
 
 ## Team sync (optional, v0.2 and later)
 
-When you run `awm team join`, team sync is end-to-end encrypted: the server holds only ciphertext and metadata (which projects are shared, record counts, HTTP status). Encrypted independently with per-organisation keys; the server never sees plaintext research.
+When you run `awm team join`, team sync is end-to-end encrypted: the server holds only ciphertext and metadata. The operator sees handles and roles; counts and times of members, devices and invites; per stream the record count, padded sizes (256-byte buckets) and the hours records arrived; deletion counts; key epochs; and request logs (IP address, token prefix, path, status, latency). It does not learn which projects are shared: `repo_key` is a keyed hash inside the ciphertext. Encrypted independently with per-organisation keys; the server never sees plaintext research.
 
 **Threats mitigated:** Malicious teammates are bounded by pull-side checks and quarantine (the same rules as your own notes). Leaked device tokens can be revoked and rotated. Leaked invites expire in 7 days and are single-use. Breaches of the server yield only ciphertext (recoverable only if the organisation key leaks separately).
 
