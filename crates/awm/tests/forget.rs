@@ -244,7 +244,8 @@ impl Env {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        child.stdin.take().unwrap().write_all(b"y\n").unwrap();
+        // A command that refuses without a terminal can exit before this write: BrokenPipe is fine.
+        let _ = child.stdin.take().unwrap().write_all(b"y\n");
         let o = child.wait_with_output().unwrap();
         (
             o.status.code(),
