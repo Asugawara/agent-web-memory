@@ -36,6 +36,7 @@ const KEYS: &[&str] = &[
     "short_circuit.window_days",
     "short_circuit.query",
     "short_circuit.query_window_days",
+    "short_circuit.query_min_score",
     "inject.max_notes",
     "hooks.deadline_ms",
     "capture.exclude_hosts",

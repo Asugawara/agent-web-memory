@@ -93,7 +93,10 @@ pub fn collect(conn: &Connection, args: &Args) -> anyhow::Result<Value> {
     if !any {
         out.insert("by_agent".into(), by_agent(conn)?);
         out.insert("injections".into(), injections(conn)?);
-        out.insert("query_deny".into(), query_deny(conn)?);
+        let min_score = crate::paths::config_path()
+            .and_then(|p| crate::config::load(&p))
+            .map_or(None, |c| c.short_circuit.query_min_score);
+        out.insert("query_deny".into(), query_deny(conn, min_score)?);
     }
     if args.latency {
         out.insert("latency".into(), latency(conn)?);
@@ -276,7 +279,14 @@ fn refetch_after_deny(conn: &Connection) -> anyhow::Result<Value> {
 const RETRY_WINDOW_MS: i64 = 120_000;
 
 /// Session, agent id, time, tool use id and trigger text of a deny.
-type DenyRow = (String, Option<String>, i64, Option<String>, Option<String>);
+type DenyRow = (
+    String,
+    Option<String>,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<f64>,
+);
 
 /// QD1 §5.4: the PreToolUse deny on repeated searches (`hook = 'PreToolUse'`, `channel = 'query'`).
 /// `relation` is read from the earlier record against the
@@ -284,7 +294,7 @@ type DenyRow = (String, Option<String>, i64, Option<String>, Option<String>);
 /// project (from any event of the caller's session; `other_session_project_unknown` when none
 /// was captured). The caller's coding agent is Codex when its transcript is under `/.codex/` or its
 /// tool use id starts with `exec-`. `by_age` is cumulative.
-fn query_deny(conn: &Connection) -> anyhow::Result<Value> {
+fn query_deny(conn: &Connection, min_score: Option<f64>) -> anyhow::Result<Value> {
     const ROWS: &str = "FROM injection i JOIN injection_item ii ON ii.injection_id = i.id \
         JOIN event e ON e.id = ii.event_id \
         WHERE i.hook = 'PreToolUse' AND i.channel = 'query' AND ii.position = 1";
@@ -348,12 +358,20 @@ fn query_deny(conn: &Connection) -> anyhow::Result<Value> {
 
     // Research after a deny: the same agent searches the same token set within 2 minutes.
     let mut st = conn.prepare(
-        "SELECT session_id, agent_id, created_at, tool_use_id, trigger_text FROM injection \
-         WHERE hook = 'PreToolUse' AND channel = 'query' AND mode = 'deny'",
+        "SELECT session_id, agent_id, created_at, tool_use_id, trigger_text, \
+                (SELECT score FROM injection_item WHERE injection_id = injection.id AND position = 1) \
+         FROM injection WHERE hook = 'PreToolUse' AND channel = 'query' AND mode = 'deny'",
     )?;
     let denies: Vec<DenyRow> = st
         .query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
         })?
         .collect::<rusqlite::Result<_>>()?;
     let mut again = conn.prepare(
@@ -361,7 +379,9 @@ fn query_deny(conn: &Connection) -> anyhow::Result<Value> {
            AND created_at > ?3 AND created_at <= ?3 + ?4 AND (?5 IS NULL OR tool_use_id != ?5)",
     )?;
     let mut researched = 0;
-    for (session, agent, at, tool_use_id, trigger) in &denies {
+    // Per top score of the deny (its first item): denies and retried denies, to re-tune the cutoff.
+    let mut buckets = [(0i64, 0i64); 4];
+    for (session, agent, at, tool_use_id, trigger, score) in &denies {
         let key = crate::normalize::token_set(trigger.as_deref().unwrap_or(""));
         let queries = again.query_map(
             rusqlite::params![session, agent, at, RETRY_WINDOW_MS, tool_use_id],
@@ -372,8 +392,22 @@ fn query_deny(conn: &Connection) -> anyhow::Result<Value> {
             hit |= q?.is_some_and(|q| crate::normalize::token_set(&q) == key);
         }
         researched += i64::from(hit);
+        let slot = match score.unwrap_or(0.0) {
+            s if s < 30.0 => 0,
+            s if s < 40.0 => 1,
+            s if s < 60.0 => 2,
+            _ => 3,
+        };
+        buckets[slot].0 += 1;
+        buckets[slot].1 += i64::from(hit);
     }
     let n = i64::try_from(denies.len()).unwrap_or(i64::MAX);
+    let (cutoff, source) = crate::matching::calibrate::deny_cutoff(conn, min_score)?;
+    let by_top_score: Map<String, Value> = ["<30", "30-40", "40-60", "60+"]
+        .iter()
+        .zip(buckets)
+        .map(|(name, (d, r))| ((*name).to_string(), json!({"denies": d, "researched": r})))
+        .collect();
     Ok(json!({
         "denied": denied,
         "by_agent_kind": by_kind,
@@ -381,6 +415,8 @@ fn query_deny(conn: &Connection) -> anyhow::Result<Value> {
         "by_age": {"within_30_min": within(1_800_000)?, "within_24_h": within(86_400_000)?},
         "labels": labels,
         "per_100_searches": per_100,
+        "cutoff_used": {"value": cutoff, "source": source},
+        "by_top_score": by_top_score,
         "research_after_deny": {
             "denies": n, "researched": researched, "share": super::pct(researched, n)
         },

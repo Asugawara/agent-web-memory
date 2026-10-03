@@ -380,6 +380,8 @@ fn calibration_defaults_below_fifty_records_and_median_above() {
     let cal = calibrate::run(&c).unwrap();
     assert_eq!(cal.n, 40);
     assert_eq!(cal.cutoff_query, 42.0);
+    assert_eq!(cal.cutoff_query_deny, 55.0);
+    assert_eq!(calibrate::cutoff_query_deny(&c).unwrap(), 55.0);
     assert_eq!(cal.cutoff_prompt, Some(49.0));
     let (n, cut): (String, String) = c
         .query_row(
@@ -413,6 +415,15 @@ fn calibration_defaults_below_fifty_records_and_median_above() {
     assert!(
         cal.cutoff_query > 0.0 && cal.cutoff_query != 42.0,
         "{cal:?}"
+    );
+    // The deny cutoff is the 75th percentile of the same scores: stored, and not below the median.
+    assert!(
+        cal.cutoff_query_deny >= cal.cutoff_query && cal.cutoff_query_deny != 55.0,
+        "{cal:?}"
+    );
+    assert_eq!(
+        calibrate::cutoff_query_deny(&c).unwrap(),
+        cal.cutoff_query_deny
     );
     assert!(!calibrate::should_recalibrate(&c).unwrap());
     // The prompt cutoff is the 75th percentile and survives recalibration.

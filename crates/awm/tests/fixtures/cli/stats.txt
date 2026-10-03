@@ -39,6 +39,22 @@ query_deny:
     other_session_same_project: 0
     same_agent: 0
     sibling: 0
+  by_top_score:
+    30-40:
+      denies: 0
+      researched: 0
+    40-60:
+      denies: 0
+      researched: 0
+    60+:
+      denies: 0
+      researched: 0
+    <30:
+      denies: 0
+      researched: 0
+  cutoff_used:
+    source: calibrated
+    value: 55.0
   denied: 0
   labels:
     0: 0

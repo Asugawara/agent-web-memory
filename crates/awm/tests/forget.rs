@@ -553,7 +553,7 @@ fn forget_url_removes_every_trace_and_reimport_does_not_restore_it() {
         ),
         1
     );
-    assert_eq!(env.count("SELECT COUNT(*) FROM meta WHERE key NOT IN ('consent.record', 'cutoff.query', 'cutoff.prompt', 'calibrated_at', 'calibrated_n')"), 0);
+    assert_eq!(env.count("SELECT COUNT(*) FROM meta WHERE key NOT IN ('consent.record', 'cutoff.query', 'cutoff.query_deny', 'cutoff.prompt', 'calibrated_at', 'calibrated_n')"), 0);
 
     let again = env.reimport();
     assert_eq!(again.records_inserted, 0, "{again:?}");

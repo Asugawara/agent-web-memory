@@ -45,7 +45,7 @@ impl Home {
         db::migrate(&mut conn).unwrap();
         conn.execute_batch(
             "INSERT INTO meta (key, value) VALUES ('consent.record', 'yes'), \
-             ('cutoff.query', '0'), ('cutoff.prompt', '0'); \
+             ('cutoff.query', '0'), ('cutoff.query_deny', '0'), ('cutoff.prompt', '0'); \
              INSERT INTO team_member (member_id, handle, role, updated_at) \
              VALUES ('22222222-2222-4222-8222-222222222222', 'alf', 'member', 0), \
                     ('11111111-1111-4111-8111-111111111111', 'me', 'member', 0);",

@@ -79,7 +79,7 @@ pub struct Channels {
     pub prompt_bm25: PromptBm25,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShortCircuit {
     pub mode: ShortCircuitMode,
@@ -89,6 +89,8 @@ pub struct ShortCircuit {
     pub query: ShortCircuitMode,
     #[serde(deserialize_with = "de_u32")]
     pub query_window_days: u32,
+    /// Fixed score cutoff of the search deny; `None` uses the calibrated `cutoff.query_deny`.
+    pub query_min_score: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,6 +252,7 @@ impl Default for ShortCircuit {
             window_days: 7,
             query: ShortCircuitMode::On,
             query_window_days: 7,
+            query_min_score: None,
         }
     }
 }
@@ -297,6 +300,9 @@ fn de_u32<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     let v = i64::deserialize(d)?;
     Ok(u32::try_from(v.clamp(0, i64::from(u32::MAX))).unwrap_or(u32::MAX))
 }
+
+/// Allowed range of `short_circuit.query_min_score`.
+const QUERY_MIN_SCORE: (f64, f64) = (0.0, 1000.0);
 
 /// A price: a finite number that is not negative (an error naming the field, unlike the clamped integers).
 fn de_price<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
@@ -351,6 +357,19 @@ impl Config {
             &mut self.short_circuit.query_window_days,
             &mut w,
         );
+        if let Some(v) = self.short_circuit.query_min_score {
+            let (lo, hi) = QUERY_MIN_SCORE;
+            if !v.is_finite() {
+                w.push("config: short_circuit.query_min_score is not a number; using the calibrated cutoff".into());
+                self.short_circuit.query_min_score = None;
+            } else if !(lo..=hi).contains(&v) {
+                let c = v.clamp(lo, hi);
+                w.push(format!(
+                    "config: short_circuit.query_min_score = {v} is outside {lo}-{hi}; using {c}"
+                ));
+                self.short_circuit.query_min_score = Some(c);
+            }
+        }
         clamp("inject.max_notes", &mut self.inject.max_notes, &mut w);
         clamp("hooks.deadline_ms", &mut self.hooks.deadline_ms, &mut w);
         clamp("review.daily_limit", &mut self.review.daily_limit, &mut w);
@@ -391,6 +410,10 @@ impl Config {
             "short_circuit.window_days" => self.short_circuit.window_days.to_string(),
             "short_circuit.query" => self.short_circuit.query.as_str().to_string(),
             "short_circuit.query_window_days" => self.short_circuit.query_window_days.to_string(),
+            "short_circuit.query_min_score" => self
+                .short_circuit
+                .query_min_score
+                .map_or_else(|| "auto".to_string(), |v| v.to_string()),
             "inject.max_notes" => self.inject.max_notes.to_string(),
             "hooks.deadline_ms" => self.hooks.deadline_ms.to_string(),
             "capture.exclude_hosts" => self.capture.exclude_hosts.join(","),
@@ -450,6 +473,23 @@ impl Config {
             match value.trim().parse::<f64>() {
                 Ok(n) if n.is_finite() && n >= 0.0 => Ok(n),
                 _ => bail!("{key}: expected a number >= 0, got {value:?}"),
+            }
+        }
+        // `auto` (or empty) clears the override: the calibrated cutoff applies.
+        fn score(key: &str, value: &str) -> anyhow::Result<Option<f64>> {
+            let v = value.trim();
+            if v.is_empty() || v == "auto" {
+                return Ok(None);
+            }
+            match v.parse::<f64>() {
+                Ok(n) if n.is_finite() && (QUERY_MIN_SCORE.0..=QUERY_MIN_SCORE.1).contains(&n) => {
+                    Ok(Some(n))
+                }
+                _ => bail!(
+                    "{key}: expected auto or a number in {}-{}, got {value:?}",
+                    QUERY_MIN_SCORE.0,
+                    QUERY_MIN_SCORE.1
+                ),
             }
         }
         fn list(value: &str) -> Vec<String> {
@@ -532,6 +572,9 @@ impl Config {
             }
             "short_circuit.query_window_days" => {
                 self.short_circuit.query_window_days = number(key, value)?
+            }
+            "short_circuit.query_min_score" => {
+                self.short_circuit.query_min_score = score(key, value)?
             }
             "inject.max_notes" => self.inject.max_notes = number(key, value)?,
             "hooks.deadline_ms" => self.hooks.deadline_ms = number(key, value)?,

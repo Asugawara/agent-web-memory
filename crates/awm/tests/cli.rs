@@ -1463,8 +1463,30 @@ fn seed_query_denies(env: &Env) {
 fn stats_reports_query_deny_with_hand_computed_numbers() {
     let env = Env::new();
     seed_query_denies(&env);
+    // Denies 2, 4 and 6 score 1.0 (below 30); move two of them into the 40-60 and 60+ buckets.
+    env.conn()
+        .execute(
+            "UPDATE injection_item SET score = CASE injection_id WHEN 4 THEN 45.0 ELSE 65.0 END \
+             WHERE injection_id IN (4, 6)",
+            [],
+        )
+        .unwrap();
     let v: Value = serde_json::from_str(env.awm(&["stats", "--json"]).ok()).unwrap();
     let q = &v["query_deny"];
+    assert_eq!(
+        q["cutoff_used"],
+        json!({"value": 55.0, "source": "calibrated"})
+    );
+    let b = &q["by_top_score"];
+    assert_eq!(b["<30"]["denies"], 1);
+    assert_eq!(b["30-40"]["denies"], 0);
+    assert_eq!(b["40-60"]["denies"], 1);
+    assert_eq!(b["60+"]["denies"], 1);
+    let researched: i64 = ["<30", "30-40", "40-60", "60+"]
+        .iter()
+        .map(|k| b[*k]["researched"].as_i64().unwrap())
+        .sum();
+    assert_eq!(researched, 1);
     // Rows of an older version (mode shadow_deny) stay in the breakdowns below; only real denies
     // are counted as denied.
     assert!(q.get("shadow").is_none());
