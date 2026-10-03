@@ -3,9 +3,11 @@
 //! `WebFetch`: a per-URL cache (plan-v2 §4.6). With `short_circuit.mode = "on"` (the default) a
 //! fetch is denied when awm holds a usable earlier fetch of the same `url_norm` within
 //! `short_circuit.window_days`, whoever made it: the caller itself, a sibling agent, another
-//! session or project, the owner's other device. Usable means status ok, code 200, not
-//! quarantined, not tombstoned; a teammate's row never counts. The reason carries the earlier
-//! answer; the retry passes (once per session, agent and URL).
+//! session or project, the owner's other device. Usable means status ok with code 200, or a dead
+//! end with an HTTP code (202, 3xx, 4xx except 429: such a URL never succeeded on a repeat), not
+//! quarantined, not tombstoned; a teammate's row never counts. The newest usable row decides: the
+//! reason carries the earlier answer, or says the URL returned that code; the retry passes (once
+//! per session, agent and URL).
 //!
 //! `WebSearch` (Claude Code) and `webrun` (Codex) go to [`super::pre_search`].
 
@@ -14,7 +16,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use super::{append_canary, canary_line, deny_json, Env, HookArgs, Injection, Verdict};
 use crate::config::ShortCircuitMode;
 use crate::matching::{self, Hit};
-use crate::note::{Channel, Relation};
+use crate::note::{Channel, Relation, Status};
 use crate::record::redact_url;
 use crate::render::{self, plain_label};
 
@@ -73,7 +75,12 @@ fn handle_fetch(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
             let note = matching::to_note(conn, &c.hit, &opts)?;
             let who = who_text(&note.relation, c.own);
             items.push((c.hit.event_id, c.hit.score));
-            render::deny_reason(&note, &env.render_ctx(Channel::Url, &ref_id), &who)
+            let ctx = env.render_ctx(Channel::Url, &ref_id);
+            if note.status == Status::DeadEnd {
+                render::deny_reason_dead_url(&note, &ctx, &who)
+            } else {
+                render::deny_reason(&note, &ctx, &who)
+            }
         }
         None => "agent-web-memory: canary deny. Call WebFetch again with the same URL; it will not be blocked again."
             .to_string(),
@@ -132,14 +139,19 @@ struct Cached {
 }
 
 /// The newest usable fetch of `norm` within the window, by any agent of the owner (the same
-/// agent, a sibling, another session or project, the owner's other device).
+/// agent, a sibling, another session or project, the owner's other device). Usable: status ok
+/// with code 200, or a dead end with an HTTP code that is 202, 3xx, or 4xx but not 429 (such a URL rarely
+/// succeeds on a repeat); 429, 5xx, a dead end without a code and
+/// a refusal never count. The newest usable row decides which reason the deny carries.
 fn find_cached(env: &Env, conn: &Connection, norm: &str) -> anyhow::Result<Option<Cached>> {
     let window_ms = i64::from(env.config.short_circuit.window_days) * 86_400_000;
     let row: Option<(i64, bool)> = conn
         .prepare_cached(
             "SELECT e.id, (e.origin = 'local' AND e.session_id = ?2 AND e.agent_id IS ?3) FROM event e \
              WHERE e.tool = 'WebFetch' AND e.url_norm = ?1 \
-               AND e.status = 'ok' AND e.http_code = 200 \
+               AND ((e.status = 'ok' AND e.http_code = 200) \
+                 OR (e.status = 'dead_end' AND (e.http_code = 202 \
+                     OR (e.http_code BETWEEN 300 AND 499 AND e.http_code != 429)))) \
                AND e.created_at >= ?4 AND e.quarantined = 0 \
                AND (e.origin = 'local' OR e.member = ?6) \
                AND (?5 IS NULL OR e.tool_use_id != ?5) \

@@ -36,7 +36,14 @@ pub struct MatchOpts {
     pub caller_tool_use_id: Option<String>,
     /// Only records created strictly before this time.
     pub before_ms: Option<i64>,
+    /// Only records created at or after this time.
+    pub since_ms: Option<i64>,
     pub exclude_same_agent: bool,
+    /// Skip a teammate's pulled rows (`origin = 'team'` of another member); the caller's own
+    /// pulled rows (`member` = `own_member`, the other device) stay.
+    pub exclude_team: bool,
+    /// The caller's member id; read only with `exclude_team`.
+    pub own_member: Option<String>,
     pub limit: usize,
     pub shown_event_ids: Vec<i64>,
 }
@@ -51,10 +58,13 @@ pub struct Hit {
 }
 
 /// SQL for rules 1-3 on alias `e`; `?1` tool_use_id, `?2` session, `?3` agent,
-/// `?4` exclude flag, `?5` before_ms.
+/// `?4` exclude flag, `?5` before_ms, `?7` since_ms, `?8` exclude_team, `?9` own member id.
+/// (`?6` is the statement's own parameter: the url or the event id.)
 const RULES_SQL: &str = "(?1 IS NULL OR e.tool_use_id != ?1) \
      AND (?4 = 0 OR NOT (e.session_id = ?2 AND e.agent_id IS ?3)) \
      AND (?5 IS NULL OR e.created_at < ?5) \
+     AND (?7 IS NULL OR e.created_at >= ?7) \
+     AND (?8 = 0 OR e.origin != 'team' OR e.member = ?9) \
      AND e.quarantined = 0 \
      AND NOT EXISTS (SELECT 1 FROM tombstone t \
                      WHERE t.kind = 'tool_use_id' AND t.value = e.tool_use_id)";
@@ -142,7 +152,10 @@ pub fn url_channel(conn: &Connection, url_norm: &str, opts: &MatchOpts) -> Resul
             opts.caller_agent,
             opts.exclude_same_agent,
             opts.before_ms,
-            url_norm
+            url_norm,
+            opts.since_ms,
+            opts.exclude_team,
+            opts.own_member
         ],
         |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
     )?;
@@ -197,7 +210,10 @@ pub fn query_channel(
                     opts.caller_agent,
                     opts.exclude_same_agent,
                     opts.before_ms,
-                    id
+                    id,
+                    opts.since_ms,
+                    opts.exclude_team,
+                    opts.own_member
                 ],
                 |r| {
                     Ok((

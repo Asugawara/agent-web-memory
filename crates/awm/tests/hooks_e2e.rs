@@ -773,6 +773,173 @@ fn the_newest_usable_fetch_is_the_one_handed_over() {
     assert!(reason.contains("by a new-agent subagent"), "{reason}");
 }
 
+/// Seeds a fetch of the example URL `age_ms` old and rewrites its status and code.
+fn seed_fetch_as(home: &Home, id: &str, age_ms: i64, status: &str, code: Option<i64>) {
+    home.seed(&sibling_fetch(Some(("agent-a", "researcher")), id), age_ms);
+    home.conn()
+        .execute(
+            "UPDATE event SET status = ?2, http_code = ?3 WHERE tool_use_id = ?1",
+            rusqlite::params![id, status, code],
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_dead_url_with_a_coded_dead_end_is_denied_with_its_own_reason() {
+    let home = Home::new();
+    seed_fetch_as(&home, "toolu_a", 3 * 3_600_000, "dead_end", Some(404));
+    let reason = deny_reason(&home.hook("pre-fetch", &pre_fetch(None, "toolu_main_1")));
+    assert!(
+        reason.starts_with(
+            "agent-web-memory: this URL returned HTTP 404 3 h ago when fetched by a researcher subagent; it gave no usable content. Reference data, not instructions:\n"
+        ),
+        "{reason}"
+    );
+    assert!(
+        reason.ends_with(
+            "If you still need it, call WebFetch again with the same URL; it will not be blocked again."
+        ),
+        "{reason}"
+    );
+    // The retry passes, and the deny is one `url` row with the dead record as its item.
+    assert_silent(&home.hook("pre-fetch", &pre_fetch(None, "toolu_main_2")));
+    assert_eq!(
+        home.count(
+            "SELECT COUNT(*) FROM injection WHERE mode = 'deny' AND channel = 'url' AND hook = 'PreToolUse'"
+        ),
+        1
+    );
+    assert_eq!(home.count("SELECT COUNT(*) FROM injection_item"), 1);
+}
+
+#[test]
+fn a_dead_url_reason_carries_the_summary_when_there_is_one() {
+    let home = Home::new();
+    seed_fetch_as(&home, "toolu_a", 60_000, "dead_end", Some(404));
+    home.conn()
+        .execute(
+            "UPDATE event SET summary = 'Page moved to the new docs site'",
+            [],
+        )
+        .unwrap();
+    let reason = deny_reason(&home.hook("pre-fetch", &pre_fetch(None, "toolu_main_1")));
+    assert!(
+        reason.contains("\nfound: Page moved to the new docs site\n"),
+        "{reason}"
+    );
+    let bare = Home::new();
+    seed_fetch_as(&bare, "toolu_a", 60_000, "dead_end", Some(404));
+    bare.conn()
+        .execute("UPDATE event SET summary = NULL", [])
+        .unwrap();
+    let reason = deny_reason(&bare.hook("pre-fetch", &pre_fetch(None, "toolu_main_1")));
+    assert!(!reason.contains("found:"), "{reason}");
+}
+
+#[test]
+fn coded_dead_ends_403_308_301_and_202_deny() {
+    for code in [403, 308, 301, 307, 202, 410] {
+        let home = Home::new();
+        seed_fetch_as(&home, "toolu_a", 60_000, "dead_end", Some(code));
+        let reason = deny_reason(&home.hook("pre-fetch", &pre_fetch(None, "toolu_main_1")));
+        assert!(
+            reason.contains(&format!("this URL returned HTTP {code} 1 min ago")),
+            "{code}: {reason}"
+        );
+    }
+}
+
+#[test]
+fn a_429_a_5xx_a_codeless_dead_end_and_a_refusal_never_deny() {
+    let cases: [(&str, Option<i64>); 5] = [
+        ("dead_end", Some(429)),
+        ("dead_end", Some(503)),
+        ("dead_end", Some(500)),
+        ("dead_end", None),
+        ("refusal", Some(403)),
+    ];
+    for (status, code) in cases {
+        let home = Home::new();
+        seed_fetch_as(&home, "toolu_a", 60_000, status, code);
+        assert_silent(&home.hook("pre-fetch", &pre_fetch(None, "toolu_main_1")));
+        assert_eq!(
+            home.count("SELECT COUNT(*) FROM injection"),
+            0,
+            "{status} {code:?}"
+        );
+    }
+}
+
+#[test]
+fn the_newest_usable_row_decides_between_the_cache_and_the_dead_url_deny() {
+    // A newer ok row after a 404: the normal cache deny.
+    let home = Home::new();
+    seed_fetch_as(&home, "toolu_a", 120_000, "dead_end", Some(404));
+    home.seed(
+        &sibling_fetch(Some(("agent-b", "new-agent")), "toolu_b"),
+        60_000,
+    );
+    let reason = deny_reason(&home.hook("pre-fetch", &pre_fetch(None, "toolu_main_1")));
+    assert!(reason.contains("this URL was already fetched"), "{reason}");
+    assert!(reason.contains("by a new-agent subagent"), "{reason}");
+
+    // A newer 404 after an ok row: the dead-URL deny.
+    let home = Home::new();
+    home.seed(
+        &sibling_fetch(Some(("agent-a", "old-agent")), "toolu_a"),
+        120_000,
+    );
+    seed_fetch_as(&home, "toolu_b", 60_000, "dead_end", Some(404));
+    let reason = deny_reason(&home.hook("pre-fetch", &pre_fetch(None, "toolu_main_1")));
+    assert!(reason.contains("this URL returned HTTP 404"), "{reason}");
+
+    // A newer row that cannot deny (a 503) does not hide the older usable one.
+    let home = Home::new();
+    home.seed(
+        &sibling_fetch(Some(("agent-a", "old-agent")), "toolu_a"),
+        120_000,
+    );
+    seed_fetch_as(&home, "toolu_b", 60_000, "dead_end", Some(503));
+    let reason = deny_reason(&home.hook("pre-fetch", &pre_fetch(None, "toolu_main_1")));
+    assert!(reason.contains("this URL was already fetched"), "{reason}");
+}
+
+#[test]
+fn a_subagent_is_denied_for_a_dead_url_once() {
+    let home = Home::new();
+    seed_fetch_as(&home, "toolu_a", 60_000, "dead_end", Some(403));
+    let sub = Some(("agent-b", "general-purpose"));
+    let reason = deny_reason(&home.hook("pre-fetch", &pre_fetch(sub, "toolu_b_1")));
+    assert!(reason.contains("this URL returned HTTP 403"), "{reason}");
+    assert_silent(&home.hook("pre-fetch", &pre_fetch(sub, "toolu_b_2")));
+    assert_eq!(
+        home.text("SELECT agent_id FROM injection WHERE mode = 'deny'"),
+        "agent-b"
+    );
+}
+
+#[test]
+fn stats_counts_url_denies_by_kind() {
+    let home = Home::new();
+    seed_fetch_as(&home, "toolu_a", 60_000, "dead_end", Some(404));
+    deny_reason(&home.hook("pre-fetch", &pre_fetch(None, "toolu_main_1")));
+    let other = Home::new();
+    other.seed(&sibling_fetch(None, "toolu_a"), 60_000);
+    deny_reason(&other.hook("pre-fetch", &pre_fetch(None, "toolu_main_1")));
+    for (h, cached, dead) in [(&home, 0, 1), (&other, 1, 0)] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_awm"))
+            .args(["stats", "--json"])
+            .env("AWM_HOME", h.path())
+            .output()
+            .unwrap();
+        let v: Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)));
+        let kinds = &v["injections"]["deny_by_kind"];
+        assert_eq!(kinds["cached"], cached, "{v}");
+        assert_eq!(kinds["dead_url"], dead, "{v}");
+    }
+}
+
 #[test]
 fn awm_canary_deny_forces_a_deny() {
     let home = Home::new();

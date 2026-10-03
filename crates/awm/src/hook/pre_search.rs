@@ -60,17 +60,19 @@ pub fn search_text(input: &super::HookInput) -> Option<String> {
 pub fn find_similar(env: &Env, conn: &Connection, text: &str) -> anyhow::Result<Vec<(Note, f64)>> {
     let cutoff = calibrate::cutoff_query(conn)?;
     let mut opts = env.match_opts(conn)?;
-    // The caller's own earlier research counts as well.
+    // The caller's own earlier research counts as well; a teammate's row and a row older than the
+    // window are skipped in SQL, so neither takes one of the three hits (or a newer teammate's
+    // identical search the place of the owner's older one in its group).
     opts.exclude_same_agent = false;
+    opts.exclude_team = true;
+    opts.own_member = matching::own_member_id();
     let window_ms = i64::from(env.config.short_circuit.query_window_days) * 86_400_000;
-    let since = env.started_at_ms - window_ms;
+    opts.since_ms = Some(env.started_at_ms - window_ms);
     let max = env.config.inject.max_notes as usize;
     let mut found = Vec::new();
     for hit in matching::query_channel(conn, text, cutoff, &opts)? {
         let note = matching::to_note(conn, &hit, &opts)?;
-        let usable = note.created_at_ms >= since
-            && !matches!(note.relation, Relation::Teammate { .. })
-            && (note.tool != crate::note::Tool::WebFetch || note.http_code == Some(200))
+        let usable = (note.tool != crate::note::Tool::WebFetch || note.http_code == Some(200))
             && note
                 .summary
                 .as_deref()

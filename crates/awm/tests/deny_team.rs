@@ -232,6 +232,108 @@ fn a_record_of_the_callers_other_machine_triggers_the_query_deny() {
     );
 }
 
+const DAY_MS: i64 = 24 * HOUR_MS;
+
+fn denied_event_ids(home: &Home) -> Vec<i64> {
+    let conn = home.conn();
+    let mut st = conn
+        .prepare(
+            "SELECT ii.event_id FROM injection_item ii JOIN injection i ON i.id = ii.injection_id \
+             WHERE i.mode = 'deny' ORDER BY ii.position",
+        )
+        .unwrap();
+    let ids = st
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<i64>>>()
+        .unwrap();
+    ids
+}
+
+#[test]
+fn a_teammates_newer_identical_search_does_not_hide_the_owners_older_one() {
+    let home = Home::new();
+    home.join_team();
+    query_on(&home);
+    let own = home.seed(&search_record("s-old", "t1", QUERY, "/work/x"), 2 * HOUR_MS);
+    let team = home.seed(&search_record("s-team", "t2", QUERY, "/work/x"), MIN_MS);
+    home.make_team(team, ALF, None);
+    let (_, out) = home.hook("pre-fetch", &pre_search("toolu_1"));
+    assert!(
+        reason(&out).contains("earlier research matches this search"),
+        "{out}"
+    );
+    assert_eq!(denied_event_ids(&home), vec![own]);
+}
+
+#[test]
+fn a_hit_outside_the_window_never_consumes_one_of_the_note_slots() {
+    let home = Home::new();
+    home.join_team();
+    query_on(&home);
+    // Three exact-ish matches older than the 7-day window (distinct groups) outrank the one
+    // inside the window; before the SQL-side window they took all three hit places and the
+    // in-window record was never seen.
+    for (i, extra) in ["", " tutorial", " guide"].iter().enumerate() {
+        home.seed(
+            &search_record(
+                "s-old",
+                &format!("old{i}"),
+                &format!("{QUERY}{extra}"),
+                "/work/x",
+            ),
+            8 * DAY_MS + i64::try_from(i).unwrap() * HOUR_MS,
+        );
+    }
+    let fresh = home.seed(
+        &search_record(
+            "s-new",
+            "new",
+            &format!("{QUERY} reference manual overview examples notes"),
+            "/work/x",
+        ),
+        HOUR_MS,
+    );
+    let (_, out) = home.hook("pre-fetch", &pre_search("toolu_1"));
+    assert!(
+        reason(&out).contains("earlier research matches this search"),
+        "{out}"
+    );
+    assert_eq!(denied_event_ids(&home), vec![fresh]);
+}
+
+#[test]
+fn the_sql_filters_keep_the_callers_other_machine_and_drop_a_teammate() {
+    let home = Home::new();
+    let mine = home.seed(&search_record("s-a", "t1", QUERY, "/work/x"), HOUR_MS);
+    home.make_team(mine, OWN, None);
+    let theirs = home.seed(
+        &search_record("s-b", "t2", &format!("{QUERY} again"), "/work/x"),
+        HOUR_MS,
+    );
+    home.make_team(theirs, ALF, None);
+    let conn = home.conn();
+    let run = |exclude_team: bool, since_ms: Option<i64>| -> Vec<i64> {
+        let o = MatchOpts {
+            exclude_team,
+            since_ms,
+            own_member: Some(OWN.to_string()),
+            ..opts("c")
+        };
+        let mut ids: Vec<i64> = matching::query_channel(&conn, QUERY, f64::NEG_INFINITY, &o)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.event_id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+    assert_eq!(run(false, None), vec![mine, theirs]);
+    assert_eq!(run(true, None), vec![mine]);
+    assert_eq!(run(false, Some(now_ms() - 30 * MIN_MS)), Vec::<i64>::new());
+    assert_eq!(run(false, Some(now_ms() - 2 * HOUR_MS)), vec![mine, theirs]);
+}
+
 // ---- the URL deny ----
 
 #[test]

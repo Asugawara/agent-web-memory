@@ -310,7 +310,10 @@ impl Env {
             caller_cwd_hash: sha256_hex(&self.input.cwd),
             caller_tool_use_id: self.input.tool_use_id.clone(),
             before_ms: None,
+            since_ms: None,
             exclude_same_agent: true,
+            exclude_team: false,
+            own_member: None,
             limit: self.config.inject.max_notes as usize,
             shown_event_ids: self.shown_event_ids(conn)?,
         })

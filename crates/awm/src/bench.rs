@@ -243,6 +243,7 @@ fn opts_for(a: &Anchor, exclude_same_agent: bool) -> MatchOpts {
         exclude_same_agent,
         limit: 3,
         shown_event_ids: Vec::new(),
+        ..MatchOpts::default()
     }
 }
 

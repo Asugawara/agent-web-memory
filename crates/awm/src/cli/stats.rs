@@ -228,11 +228,28 @@ fn injections(conn: &Connection) -> anyhow::Result<Value> {
         "harmful": with_label("'h'")?,
         "per_note_precision": precision,
         "refetch_after_deny": refetch,
+        "deny_by_kind": url_deny_kinds(conn)?,
         "rendered_chars": {
             "p50": super::percentile(&mut chars, 50.0),
             "p95": super::percentile(&mut chars, 95.0),
         },
     }))
+}
+
+/// URL denies by what the record they hand over was: a cached answer or a dead URL.
+fn url_deny_kinds(conn: &Connection) -> anyhow::Result<Value> {
+    let kind = |status: &str| {
+        count(
+            conn,
+            &format!(
+                "SELECT COUNT(*) FROM injection i JOIN injection_item ii \
+                   ON ii.injection_id = i.id AND ii.position = 1 \
+                 JOIN event e ON e.id = ii.event_id \
+                 WHERE i.mode = 'deny' AND i.channel = 'url' AND e.status {status}"
+            ),
+        )
+    };
+    Ok(json!({"cached": kind("= 'ok'")?, "dead_url": kind("= 'dead_end'")?}))
 }
 
 fn refetch_after_deny(conn: &Connection) -> anyhow::Result<Value> {

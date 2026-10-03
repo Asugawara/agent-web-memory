@@ -44,7 +44,7 @@ fn legacy_query_channel(
         "SELECT e.id, e.tool, e.query, e.url_norm, e.created_at, -bm25(event_fts) AS score \
          FROM event_fts JOIN event e ON e.id = event_fts.rowid \
          WHERE event_fts MATCH ?6 AND e.status = 'ok' AND {RULES_SQL} \
-         ORDER BY bm25(event_fts) LIMIT ?7"
+         ORDER BY bm25(event_fts) LIMIT ?10"
     );
     let mut st = conn.prepare_cached(&sql)?;
     let rows = st.query_map(
@@ -55,6 +55,9 @@ fn legacy_query_channel(
             opts.exclude_same_agent,
             opts.before_ms,
             expr,
+            opts.since_ms,
+            opts.exclude_team,
+            opts.own_member,
             CANDIDATES
         ],
         |r| {
@@ -163,7 +166,10 @@ fn opts_of(conn: &Connection, t: &Trigger) -> MatchOpts {
         caller_cwd_hash: t.cwd_hash.clone(),
         caller_tool_use_id: Some(t.tool_use_id.clone()),
         before_ms: None,
+        since_ms: None,
         exclude_same_agent: true,
+        exclude_team: false,
+        own_member: None,
         limit: 3,
         shown_event_ids: shown_ids(conn, t),
     }
