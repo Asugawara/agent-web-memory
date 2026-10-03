@@ -22,12 +22,6 @@ pub const LAST_SPAWN: &str = "last_spawn";
 /// The arguments of the child: `awm sync --once --quiet` (§4.6).
 const CHILD_ARGS: [&str; 3] = ["sync", "--once", "--quiet"];
 
-/// True when `team.toml` and `team.key` are both in the data directory (this machine is in a
-/// team). Duplicates `sync::state::configured`, which exists only with the `sync` feature.
-fn configured(dir: &Path) -> bool {
-    dir.join("team.toml").is_file() && dir.join("team.key").is_file()
-}
-
 /// Spawns `awm sync --once --quiet` detached when the debounce allows (§3.3). Returns whether
 /// a child was started. Never fails and never waits.
 pub fn maybe_spawn(data_dir: &Path, config: &Config, now_ms: i64) -> bool {
@@ -48,7 +42,7 @@ pub fn maybe_spawn_with(
     now_ms: i64,
     launch: impl FnOnce() -> std::io::Result<()>,
 ) -> bool {
-    if !config.team.auto_sync || !configured(data_dir) {
+    if !config.team.auto_sync || !crate::paths::team_configured(data_dir) {
         return false;
     }
     let Ok(conn) = db::open(&data_dir.join(paths::DB_FILE), Role::HookRead) else {

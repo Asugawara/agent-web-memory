@@ -238,28 +238,27 @@ mod imp {
     use std::path::{Path, PathBuf};
 
     use anyhow::{anyhow, bail, Context, Result};
-    use awm_proto::crypto::{open_record, RecordAd};
+    use awm_proto::crypto::open_record;
     use awm_proto::keys::{
         self, approve, ApprovalInfo, DeviceKeys, DeviceStatus, Invite, KeyRing, ListedDevice,
         Roster, RosterEntry, ROSTER_TAG,
     };
     use awm_proto::wire::{
-        ApproveRequest, BootstrapRequest, BootstrapResponse, Cursor, DeleteRequest, EpochWrap,
-        ErrorCode, Handle, Id, InviteKind, InviteRequest, InviteResponse, JoinRequest,
-        JoinResponse, Key32, MembersResponse, OrgSettings, PolicyPlaintext, PullRequest,
-        PulledItem, RemoveRequest, Role, RosterPlaintext, SettingsUpdate, StatusResponse, Tag,
-        Version, B64,
+        BootstrapRequest, BootstrapResponse, Cursor, DeleteRequest, ErrorCode, Handle, Id,
+        InviteKind, InviteRequest, InviteResponse, JoinRequest, JoinResponse, Key32,
+        MembersResponse, OrgSettings, PolicyPlaintext, PullRequest, PulledItem, RemoveRequest,
+        Role, RosterPlaintext, SettingsUpdate, StatusResponse, Tag, Version,
     };
     use rusqlite::{params, Connection, OptionalExtension};
     use serde_json::{json, Value};
 
     use super::{Args, KeySub, PolicySub, Sub, TokenSub};
-    use crate::cli::fmt_ts;
-    use crate::db::{self, Role as DbRole, VersionCheck};
+    use crate::cli::{fmt_ts, now_ms};
+    use crate::db::Role as DbRole;
     use crate::paths;
     use crate::sync::http::{check_url, CallError, Client};
     use crate::sync::state::{self, Identity, PendingInvite, SyncState, TeamKey, TeamToml};
-    use crate::sync::{self, pull, push, roster, Env, Opts, Outcome, Report, Session};
+    use crate::sync::{self, apply, pull, push, roster, Env, Opts, Outcome, Session};
     use crate::team::{self, bare_handle, JoinState};
 
     const NOT_IN_TEAM: &str =
@@ -340,34 +339,8 @@ mod imp {
         }
     }
 
-    fn now_ms() -> i64 {
-        crate::hook::now_ms()
-    }
-
     fn open_db(dir: &Path, role: DbRole) -> Result<Connection> {
-        let path = dir.join(paths::DB_FILE);
-        if !path.is_file() {
-            bail!("no database at {}. Run: awm init", path.display());
-        }
-        let conn = db::open(&path, role)?;
-        match db::check_version(&conn)? {
-            VersionCheck::Current => Ok(conn),
-            VersionCheck::Older { .. } => bail!("database needs an upgrade. Run: awm doctor"),
-            VersionCheck::Newer { db, .. } => {
-                bail!("database is from a newer awm ({db}). Upgrade awm.")
-            }
-        }
-    }
-
-    /// `sync.lock`, waiting up to 10 s (plan-v3-team §3.6), then refusing: the one
-    /// implementation lives in [`sync::apply::lock_sync`].
-    fn lock(dir: &Path) -> Result<std::fs::File> {
-        sync::apply::lock_sync(dir)
-    }
-
-    fn client_of(ident: &Identity) -> Result<Client> {
-        let ca = ident.team.ca_file.as_deref().map(Path::new);
-        Client::new(&ident.team.server_url, Some(&ident.key.device_token), ca)
+        crate::cli::open_db_in(dir, role)
     }
 
     fn proto_err(e: awm_proto::crypto::Error) -> anyhow::Error {
@@ -408,7 +381,7 @@ mod imp {
         f: impl FnOnce(&mut Session<'_>) -> Result<R>,
     ) -> Result<R> {
         let _ = ready(ctx)?;
-        let _lock = lock(ctx.dir())?;
+        let _lock = apply::lock_sync(ctx.dir())?;
         with_session_held(ctx, fresh, f)
     }
 
@@ -420,22 +393,8 @@ mod imp {
     ) -> Result<R> {
         let ident = Identity::load(ctx.dir())?;
         let conn = open_db(ctx.dir(), DbRole::Sync)?;
-        let ring = ident.ring()?;
-        let client = client_of(&ident)?;
         let opts = Opts::default();
-        let mut s = Session {
-            env: &ctx.env,
-            opts: &opts,
-            device: ident.device_keys(),
-            conn,
-            ident,
-            ring,
-            client,
-            status: None,
-            roster: Roster::default(),
-            keys_refreshed: false,
-            report: Report::default(),
-        };
+        let mut s = Session::new(&ctx.env, &opts, ident, conn)?;
         s.roster = roster::verify_and_store(&s.conn, &s.ring, now_ms())?.0;
         if fresh {
             let st = s.client.status()?;
@@ -635,10 +594,10 @@ mod imp {
     ) -> Result<String> {
         let dir = ctx.dir();
         let _ = ready(ctx)?;
-        let _lock = lock(dir)?;
+        let _lock = apply::lock_sync(dir)?;
         let mut ident = Identity::load(dir)?;
         let conn = open_db(dir, DbRole::Cli)?;
-        let client = client_of(&ident)?;
+        let client = ident.client()?;
         let handle = req.handle.as_str().to_string();
         let role = req.role;
         let resp: InviteResponse = client
@@ -902,7 +861,6 @@ mod imp {
                 verified.code()
             );
             confirm_code(verified.code(), code, &invite.handle)?;
-            let now = now_ms();
             let approval = approve(
                 &s.ring,
                 &s.roster,
@@ -913,26 +871,11 @@ mod imp {
                     kind,
                     role,
                     approver_device: *s.ident.team.device_id.as_uuid(),
-                    approved_at: now / 1_000,
+                    approved_at: now_ms() / 1_000,
                 },
             )
             .map_err(|e| anyhow!("not approved: {e}"))?;
-            let body = ApproveRequest {
-                wraps: approval
-                    .wraps
-                    .iter()
-                    .map(|w| EpochWrap {
-                        epoch: w.epoch,
-                        wrap: B64(w.blob.clone()),
-                        auth: Key32(w.auth),
-                    })
-                    .collect(),
-            };
-            s.client.approve_device(p.device_id, &body)?;
-            push::queue_roster_entry(&mut s.conn, &s.ident, &s.ring, &approval.roster, now)?;
-            s.ident.key.pending_invites.remove(pos);
-            s.ident.save_key(&s.env.data_dir)?;
-            s.roster = roster::verify_and_store(&s.conn, &s.ring, now)?.0;
+            roster::commit_approval(s, p.device_id, pos, &approval)?;
             flush_or_queue(s);
             println!("approved @{}", invite.handle);
             Ok(())
@@ -961,7 +904,7 @@ mod imp {
 
     fn members(ctx: &Ctx, json_out: bool, trust: &[String]) -> Result<()> {
         let ident = ready(ctx)?;
-        let client = client_of(&ident)?;
+        let client = ident.client()?;
         let listed: MembersResponse = client.members().map_err(|e| match e.status() {
             Some(403) => anyhow!("this device is not approved yet"),
             _ => anyhow!(e),
@@ -1085,12 +1028,12 @@ mod imp {
     // remove, rotate-key
 
     /// Rotates now, whatever the server's `rotation_needed` says, wrapping only to devices the
-    /// roster verifies (`roster::rotate_if_needed`, §5.1).
+    /// roster verifies (`roster::rotate`, §5.1).
     fn rotate_now(s: &mut Session<'_>) -> Result<bool> {
-        if let Some(st) = s.status.as_mut() {
-            st.rotation_needed = true;
+        if s.status.is_none() || !roster::own_member_is_admin(&s.roster, &s.ident) {
+            return Ok(false);
         }
-        roster::rotate_if_needed(s)
+        roster::rotate(s)
     }
 
     fn rotation_counts(conn: &Connection) -> Result<[i64; 3]> {
@@ -1247,7 +1190,7 @@ mod imp {
 
     fn share(ctx: &Ctx, path: Option<PathBuf>) -> Result<()> {
         let dir = ctx.dir();
-        if !state::configured(dir) {
+        if !paths::team_configured(dir) {
             bail!("share works inside an organisation: run awm team join or awm team create first");
         }
         let p = project_of(dir, path)?;
@@ -1310,7 +1253,7 @@ mod imp {
                 }
             }
             tx.commit()?;
-            match push::deletions(s) {
+            match push::deletions(&s.conn, &s.client) {
                 Ok(_) => println!("deleted {} shared record(s) from the server", ids.len()),
                 Err(e) => println!(
                     "{} deletion(s) queued for the next awm sync (the server did not answer: {e})",
@@ -1323,7 +1266,7 @@ mod imp {
 
     fn unshare(ctx: &Ctx, path: Option<PathBuf>, delete: bool) -> Result<()> {
         let dir = ctx.dir();
-        if !state::configured(dir) {
+        if !paths::team_configured(dir) {
             bail!(NOT_IN_TEAM);
         }
         let p = project_of(dir, path)?;
@@ -1385,7 +1328,7 @@ mod imp {
 
     fn unshare_record(ctx: &Ctx, id: &str) -> Result<()> {
         let dir = ctx.dir();
-        if !state::configured(dir) {
+        if !paths::team_configured(dir) {
             bail!(NOT_IN_TEAM);
         }
         let ident = Identity::load(dir)?;
@@ -1416,14 +1359,14 @@ mod imp {
 
     /// The JSON of `awm team status` (also read by `awm doctor`): `in_team: false` outside a team.
     pub fn status_value(dir: &Path) -> Result<Value> {
-        if !state::configured(dir) {
+        if !paths::team_configured(dir) {
             return Ok(json!({ "in_team": false }));
         }
         let join = team::finish_join(dir);
         let ident = Identity::load(dir)?;
         let conn = open_db(dir, DbRole::Cli)?;
         let st = SyncState::load(&conn)?;
-        let server: Result<StatusResponse> = client_of(&ident).and_then(|c| Ok(c.status()?));
+        let server: Result<StatusResponse> = ident.client().and_then(|c| Ok(c.status()?));
         let (reachable, server_error) = match &server {
             Ok(_) => (true, None),
             Err(e) => (false, Some(e.to_string())),
@@ -1754,7 +1697,7 @@ mod imp {
             tx.execute(&format!("DELETE FROM {t}"), [])?;
         }
         tx.commit()?;
-        for f in [state::TEAM_TOML, state::TEAM_KEY, team::TEAM_REPO] {
+        for f in [paths::TEAM_TOML, paths::TEAM_KEY, team::TEAM_REPO] {
             match std::fs::remove_file(dir.join(f)) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1766,14 +1709,14 @@ mod imp {
 
     fn leave(ctx: &Ctx, delete: bool) -> Result<()> {
         let dir = ctx.dir();
-        if !state::configured(dir) {
+        if !paths::team_configured(dir) {
             bail!(NOT_IN_TEAM);
         }
         // sync.lock for the whole command (§3.6), so no run pushes between the deletion and the
         // token revocation (TM11).
-        let _lock = lock(dir)?;
+        let _lock = apply::lock_sync(dir)?;
         let ident = Identity::load(dir)?;
-        let client = client_of(&ident)?;
+        let client = ident.client()?;
         if delete {
             match client.delete(&DeleteRequest::AllMine) {
                 Ok(r) => println!(
@@ -1860,14 +1803,8 @@ mod imp {
             };
             let tx = s.conn.transaction()?;
             for id in &ids {
-                tx.execute(
-                    "UPDATE sync_own SET deleted = 1, blob = NULL, epoch = NULL WHERE record_id = ?1",
-                    [id],
-                )?;
-                tx.execute(
-                    "INSERT OR IGNORE INTO tombstone (kind, value, created_at) VALUES ('tool_use_id', ?1, ?2)",
-                    params![format!("team:{id}"), now],
-                )?;
+                apply::mark_own_deleted(&tx, id)?;
+                apply::tombstone_team(&tx, id, now)?;
             }
             tx.commit()?;
             println!(
@@ -1883,7 +1820,7 @@ mod imp {
         let url = check_url(url)?;
         {
             let _ = ready(ctx)?;
-            let _lock = lock(dir)?;
+            let _lock = apply::lock_sync(dir)?;
             let mut ident = Identity::load(dir)?;
             if url == ident.team.server_url {
                 bail!("this machine already uses {url}");
@@ -1974,9 +1911,7 @@ mod imp {
         let ident = ready(ctx)?;
         let conn = open_db(ctx.dir(), DbRole::Cli)?;
         let p = current_policy(&conn)?;
-        let settings = client_of(&ident)?
-            .get::<OrgSettings>("/v1/org/settings")
-            .ok();
+        let settings = ident.client()?.get::<OrgSettings>("/v1/org/settings").ok();
         if json_out {
             println!(
                 "{}",
@@ -2092,7 +2027,8 @@ mod imp {
             || update.max_members.is_some()
             || update.cancel_pending_retention.is_some();
         if settings_change {
-            let s: OrgSettings = client_of(&ident)?
+            let s: OrgSettings = ident
+                .client()?
                 .put("/v1/org/settings", &update)
                 .map_err(
                     |e| match (e.status(), e.body().and_then(|b| b.field.clone())) {
@@ -2254,14 +2190,8 @@ mod imp {
                     "INSERT INTO sync_outbox (kind, ref, created_at) VALUES ('delete', ?1, ?2)",
                     params![id, now],
                 )?;
-                tx.execute(
-                    "INSERT OR IGNORE INTO tombstone (kind, value, created_at) VALUES ('tool_use_id', ?1, ?2)",
-                    params![format!("team:{id}"), now],
-                )?;
-                tx.execute(
-                    "UPDATE sync_own SET deleted = 1, blob = NULL, epoch = NULL WHERE record_id = ?1",
-                    [id],
-                )?;
+                apply::tombstone_team(&tx, id, now)?;
+                apply::mark_own_deleted(&tx, id)?;
                 tx.execute(
                     "DELETE FROM event WHERE sync_id = ?1 AND origin = 'team'",
                     [id],
@@ -2272,7 +2202,7 @@ mod imp {
                 )?;
             }
             tx.commit()?;
-            match push::deletions(s) {
+            match push::deletions(&s.conn, &s.client) {
                 Ok(_) => println!("deleted {} record(s) from the server", ids.len()),
                 Err(e) => println!(
                     "{} deletion(s) queued for the next awm sync ({e})",
@@ -2285,7 +2215,7 @@ mod imp {
 
     fn audit_log(ctx: &Ctx, json_out: bool, from: u64) -> Result<()> {
         let ident = ready(ctx)?;
-        let client = client_of(&ident)?;
+        let client = ident.client()?;
         let resp: awm_proto::wire::AuditResponse = client
             .get(&format!("/v1/audit?from={from}&limit=1000"))
             .map_err(|e| match e.status() {
@@ -2364,9 +2294,9 @@ mod imp {
     fn token_rotate(ctx: &Ctx) -> Result<()> {
         let dir = ctx.dir();
         let _ = ready(ctx)?;
-        let _lock = lock(dir)?;
+        let _lock = apply::lock_sync(dir)?;
         let mut ident = Identity::load(dir)?;
-        let fresh = client_of(&ident)?.rotate_token()?;
+        let fresh = ident.client()?.rotate_token()?;
         ident.key.previous_device_token = Some(ident.key.device_token.clone());
         ident.key.device_token = fresh.device_token.as_str().to_string();
         ident.save_key(dir)?;
@@ -2393,16 +2323,7 @@ mod imp {
             .iter()
             .filter(|b| b.idx == 0 && b.epoch == 0)
             .any(|b| {
-                let ad = RecordAd {
-                    org: ring.org(),
-                    member: b.member,
-                    device: b.device,
-                    tag: ROSTER_TAG.to_string(),
-                    idx: 0,
-                    record_id: b.record_id,
-                    epoch: 0,
-                };
-                let Ok(plain) = open_record(ring, &ad, &b.blob) else {
+                let Ok(plain) = open_record(ring, &b.ad(ring.org()), &b.blob) else {
                     return false;
                 };
                 match serde_json::from_slice::<RosterPlaintext>(&plain) {
@@ -2428,7 +2349,7 @@ mod imp {
 
     /// Index-0 roster records from the server, for a device that has none stored.
     fn server_geneses(ident: &Identity) -> Result<Vec<keys::RosterBlob>> {
-        let client = client_of(ident)?;
+        let client = ident.client()?;
         let st = client.status()?;
         let cursors: Vec<Cursor> = st
             .streams
@@ -2470,7 +2391,7 @@ mod imp {
 
     fn key_import(ctx: &Ctx, text: Option<String>) -> Result<()> {
         let dir = ctx.dir();
-        if !state::configured(dir) {
+        if !paths::team_configured(dir) {
             bail!(NOT_IN_TEAM);
         }
         let text = match text {
@@ -2484,7 +2405,7 @@ mod imp {
         let imported = KeyRing::import_recovery(text.trim()).map_err(|_| {
             anyhow!("not a recovery string (awmk1_...), or a typing error: nothing was written")
         })?;
-        let _lock = lock(dir)?;
+        let _lock = apply::lock_sync(dir)?;
         let mut ident = Identity::load(dir)?;
         if Id::from(imported.org()) != ident.team.org_id {
             bail!(

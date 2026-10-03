@@ -9,10 +9,10 @@
 use std::collections::BTreeSet;
 
 use anyhow::Result;
-use awm_proto::crypto::{open_record, RecordAd};
+use awm_proto::crypto::open_record;
 use awm_proto::keys::{
-    approve, plan_rotation, rotate, ApprovalInfo, ApprovalKind, Invite, JoinRequest, ListedDevice,
-    Role as KeyRole, Roster, RosterBlob, RosterEntry, ROSTER_TAG,
+    approve, plan_rotation, rotate as rotate_keys, Approval, ApprovalInfo, ApprovalKind,
+    JoinRequest, ListedDevice, Roster, RosterBlob, RosterEntry,
 };
 use awm_proto::wire::{
     ApproveRequest, DeviceWrap, EpochWrap, ErrorCode, Id, InviteKind, Key32, RosterPlaintext,
@@ -20,10 +20,10 @@ use awm_proto::wire::{
 };
 use rusqlite::{params, Connection};
 
-use crate::config::AutoApprove;
 use crate::sync::push;
 use crate::sync::state::Identity;
 use crate::sync::Session;
+use crate::team;
 
 /// Stores one roster record; false when it was already there.
 pub fn store_record(
@@ -160,15 +160,12 @@ fn to_wrap_item(w: &awm_proto::keys::Wrap) -> EpochWrap {
 }
 
 /// Approves pending devices (plan-v3-team §4.6 item 7): the device's join MAC must verify under
-/// the secret of an invite this device created, and `decide` (`team::auto_approve`) must say
-/// yes for that kind of join. Under the default `team.auto_approve = none` it never does: a
-/// verifying MAC proves only possession of the invite string, so every join waits for
+/// the secret of an invite this device created, and `team.auto_approve` ([`team::auto_approve`])
+/// must say yes for that kind of join. Under the default `team.auto_approve = none` it never
+/// does: a verifying MAC proves only possession of the invite string, so every join waits for
 /// `awm team approve --code N` (RVT2 m3). The member id and kind come from the invite record,
 /// never from the server's pending list (RVT1 M2). Returns how many were approved.
-pub fn approve_pending(
-    s: &mut Session<'_>,
-    decide: &dyn Fn(AutoApprove, bool) -> bool,
-) -> Result<usize> {
+pub fn approve_pending(s: &mut Session<'_>) -> Result<usize> {
     let Some(status) = s.status.clone() else {
         return Ok(0);
     };
@@ -177,40 +174,16 @@ pub fn approve_pending(
         if p.kind == InviteKind::Unknown {
             continue;
         }
-        let Some((pos, invite)) =
-            s.ident
-                .key
-                .pending_invites
-                .iter()
-                .enumerate()
-                .find_map(|(i, pi)| {
-                    Invite::parse(&pi.invite)
-                        .ok()
-                        .filter(|inv| inv.invite_id == p.invite_id.to_string())
-                        .map(|inv| (i, inv))
-                })
-        else {
+        let Some((pos, record, invite)) = team::find_invite(&s.ident.key, p.invite_id) else {
             continue;
         };
-        let record = s.ident.key.pending_invites[pos].clone();
-        let (kind, member_id, role) = match record.kind.as_str() {
-            "device" => {
-                let m = match record.member_id.as_deref().map(Id::parse) {
-                    Some(Ok(m)) => m,
-                    _ => s.ident.team.member_id,
-                };
-                (ApprovalKind::Device, m, KeyRole::Member)
-            }
-            "member" => (
-                ApprovalKind::Member,
-                p.member_id,
-                if record.role.as_deref() == Some("admin") {
-                    KeyRole::Admin
-                } else {
-                    KeyRole::Member
-                },
-            ),
-            _ => continue,
+        if !matches!(record.kind.as_str(), "device" | "member") {
+            continue;
+        }
+        let Ok((kind, member_id, role)) = team::approval_plan(p, &record, s.ident.team.member_id)
+        else {
+            crate::sync::state::bump(&s.conn, "dropped.approval_refused", 1)?;
+            continue;
         };
         let request = JoinRequest {
             invite_id: invite.invite_id.clone(),
@@ -224,7 +197,7 @@ pub fn approve_pending(
             continue;
         };
         let is_own = kind == ApprovalKind::Device && member_id == s.ident.team.member_id;
-        if !decide(s.env.config.team.auto_approve, is_own) {
+        if !team::auto_approve(s.env.config.team.auto_approve, is_own) {
             continue;
         }
         let approval = match approve(
@@ -246,19 +219,32 @@ pub fn approve_pending(
                 continue;
             }
         };
-        let body = ApproveRequest {
-            wraps: approval.wraps.iter().map(to_wrap_item).collect(),
-        };
-        s.client.approve_device(p.device_id, &body)?;
-        let now = s.now_ms();
-        push::queue_roster_entry(&mut s.conn, &s.ident, &s.ring, &approval.roster, now)?;
-        s.ident.key.pending_invites.remove(pos);
-        s.ident.save_key(&s.env.data_dir)?;
-        let (roster, _) = verify_and_store(&s.conn, &s.ring, now)?;
-        s.roster = roster;
+        commit_approval(s, p.device_id, pos, &approval)?;
         approved += 1;
     }
     Ok(approved)
+}
+
+/// What an approval does once the approver has decided and `approve` has built it: the wraps go
+/// to the server for the joining device, the roster entry is queued, the pending invite is
+/// dropped from `team.key`, and the roster is verified again. The engine and `awm team approve`
+/// share it.
+pub fn commit_approval(
+    s: &mut Session<'_>,
+    device_id: Id,
+    pos: usize,
+    approval: &Approval,
+) -> Result<()> {
+    let body = ApproveRequest {
+        wraps: approval.wraps.iter().map(to_wrap_item).collect(),
+    };
+    s.client.approve_device(device_id, &body)?;
+    let now = s.now_ms();
+    push::queue_roster_entry(&mut s.conn, &s.ident, &s.ring, &approval.roster, now)?;
+    s.ident.key.pending_invites.remove(pos);
+    s.ident.save_key(&s.env.data_dir)?;
+    s.roster = verify_and_store(&s.conn, &s.ring, now)?.0;
+    Ok(())
 }
 
 /// How far ahead of the local clock a roster date may be before it is clamped (one day).
@@ -282,16 +268,7 @@ fn epoch_dates(
     let mut epoch_at: Option<i64> = None;
     let mut revoked_at = Vec::new();
     for b in blobs(conn)? {
-        let ad = RecordAd {
-            org: ring.org(),
-            member: b.member,
-            device: b.device,
-            tag: ROSTER_TAG.to_string(),
-            idx: b.idx,
-            record_id: b.record_id,
-            epoch: b.epoch,
-        };
-        let Ok(plain) = open_record(ring, &ad, &b.blob) else {
+        let Ok(plain) = open_record(ring, &b.ad(ring.org()), &b.blob) else {
             continue;
         };
         let Ok(p) = serde_json::from_slice::<RosterPlaintext>(&plain) else {
@@ -398,17 +375,25 @@ pub fn rotation_created_at(
 /// to devices the roster verifies (`plan_rotation`), then the `epoch` roster entry is queued
 /// under the new key. Returns whether a rotation happened.
 pub fn rotate_if_needed(s: &mut Session<'_>) -> Result<bool> {
-    let Some(status) = s.status.clone() else {
+    let Some(rotation_needed) = s.status.as_ref().map(|st| st.rotation_needed) else {
         return Ok(false);
     };
     if !own_member_is_admin(&s.roster, &s.ident) {
         return Ok(false);
     }
     let now_s = s.now_ms() / 1_000;
-    if !status.rotation_needed && !revoked_since_current_epoch(&s.conn, &s.ring, &s.roster, now_s)?
-    {
+    if !rotation_needed && !revoked_since_current_epoch(&s.conn, &s.ring, &s.roster, now_s)? {
         return Ok(false);
     }
+    rotate(s)
+}
+
+/// Rotates the epoch key now, whatever the server's `rotation_needed` says: lists the devices,
+/// wraps only to those the roster verifies, asks the server to rotate and queues the `epoch`
+/// roster entry. The caller has checked that this device is an admin and holds a status.
+/// Returns whether a rotation happened (false when another admin rotated first).
+pub fn rotate(s: &mut Session<'_>) -> Result<bool> {
+    let now_s = s.now_ms() / 1_000;
     let members = s.client.members()?;
     let listed: Vec<ListedDevice> = members
         .members
@@ -444,7 +429,7 @@ pub fn rotate_if_needed(s: &mut Session<'_>) -> Result<bool> {
         }
     }
     let created_at = rotation_created_at(&s.conn, &s.ring, &s.roster, now_s)?;
-    let rotation = rotate(
+    let rotation = rotate_keys(
         &s.ring,
         &plan,
         *s.ident.team.device_id.as_uuid(),

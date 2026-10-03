@@ -3,7 +3,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use awm::capture::{self, CaptureOpts};
 use awm::config::{Config, Mode, Notify, PromptBm25, ShortCircuitMode};
@@ -11,17 +11,10 @@ use awm::db::{self, Role};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
-const DAY_MS: i64 = 86_400_000;
+mod support;
+use support::now_ms;
 
-fn now_ms() -> i64 {
-    i64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis(),
-    )
-    .unwrap()
-}
+const DAY_MS: i64 = 86_400_000;
 
 fn fixture(name: &str) -> Value {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -8,7 +8,7 @@
 //! always find the write lock free for long enough.
 
 use std::collections::{BTreeMap, HashMap};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::Result;
 use awm_proto::crypto::{open_record, RecordAd};
@@ -17,11 +17,12 @@ use awm_proto::wire::{
     decode_plaintext, Cursor, Decoded, FlagReason, Id, PolicyPlaintext, PullRequest, PulledItem,
     PulledRecord, RecPlaintext, Share as WireShare, StreamRecords, Tag, Tool as WireTool,
 };
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::{params, Connection};
 use url::Url;
 
 use crate::note::{Status, Tool};
 use crate::record::{sha256_hex, Agent, Record, ResultRow};
+use crate::sync::apply::Pace;
 use crate::sync::eligible;
 use crate::sync::payload::{
     MAX_QUERY_CHARS, MAX_RESULTS, MAX_RESULT_URL_CHARS, MAX_SUMMARY_CHARS, MAX_TITLE_CHARS,
@@ -32,9 +33,7 @@ use crate::sync::{apply, push, roster, Session};
 
 /// Rows per write transaction (plan-v3-team §4.6 step 6): the one constant of the record and the
 /// deletion paths (RVT3 F18).
-pub use crate::sync::apply::CHUNK_ROWS;
-/// Time per write transaction.
-pub const CHUNK_TIME: Duration = Duration::from_millis(20);
+pub use crate::sync::apply::{CHUNK_ROWS, CHUNK_TIME};
 /// Records per `POST /v1/pull`.
 pub const PAGE: u32 = 500;
 /// A pull of more rows than this ends with `PRAGMA wal_checkpoint(PASSIVE)`.
@@ -77,10 +76,6 @@ struct Prepared {
     action: Action,
 }
 
-fn is_repo_key(s: &str) -> bool {
-    s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
 /// Decrypts one record; the keys are fetched again once when the epoch or the key is wrong.
 fn open(
     s: &mut Session<'_>,
@@ -91,15 +86,15 @@ fn open(
 ) -> Result<Option<Vec<u8>>> {
     let mut refreshed = false;
     loop {
-        let ad = RecordAd {
-            org: s.ring.org(),
-            member: *member.as_uuid(),
-            device: *device.as_uuid(),
-            tag: tag.to_string(),
-            idx: r.idx,
-            record_id: *r.id.as_uuid(),
-            epoch: r.epoch,
-        };
+        let ad = RecordAd::new(
+            s.ring.org(),
+            *member.as_uuid(),
+            *device.as_uuid(),
+            tag,
+            r.idx,
+            *r.id.as_uuid(),
+            r.epoch,
+        );
         match open_record(&s.ring, &ad, &r.blob.0) {
             Ok(plain) => return Ok(Some(plain)),
             Err(_) if !refreshed && !s.keys_refreshed => {
@@ -109,20 +104,6 @@ fn open(
             Err(_) => return Ok(None),
         }
     }
-}
-
-fn tombstoned(conn: &Connection, kind: &str, value: &str) -> Result<bool> {
-    Ok(conn
-        .query_row(
-            "SELECT 1 FROM tombstone WHERE kind = ?1 AND value = ?2",
-            params![kind, value],
-            |_| Ok(()),
-        )
-        .map(|_| true)
-        .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(false),
-            other => Err(other),
-        })?)
 }
 
 fn cut(s: &str, n: usize) -> (String, bool) {
@@ -166,7 +147,7 @@ fn check_rec(
     let terms = eligible::terms(cfg, policy);
     let conn = &s.conn;
     let sync_id = id.to_string();
-    if tombstoned(conn, "tool_use_id", &format!("team:{sync_id}"))? {
+    if crate::db::is_tombstoned(conn, "tool_use_id", &apply::team_key(&sync_id))? {
         state::bump(conn, "dropped.tombstone", 1)?;
         return Ok(None);
     }
@@ -193,7 +174,7 @@ fn check_rec(
                 state::bump(conn, "dropped.malformed", 1)?;
                 return Ok(None);
             };
-            if tombstoned(conn, "url_hash", &sha256_hex(&norm))? {
+            if crate::db::is_tombstoned(conn, "url_hash", &sha256_hex(&norm))? {
                 state::bump(conn, "dropped.tombstone", 1)?;
                 return Ok(None);
             }
@@ -226,7 +207,7 @@ fn check_rec(
             private_rows += 1;
             continue;
         };
-        if tombstoned(conn, "url_hash", &sha256_hex(&norm))? {
+        if crate::db::is_tombstoned(conn, "url_hash", &sha256_hex(&norm))? {
             forgotten += 1;
             continue;
         }
@@ -296,7 +277,7 @@ fn check_rec(
         .created_at
         .clamp(received_at - CLAMP_SECS, received_at + CLAMP_SECS);
     let mut record = Record {
-        tool_use_id: format!("team:{sync_id}"),
+        tool_use_id: apply::team_key(&sync_id),
         tool,
         session_id: format!("team:{member}"),
         agent_id: None,
@@ -329,7 +310,7 @@ fn check_rec(
         record,
         member: member.to_string(),
         sync_id,
-        repo_key: p.repo_key.filter(|k| is_repo_key(k)),
+        repo_key: p.repo_key.filter(|k| crate::team::is_repo_key(k)),
         shareable: match p.share {
             WireShare::Full => "full",
             WireShare::Link => "link",
@@ -521,35 +502,28 @@ fn apply_row(tx: &Connection, row: &NewRow) -> Result<bool> {
 
 /// The tombstone of a record id and the removal of its team row.
 fn forget_team_record(tx: &Connection, id: &str, now_ms: i64) -> Result<usize> {
-    tx.execute(
-        "INSERT OR IGNORE INTO tombstone (kind, value, created_at) VALUES ('tool_use_id', ?1, ?2)",
-        params![format!("team:{id}"), now_ms],
-    )?;
+    apply::tombstone_team(tx, id, now_ms)?;
     Ok(tx.execute(
         "DELETE FROM event WHERE sync_id = ?1 AND origin = 'team'",
         [id],
     )?)
 }
 
-/// Writes prepared items in transactions of at most [`CHUNK_ROWS`] rows and [`CHUNK_TIME`].
+/// Writes prepared items in transactions of at most [`CHUNK_ROWS`] rows and [`CHUNK_TIME`]
+/// ([`apply::run_chunked`] with [`Pace::RECORDS`]).
 fn apply(s: &mut Session<'_>, items: Vec<Prepared>) -> Result<usize> {
     let now = s.now_ms();
     let mut applied = 0;
-    let mut i = 0;
     let mut flags: Vec<(Id, String)> = Vec::new();
-    while i < items.len() {
-        let started = Instant::now();
-        let tx = s
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut heads: HashMap<(Id, Id, String), u64> = HashMap::new();
-        let mut n = 0;
-        while i < items.len() && n < CHUNK_ROWS {
-            let it = &items[i];
+    let chunks = apply::run_chunked(
+        &mut s.conn,
+        &items,
+        Pace::RECORDS,
+        |tx, it| {
             match &it.action {
                 Action::Advance => {}
                 Action::Insert(row) => {
-                    if apply_row(&tx, row)? {
+                    if apply_row(tx, row)? {
                         applied += 1;
                         if let Some(reason) = &row.flag {
                             if let Ok(id) = Id::parse(&row.sync_id) {
@@ -564,7 +538,7 @@ fn apply(s: &mut Session<'_>, items: Vec<Prepared>) -> Result<usize> {
                     blob,
                 } => {
                     roster::store_record(
-                        &tx,
+                        tx,
                         &it.key.0.to_string(),
                         &it.key.1.to_string(),
                         it.idx,
@@ -574,37 +548,31 @@ fn apply(s: &mut Session<'_>, items: Vec<Prepared>) -> Result<usize> {
                     )?;
                 }
                 Action::Policy(p) => {
-                    state::set(&tx, state::POLICY_JSON, &serde_json::to_string(p.as_ref())?)?;
-                    state::set(&tx, state::POLICY_VERSION, &p.version.to_string())?;
+                    state::set(tx, state::POLICY_JSON, &serde_json::to_string(p.as_ref())?)?;
+                    state::set(tx, state::POLICY_VERSION, &p.version.to_string())?;
                 }
                 Action::Marker(id) => {
-                    forget_team_record(&tx, &id.to_string(), now)?;
+                    forget_team_record(tx, &id.to_string(), now)?;
                 }
             }
-            heads.insert(it.key.clone(), it.idx);
-            i += 1;
-            n += 1;
-            if started.elapsed() >= CHUNK_TIME {
-                break;
+            Ok(())
+        },
+        |tx, held| {
+            let heads: HashMap<&(Id, Id, String), u64> =
+                held.iter().map(|it| (&it.key, it.idx)).collect();
+            for ((member, device, tag), idx) in heads {
+                tx.execute(
+                    "INSERT INTO sync_stream (member_id, device_id, tag, head_idx) VALUES (?1, ?2, ?3, ?4) \
+                     ON CONFLICT(member_id, device_id, tag) DO UPDATE SET head_idx = excluded.head_idx",
+                    params![member.to_string(), device.to_string(), tag, idx as i64],
+                )?;
             }
-        }
-        for ((member, device, tag), idx) in heads {
-            tx.execute(
-                "INSERT INTO sync_stream (member_id, device_id, tag, head_idx) VALUES (?1, ?2, ?3, ?4) \
-                 ON CONFLICT(member_id, device_id, tag) DO UPDATE SET head_idx = excluded.head_idx",
-                params![member.to_string(), device.to_string(), tag, idx as i64],
-            )?;
-        }
-        tx.commit()?;
-        let took = started.elapsed();
-        s.report.apply_ms.push(took.as_millis() as u64);
-        s.report.max_rows_per_txn = s.report.max_rows_per_txn.max(n);
-        if i < items.len() {
-            // Leave the write lock free long enough for a waiting hook to take it: SQLite's
-            // busy handler polls at 1, 3, 8, 18, 33 ms.
-            let gap = (took * 3).clamp(Duration::from_millis(15), Duration::from_millis(40));
-            std::thread::sleep(gap);
-        }
+            Ok(())
+        },
+    )?;
+    for c in &chunks {
+        s.report.apply_ms.push(c.took.as_millis() as u64);
+        s.report.max_rows_per_txn = s.report.max_rows_per_txn.max(c.rows);
     }
     for (id, reason) in flags {
         let now = s.now_ms();
@@ -621,16 +589,6 @@ fn apply(s: &mut Session<'_>, items: Vec<Prepared>) -> Result<usize> {
         state::bump(&s.conn, "quarantined", 1)?;
     }
     Ok(applied)
-}
-
-fn local_head(conn: &Connection, member: Id, device: Id, tag: &str) -> Result<i64> {
-    Ok(conn
-        .query_row(
-            "SELECT head_idx FROM sync_stream WHERE member_id = ?1 AND device_id = ?2 AND tag = ?3",
-            params![member.to_string(), device.to_string(), tag],
-            |r| r.get(0),
-        )
-        .unwrap_or(-1))
 }
 
 /// One pull: status heads, pages of at most 500 records, roster and policy streams first.
@@ -663,7 +621,7 @@ pub fn run(s: &mut Session<'_>) -> Result<usize> {
     loop {
         let mut cursors: Vec<Cursor> = Vec::new();
         for (member, device, tag, head) in &streams {
-            let local = local_head(&s.conn, *member, *device, tag.as_str())?;
+            let local = state::stream_head(&s.conn, *member, *device, tag.as_str()).unwrap_or(-1);
             if *head > local {
                 cursors.push(Cursor {
                     member: *member,
@@ -721,9 +679,9 @@ pub fn run(s: &mut Session<'_>) -> Result<usize> {
         }
         if advanced == 0 || (!resp.more && sent.len() < awm_proto::wire::limits::PULL_CURSORS) {
             // No progress (a gap), or everything asked for was served.
-            let still = streams
-                .iter()
-                .any(|(m, d, t, h)| local_head(&s.conn, *m, *d, t.as_str()).is_ok_and(|l| *h > l));
+            let still = streams.iter().any(|(m, d, t, h)| {
+                state::stream_head(&s.conn, *m, *d, t.as_str()).is_ok_and(|l| *h > l)
+            });
             if advanced == 0 || !still {
                 break;
             }
@@ -768,28 +726,28 @@ pub fn apply_deletions(s: &mut Session<'_>) -> Result<usize> {
         if page.entries.is_empty() {
             break;
         }
-        let chunks = page.entries.chunks(apply::CHUNK_ROWS);
-        let last = chunks.len();
-        for (n, chunk) in chunks.enumerate() {
-            let tx = s
-                .conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let ids: Vec<String> = chunk.iter().map(|e| e.record_id.to_string()).collect();
-            let a = apply::deletions(&tx, &ids, now)?;
-            if a.own_kept > 0 {
-                state::bump(&tx, "dropped.own_deleted", a.own_kept as i64)?;
-            }
-            applied += a.team_rows;
-            for e in chunk {
-                head = head.max(e.idx as i64);
-            }
-            state::set(&tx, state::DELETION_HEAD, &head.to_string())?;
-            tx.commit()?;
-            s.report.delete_tx_rows.push(chunk.len());
-            s.report.max_rows_per_txn = s.report.max_rows_per_txn.max(chunk.len());
-            if n + 1 < last {
-                std::thread::sleep(Duration::from_millis(15));
-            }
+        let chunks = apply::run_chunked(
+            &mut s.conn,
+            &page.entries,
+            Pace::DELETIONS,
+            |tx, e| {
+                let a = apply::deletions(tx, &[e.record_id.to_string()], now)?;
+                if a.own_kept > 0 {
+                    state::bump(tx, "dropped.own_deleted", a.own_kept as i64)?;
+                }
+                applied += a.team_rows;
+                Ok(())
+            },
+            |tx, held| {
+                for e in held {
+                    head = head.max(e.idx as i64);
+                }
+                state::set(tx, state::DELETION_HEAD, &head.to_string())
+            },
+        )?;
+        for c in &chunks {
+            s.report.delete_tx_rows.push(c.rows);
+            s.report.max_rows_per_txn = s.report.max_rows_per_txn.max(c.rows);
         }
         if page.entries.len() < 5_000 {
             break;

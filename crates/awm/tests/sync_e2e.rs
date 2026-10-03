@@ -7,15 +7,14 @@
 //! own data directory (what `AWM_HOME` names), database, `team.toml` and `team.key`. The harness
 //! plays the part of `awm team create/join/approve` (TM12's stubs): it bootstraps the organisation
 //! through `POST /v1/bootstrap` and `awm_proto::keys`, invites, joins, and lets the admin's
-//! engine approve through `Opts::approve`. A "forger" is a member whose records the test seals by
+//! engine approve through `team.auto_approve = all`. A "forger" is a member whose records the test seals by
 //! hand, to give the pull-side checks input no honest client would send.
 
 #![cfg(all(feature = "sync", feature = "serve"))]
 
-use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use awm::config::{AutoApprove, Config};
 use awm::db::{self, Role};
@@ -27,142 +26,28 @@ use awm::sync::{Env, Opts, Outcome, Report};
 use awm_proto::crypto::{open_record, seal_record, RecordAd};
 use awm_proto::keys::{accept_join, DeviceKeys, Invite, KeyRing, RosterEntry, Wrap, ROSTER_TAG};
 use awm_proto::wire::{Id, Key32, KeysResponse, RosterPlaintext, B64};
-use awm_server::auth;
-use awm_server::http::embedded::{self, Embedded};
-use awm_server::http::{AppState, LogSink, ServerConfig};
-use awm_server::store::sqlite::SqliteStore;
+use awm_server::http::embedded;
 use awm_server::store::Store;
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
 mod support;
-use support::{bare, coded, Proxy};
+use support::{bare, coded, unix_secs, Proxy, Srv};
 
 // ---------------------------------------------------------------------------------------------
-// The server
+// The server: `support::Srv`, plus what only this suite asks
 
-#[derive(Default)]
-struct Capture(Mutex<Vec<String>>);
-
-impl LogSink for Capture {
-    fn line(&self, line: &str) {
-        self.0.lock().unwrap().push(line.to_string());
-    }
-}
-
-fn unix_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
-}
-
+/// Unix milliseconds at second resolution (what the harness has always stamped its rows with).
 fn now_ms() -> i64 {
     unix_secs() * 1_000
 }
 
-struct Srv {
-    store: Arc<SqliteStore>,
-    emb: Option<Embedded>,
-    addr: SocketAddr,
-    dir: tempfile::TempDir,
-    logs: Arc<Capture>,
-    snaps: AtomicUsize,
-}
-
-fn server_config() -> ServerConfig {
-    let v = own_version();
-    let mut c = ServerConfig::new(v.clone(), v);
-    // Tests push thousands of records and run many syncs a minute.
-    c.limits.records_per_day = 1_000_000;
-    c.limits.requests_per_minute = 1_000_000;
-    c.limits.request_burst = 1_000_000;
-    c.limits.anonymous_per_minute = 1_000_000;
-    c.limits.joins_per_hour = 1_000;
-    c
-}
-
 impl Srv {
-    fn start() -> Srv {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(SqliteStore::open(&dir.path().join("data")).unwrap());
-        let logs = Arc::new(Capture::default());
-        let emb = embedded::spawn(Srv::state(&store, &logs)).unwrap();
-        Srv {
-            store,
-            addr: emb.addr(),
-            emb: Some(emb),
-            dir,
-            logs,
-            snaps: AtomicUsize::new(0),
-        }
-    }
-
-    fn state(store: &Arc<SqliteStore>, logs: &Arc<Capture>) -> AppState {
-        AppState::new(store.clone() as Arc<dyn Store>, server_config()).with_log_sink(logs.clone())
-    }
-
-    fn url(&self) -> String {
-        format!("http://{}", self.addr)
-    }
-
-    fn anonymous(&self) -> Client {
-        Client::new(&self.url(), None, None).unwrap()
-    }
-
-    /// Stops the server (connections are refused afterwards).
-    fn stop(&mut self) {
-        if let Some(mut e) = self.emb.take() {
-            e.stop();
-        }
-    }
-
-    /// Starts the stopped server again on the same address and store.
-    fn resume(&mut self) {
-        let emb = embedded::spawn_on(self.addr, Srv::state(&self.store, &self.logs)).unwrap();
-        self.emb = Some(emb);
-    }
-
-    fn snapshot(&self) -> PathBuf {
-        let n = self.snaps.fetch_add(1, Ordering::SeqCst);
-        let dest = self.dir.path().join(format!("snap-{n}.db"));
-        embedded::block_on(self.store.snapshot(dest.clone())).unwrap();
-        dest
-    }
-
-    /// Replaces the server with the copy in `snap` under a new generation, as
-    /// `awm serve restore` does (sync-v1 §11).
-    fn restore(&mut self, snap: &Path) {
-        self.stop();
-        let data = self.dir.path().join("data");
-        for f in ["server.db", "server.db-wal", "server.db-shm"] {
-            let _ = std::fs::remove_file(data.join(f));
-        }
-        std::fs::copy(snap, data.join("server.db")).unwrap();
-        let store = Arc::new(SqliteStore::open(&data).unwrap());
-        embedded::block_on(store.renew_generation(unix_secs())).unwrap();
-        self.store = store;
-        self.resume();
-    }
-
-    fn bootstrap_token(&self) -> String {
-        embedded::block_on(auth::issue_bootstrap(&*self.store, unix_secs()))
-            .unwrap()
-            .as_str()
-            .to_string()
-    }
-
-    fn log_text(&self) -> String {
-        self.logs.0.lock().unwrap().join("\n")
-    }
-
     /// A server that withholds the rotation flag (compromised, or rolled back by its operator):
     /// clears `rotation_needed` in its database (RVT2 M3).
     fn withhold_rotation(&self) {
-        let conn = Connection::open(self.dir.path().join("data").join("server.db")).unwrap();
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
-        conn.execute("UPDATE org SET rotation_needed = 0", [])
+        self.raw()
+            .execute("UPDATE org SET rotation_needed = 0", [])
             .unwrap();
     }
 }
@@ -182,10 +67,6 @@ struct Node {
     cfg: Config,
 }
 
-fn yes(_: AutoApprove, _: bool) -> bool {
-    true
-}
-
 impl Node {
     /// A data directory with a migrated database and a share rule for the shared project.
     fn blank(handle: &str) -> Node {
@@ -200,7 +81,11 @@ impl Node {
         Node {
             dir,
             handle: handle.to_string(),
-            cfg: Config::default(),
+            cfg: {
+                let mut cfg = Config::default();
+                cfg.team.auto_approve = AutoApprove::All;
+                cfg
+            },
         }
     }
 
@@ -230,10 +115,7 @@ impl Node {
     }
 
     fn opts(&self) -> Opts {
-        Opts {
-            approve: Some(yes),
-            ..Opts::default()
-        }
+        Opts::default()
     }
 
     fn try_sync(&self, opts: &Opts) -> anyhow::Result<Outcome> {
@@ -383,7 +265,7 @@ fn create_org(srv: &Srv, handle: &str) -> Node {
     node
 }
 
-/// `awm team invite` and `awm team join`, then the admin's engine approves (`Opts::approve`) and
+/// `awm team invite` and `awm team join`, then the admin's engine approves (`team.auto_approve = all`) and
 /// the new device takes its wraps (`accept_join`).
 fn add_member(srv: &Srv, admin: &Node, handle: &str, role: &str) -> Node {
     let ai = admin.ident();
@@ -1412,14 +1294,9 @@ fn a_pending_device_is_left_alone_when_the_decision_says_no() {
             }),
         )
         .unwrap();
-    fn no(_: AutoApprove, _: bool) -> bool {
-        false
-    }
-    let opts = Opts {
-        approve: Some(no),
-        ..Opts::default()
-    };
-    let Outcome::Done(r) = a.try_sync(&opts).unwrap() else {
+    let mut declined = a.env();
+    declined.config.team.auto_approve = AutoApprove::None;
+    let Outcome::Done(r) = awm::sync::run(&declined, &Opts::default()).unwrap() else {
         panic!()
     };
     assert_eq!(r.approvals, 0);
@@ -1430,6 +1307,50 @@ fn a_pending_device_is_left_alone_when_the_decision_says_no() {
     };
     assert_eq!(r.approvals, 1);
     assert!(a.ident().key.pending_invites.is_empty());
+}
+
+#[test]
+fn a_device_invite_record_with_a_malformed_member_id_is_refused_not_approved_as_the_approver() {
+    let srv = Srv::start();
+    let a = create_org(&srv, "ann");
+    a.sync();
+    let ai = a.ident();
+    let inv: Value = a
+        .client()
+        .post("/v1/invites", &json!({"kind": "device", "handle": "ann"}))
+        .unwrap();
+    let invite = Invite::create(
+        *ai.team.org_id.as_uuid(),
+        inv["invite_id"].as_str().unwrap(),
+        inv["invite_token"].as_str().unwrap(),
+        "ann",
+    )
+    .unwrap();
+    let mut key = ai.key.clone();
+    key.pending_invites.push(PendingInvite {
+        invite: invite.encode(),
+        kind: "device".into(),
+        member_id: Some("not-a-member-id".into()),
+        role: None,
+    });
+    key.save(a.path()).unwrap();
+    let keys = DeviceKeys::generate().unwrap();
+    let device = Id::new_v4();
+    let _: Value = srv
+        .anonymous()
+        .post(
+            "/v1/join",
+            &json!({
+                "invite_id": inv["invite_id"], "invite_token": inv["invite_token"],
+                "handle": "ann", "device_id": device, "device_pubkey": Key32(keys.public),
+                "join_mac": Key32(invite.join_mac(*device.as_uuid(), &keys.public)),
+            }),
+        )
+        .unwrap();
+    let r = a.sync();
+    assert_eq!(r.approvals, 0, "{r:?}");
+    assert_eq!(a.state("dropped.approval_refused").as_deref(), Some("1"));
+    assert_eq!(a.ident().key.pending_invites.len(), 1);
 }
 
 // --- re-seed -----------------------------------------------------------------------------------

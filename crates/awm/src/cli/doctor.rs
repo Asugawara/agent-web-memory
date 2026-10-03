@@ -131,7 +131,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     consent(&conn)?;
     quota_samples(&dir);
     // Only a machine in a team has this section; without `team.toml` the output is unchanged.
-    if dir.join(super::where_::TEAM_TOML).exists() {
+    if dir.join(crate::paths::TEAM_TOML).exists() {
         failed |= team_section(&dir);
     }
 

@@ -36,7 +36,7 @@ use anyhow::{anyhow, bail, Context};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::cli::{fmt_ts, parse_date};
-use crate::db::{self, Role, VersionCheck};
+use crate::db::{self, Role};
 use crate::normalize::norm_url;
 use crate::note::{Status, Tool};
 use crate::paths;
@@ -247,18 +247,7 @@ fn confirm(
 
 /// Opens the existing database of `data_dir` for writing; refuses a missing or mismatched schema.
 fn open_db(data_dir: &Path) -> anyhow::Result<Connection> {
-    let path = data_dir.join(paths::DB_FILE);
-    if !path.is_file() {
-        bail!("no database at {}. Run: awm init", path.display());
-    }
-    let conn = db::open(&path, Role::Cli)?;
-    match db::check_version(&conn)? {
-        VersionCheck::Current => Ok(conn),
-        VersionCheck::Older { .. } => bail!("database needs an upgrade. Run: awm doctor"),
-        VersionCheck::Newer { db, .. } => {
-            bail!("database is from a newer awm ({db}). Upgrade awm.")
-        }
-    }
+    crate::cli::open_db_in(data_dir, Role::Cli)
 }
 
 // ---------------------------------------------------------------------------
@@ -447,13 +436,6 @@ fn select_url(conn: &Connection, arg: &str, norm: &str) -> anyhow::Result<(Vec<R
 // ---------------------------------------------------------------------------
 // Team side (plan-v3-team §3.6; TM11)
 
-/// The member id in `team.toml`, read without the `sync` feature; `None` outside a team.
-fn team_member(dir: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(dir.join(crate::cli::where_::TEAM_TOML)).ok()?;
-    let table = text.parse::<toml::Table>().ok()?;
-    table.get("member_id")?.as_str().map(str::to_string)
-}
-
 /// The member's shared records this machine knows of: own captures the server accepted and
 /// copies of the member's other machines' records.
 fn own_shared(conn: &Connection, member: &str) -> anyhow::Result<usize> {
@@ -480,7 +462,7 @@ struct Team {
 impl Team {
     /// `None` outside a team; in one, takes `sync.lock` (waiting up to 10 s, then refusing).
     fn join(dir: &Path, local_only: bool) -> anyhow::Result<Option<Team>> {
-        let Some(member) = team_member(dir) else {
+        let Some(member) = crate::paths::team_member_id(dir) else {
             return Ok(None);
         };
         let lock = crate::sync::apply::lock_sync(dir)?;
@@ -765,7 +747,7 @@ pub fn run_forget(args: &Args, io: &mut Io<'_>) -> anyhow::Result<Outcome> {
         if target == "last" {
             // Your newest record: a local capture or, in a team, a copy of a record of your
             // other machine (plan-v3-team §3.5).
-            let own = team_member(&io.data_dir).unwrap_or_default();
+            let own = crate::paths::team_member_id(&io.data_dir).unwrap_or_default();
             let rows = rows(
                 &conn,
                 "id = (SELECT id FROM event WHERE origin = 'local' \
@@ -1371,8 +1353,8 @@ fn ours(name: &str) -> bool {
         || name == format!("{db}-journal")
         || name.starts_with(&format!("{db}.bak-v"))
         || name == ".DS_Store"
-        || name == crate::cli::where_::TEAM_TOML
-        || name == crate::cli::where_::TEAM_KEY
+        || name == crate::paths::TEAM_TOML
+        || name == crate::paths::TEAM_KEY
         || name == crate::team::TEAM_REPO
         || name == crate::sync::apply::SYNC_LOCK
 }
@@ -1544,11 +1526,11 @@ const ALL_MINE_GAP: &str = "Not covered: records that another of your devices ca
 
 /// The team step of `purge --all`; `Some` ends the command with that outcome.
 fn team_step(io: &mut Io<'_>, dir: &Path, step: TeamStep) -> anyhow::Result<Option<Outcome>> {
-    if step == TeamStep::None || team_member(dir).is_none() {
+    if step == TeamStep::None || crate::paths::team_member_id(dir).is_none() {
         return Ok(None);
     }
     if step == TeamStep::LocalOnly {
-        let member = team_member(dir).unwrap_or_default();
+        let member = crate::paths::team_member_id(dir).unwrap_or_default();
         let kept = open_db(dir).map_or(0, |c| own_shared(&c, &member).unwrap_or(0));
         writeln!(
             io.out,

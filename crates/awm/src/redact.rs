@@ -8,7 +8,8 @@
 //! is left unchanged.
 
 use regex::{Captures, Regex};
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Version of the pattern set. Bump it whenever a pattern is added or widened: the team
 /// pre-push check (plan-v3-team §4.5) re-redacts with the current patterns and reports
@@ -117,11 +118,29 @@ pub fn redact(text: &str, user_terms: &[String]) -> (String, u32) {
         })
         .into_owned();
     for term in user_terms.iter().filter(|t| !t.is_empty()) {
-        if let Ok(re) = Regex::new(&format!("(?i){}", regex::escape(term))) {
+        if let Some(re) = term_regex(term) {
             s = plain(&re, &s, "term", &mut n);
         }
     }
     (s, n)
+}
+
+/// The case-insensitive pattern of one user term, compiled once per process and shared by the
+/// hook path and every `scrub` caller. `None` when the term does not compile.
+fn term_regex(term: &str) -> Option<Arc<Regex>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<Regex>>>>> = OnceLock::new();
+    let mut cache = CACHE
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(hit) = cache.get(term) {
+        return hit.clone();
+    }
+    let re = Regex::new(&format!("(?i){}", regex::escape(term)))
+        .ok()
+        .map(Arc::new);
+    cache.insert(term.to_string(), re.clone());
+    re
 }
 
 /// IPv4 redaction that leaves dotted numbers inside longer version-like strings

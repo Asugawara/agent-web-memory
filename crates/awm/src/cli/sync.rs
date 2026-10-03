@@ -131,10 +131,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 #[cfg(feature = "sync")]
 fn project_values(projects: &[String]) -> Vec<String> {
     use crate::record::sha256_hex;
-    let hex = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit());
+    let hex64 = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit());
     let mut out = Vec::new();
     for p in projects {
-        if hex(p, 64) || hex(p, 32) {
+        if hex64(p) || crate::team::is_repo_key(p) {
             out.push(p.to_lowercase());
             continue;
         }

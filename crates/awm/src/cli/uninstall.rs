@@ -35,7 +35,7 @@ pub fn run_with(
     exe: Option<&Path>,
     home: Option<&Path>,
 ) -> anyhow::Result<Outcome> {
-    if io.data_dir.join(super::where_::TEAM_TOML).exists() {
+    if io.data_dir.join(crate::paths::TEAM_TOML).exists() {
         writeln!(io.out, "{TEAM_OFFER}")?;
         if !args.yes && io.terminal {
             write!(io.out, "{TEAM_QUESTION} [y/N] ")?;

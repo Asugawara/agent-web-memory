@@ -47,20 +47,17 @@ mod engine {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
-    use anyhow::{bail, Context, Result};
-    use awm_proto::keys::{DeviceKeys, KeyRing, Roster};
-    use awm_proto::wire::{ErrorCode, Id, InfoResponse, StatusResponse};
+    use anyhow::{bail, Result};
+    use awm_proto::keys::{KeyRing, Roster};
+    use awm_proto::wire::{ErrorCode, InfoResponse, StatusResponse};
     use rusqlite::Connection;
 
-    use crate::config::{AutoApprove, Config};
+    use crate::config::Config;
     use crate::db::{self, Role, VersionCheck};
     use crate::paths;
     use crate::sync::http::{self, CallError, Client};
     use crate::sync::state::{self, Identity};
-    use crate::sync::{pull, push, reseed, roster};
-
-    /// The name of the lock file in the data directory.
-    pub const LOCK_FILE: &str = "sync.lock";
+    use crate::sync::{apply, pull, push, reseed, roster};
 
     /// Where a run reads from: the data directory and the configuration.
     #[derive(Debug, Clone)]
@@ -92,9 +89,6 @@ mod engine {
         pub values: Vec<String>,
     }
 
-    /// The decision of `team.auto_approve` for one pending device (TM12's `team::auto_approve`).
-    pub type ApproveFn = fn(AutoApprove, bool) -> bool;
-
     /// Options of a run.
     #[derive(Debug, Clone, Default)]
     pub struct Opts {
@@ -113,9 +107,6 @@ mod engine {
         /// Tests: stop after the server acknowledged a push, before `pushed_at` is written.
         #[doc(hidden)]
         pub crash_after_ack: bool,
-        /// Tests: replaces `team::auto_approve` (a TM12 stub until `awm team` lands).
-        #[doc(hidden)]
-        pub approve: Option<ApproveFn>,
     }
 
     /// What a run did.
@@ -199,7 +190,6 @@ mod engine {
         pub(crate) conn: Connection,
         pub(crate) ident: Identity,
         pub(crate) ring: KeyRing,
-        pub(crate) device: DeviceKeys,
         pub(crate) client: Client,
         pub(crate) status: Option<StatusResponse>,
         pub(crate) roster: Roster,
@@ -208,32 +198,31 @@ mod engine {
         pub(crate) report: Report,
     }
 
-    impl Session<'_> {
+    impl<'a> Session<'a> {
+        /// A session over `ident` and `conn`: the key ring and the client derived from the
+        /// identity, no status and no roster yet.
+        pub(crate) fn new(
+            env: &'a Env,
+            opts: &'a Opts,
+            ident: Identity,
+            conn: Connection,
+        ) -> Result<Session<'a>> {
+            Ok(Session {
+                env,
+                opts,
+                ring: ident.ring()?,
+                client: ident.client()?,
+                conn,
+                ident,
+                status: None,
+                roster: Roster::default(),
+                keys_refreshed: false,
+                report: Report::default(),
+            })
+        }
+
         pub(crate) fn now_ms(&self) -> i64 {
             self.env.now_ms.unwrap_or_else(crate::hook::now_ms)
-        }
-    }
-
-    fn real_now(env: &Env) -> i64 {
-        env.now_ms.unwrap_or_else(crate::hook::now_ms)
-    }
-
-    /// Takes the lock; `None` when another process holds it.
-    fn take_lock(dir: &std::path::Path) -> Result<Option<std::fs::File>> {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.create(true).truncate(false).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let f = opts
-            .open(dir.join(LOCK_FILE))
-            .with_context(|| format!("cannot open {}", LOCK_FILE))?;
-        match f.try_lock() {
-            Ok(()) => Ok(Some(f)),
-            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-            Err(std::fs::TryLockError::Error(e)) => Err(e).context("cannot take sync.lock"),
         }
     }
 
@@ -255,7 +244,7 @@ mod engine {
     /// build's schema yields nothing and `run` reports the refusal.
     pub fn backfill_preview(env: &Env, backfill: &Backfill) -> Result<Vec<push::ProjectPreview>> {
         let db_path = env.data_dir.join(paths::DB_FILE);
-        if !state::configured(&env.data_dir) || !db_path.is_file() {
+        if !paths::team_configured(&env.data_dir) || !db_path.is_file() {
             return Ok(Vec::new());
         }
         let conn = db::open(&db_path, Role::Sync)?;
@@ -269,12 +258,12 @@ mod engine {
     /// Runs `awm sync` once.
     pub fn run(env: &Env, opts: &Opts) -> Result<Outcome> {
         let dir = env.data_dir.as_path();
-        if !state::configured(dir) && !opts.dry_run {
+        if !paths::team_configured(dir) && !opts.dry_run {
             bail!(
                 "this machine is not in a team (no team.toml and team.key in the data directory)"
             );
         }
-        let Some(_lock) = take_lock(dir)? else {
+        let Some(_lock) = apply::take_lock(dir)? else {
             return Ok(Outcome::Locked);
         };
         let db_path = dir.join(paths::DB_FILE);
@@ -282,20 +271,10 @@ mod engine {
             bail!("no database at {}. Run: awm init", db_path.display());
         }
         let conn = db::open(&db_path, Role::Sync)?;
-        match db::check_version(&conn)? {
-            VersionCheck::Current => {}
-            VersionCheck::Older { .. } => {
-                return Ok(Outcome::Refused(
-                    "database needs an upgrade. Run: awm doctor".into(),
-                ))
-            }
-            VersionCheck::Newer { db, .. } => {
-                return Ok(Outcome::Refused(format!(
-                    "database is from a newer awm ({db}). Upgrade awm."
-                )))
-            }
+        if let Some(why) = db::refusal(&db::check_version(&conn)?) {
+            return Ok(Outcome::Refused(why));
         }
-        let now = real_now(env);
+        let now = env.now_ms.unwrap_or_else(crate::hook::now_ms);
         if opts.honour_backoff {
             if let Some(until_ms) = state::backoff_active(&conn, now)? {
                 return Ok(Outcome::BackedOff { until_ms });
@@ -311,23 +290,7 @@ mod engine {
                 kept: scan.counts,
             });
         }
-        let ident = Identity::load(dir)?;
-        let ring = ident.ring()?;
-        let ca = ident.team.ca_file.as_deref().map(std::path::Path::new);
-        let client = Client::new(&ident.team.server_url, Some(&ident.key.device_token), ca)?;
-        let mut s = Session {
-            env,
-            opts,
-            device: ident.device_keys(),
-            conn,
-            ident,
-            ring,
-            client,
-            status: None,
-            roster: Roster::default(),
-            keys_refreshed: false,
-            report: Report::default(),
-        };
+        let mut s = Session::new(env, opts, Identity::load(dir)?, conn)?;
         let previous_ok = state::get_i64(&s.conn, state::LAST_OK)?;
         match session(&mut s) {
             Ok(()) => {
@@ -342,13 +305,13 @@ mod engine {
                 // and the `awm sync` waiting line would otherwise count a run that pushed (or
                 // pulled) nothing by design.
                 if !opts.pull_only && !opts.push_only {
-                    state::record_success(&s.conn, real_now(env))?;
+                    state::record_success(&s.conn, s.now_ms())?;
                 }
                 Ok(Outcome::Done(s.report))
             }
             Err(e) => {
                 let retry_after = e.downcast_ref::<CallError>().and_then(|c| c.retry_after());
-                let _ = state::record_failure(&s.conn, real_now(env), &e.to_string(), retry_after);
+                let _ = state::record_failure(&s.conn, s.now_ms(), &e.to_string(), retry_after);
                 Err(e)
             }
         }
@@ -462,8 +425,7 @@ mod engine {
             return Ok(());
         }
 
-        let decide: ApproveFn = s.opts.approve.unwrap_or(crate::team::auto_approve);
-        s.report.approvals += roster::approve_pending(s, &decide)?;
+        s.report.approvals += roster::approve_pending(s)?;
         s.report.rotated |= roster::rotate_if_needed(s)?;
 
         match push::run(s) {
@@ -480,13 +442,5 @@ mod engine {
             }
         }
         Ok(())
-    }
-
-    /// Own member and device ids of a session, for the modules.
-    impl Session<'_> {
-        #[allow(dead_code)]
-        pub(crate) fn ids(&self) -> (Id, Id) {
-            (self.ident.team.member_id, self.ident.team.device_id)
-        }
     }
 }

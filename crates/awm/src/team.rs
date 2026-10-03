@@ -33,6 +33,11 @@ pub fn auto_approve(policy: AutoApprove, is_own_device: bool) -> bool {
 /// The file holding `K_repo` (plan-v3-team §4.4).
 pub const TEAM_REPO: &str = "team.repo";
 
+/// True for a repository key as capture stores it: 32 hex digits.
+pub fn is_repo_key(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// A handle as typed: `@alf` or `alf`.
 pub fn bare_handle(h: &str) -> &str {
     h.trim().trim_start_matches('@')
@@ -312,7 +317,7 @@ mod client {
     /// `team.repo` is written. Wraps of later rotations are left to `awm sync`. No network call
     /// when the device already holds keys.
     pub fn finish_join(dir: &Path) -> Result<JoinState> {
-        if !state::configured(dir) {
+        if !crate::paths::team_configured(dir) {
             return Ok(JoinState::NotInTeam);
         }
         let team = TeamToml::load(dir)?;

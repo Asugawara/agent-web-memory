@@ -13,7 +13,7 @@ use awm_proto::crypto::{open_record, seal_record, RecordAd};
 use awm_proto::keys::{RosterEntry, ROSTER_TAG};
 use awm_proto::wire::{
     ErrorCode, FlagPlaintext, Id, PushDeleted, PushItem, PushRecord, PushRequest, StatsPlaintext,
-    Tag, B64,
+    StatusResponse, Tag, B64,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
@@ -21,10 +21,10 @@ use crate::config::Config;
 use crate::note::{Status, Tool};
 use crate::record::{Agent, Record, ResultRow};
 use crate::sync::eligible::{self, Eligibility, OptIn, Project, RuleKind, ShareRule, TeamPolicy};
-use crate::sync::http::CallError;
+use crate::sync::http::{CallError, Client};
 use crate::sync::payload::{self, Share, ShareCtx};
 use crate::sync::state::{self, Identity};
-use crate::sync::{roster, Backfill, Session};
+use crate::sync::{apply, roster, Backfill, Session};
 
 /// At most this many items in one request (sync-v1 §12).
 const BATCH_ITEMS: usize = 100;
@@ -38,18 +38,16 @@ const SCAN_LIMIT: i64 = 1_000;
 
 /// The head of this device's own stream `tag`: the highest idx queued (-1 when none).
 pub fn own_head(conn: &Connection, ident: &Identity, tag: &str) -> Result<i64> {
-    Ok(conn
-        .query_row(
-            "SELECT head_idx FROM sync_stream WHERE member_id = ?1 AND device_id = ?2 AND tag = ?3",
-            params![
-                ident.team.member_id.to_string(),
-                ident.team.device_id.to_string(),
-                tag
-            ],
-            |r| r.get(0),
-        )
-        .optional()?
-        .unwrap_or(-1))
+    state::stream_head(conn, ident.team.member_id, ident.team.device_id, tag)
+}
+
+/// The head the server reports for the stream `(member, device, tag)` (-1 when it lists none).
+pub fn head_of(status: &StatusResponse, member: Id, device: Id, tag: &str) -> i64 {
+    status
+        .streams
+        .iter()
+        .find(|h| h.member == member && h.device == device && h.tag.as_str() == tag)
+        .map_or(-1, |h| h.head)
 }
 
 /// The AD of an item of this device's own stream.
@@ -61,15 +59,15 @@ pub fn own_ad(
     id: Id,
     epoch: u32,
 ) -> RecordAd {
-    RecordAd {
-        org: ring.org(),
-        member: *ident.team.member_id.as_uuid(),
-        device: *ident.team.device_id.as_uuid(),
-        tag: tag.to_string(),
+    RecordAd::new(
+        ring.org(),
+        *ident.team.member_id.as_uuid(),
+        *ident.team.device_id.as_uuid(),
+        tag,
         idx,
-        record_id: *id.as_uuid(),
+        *id.as_uuid(),
         epoch,
-    }
+    )
 }
 
 fn set_head(tx: &Connection, ident: &Identity, tag: &str, idx: u64) -> Result<()> {
@@ -84,6 +82,41 @@ fn set_head(tx: &Connection, ident: &Identity, tag: &str, idx: u64) -> Result<()
         ],
     )?;
     Ok(())
+}
+
+/// A sealed item of this device's own stream, as `sync_own` stores it.
+struct OwnItem<'a> {
+    tag: &'a str,
+    idx: u64,
+    id: Id,
+    epoch: u32,
+    blob: &'a [u8],
+}
+
+/// Stores a sealed item: its `sync_own` row, the outbox row of `kind`, and the stream head. The
+/// caller's transaction holds all three.
+fn insert_own(
+    tx: &Connection,
+    ident: &Identity,
+    item: &OwnItem<'_>,
+    kind: &str,
+    now_ms: i64,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO sync_own (tag, idx, record_id, epoch, blob, deleted) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+        params![
+            item.tag,
+            item.idx as i64,
+            item.id.to_string(),
+            item.epoch,
+            item.blob
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO sync_outbox (kind, ref, created_at) VALUES (?1, ?2, ?3)",
+        params![kind, outbox_ref(item.tag, item.idx), now_ms],
+    )?;
+    set_head(tx, ident, item.tag, item.idx)
 }
 
 /// Queues one item of another tag (`flag`, `stats`, `policy`, `roster`): assigns the next idx,
@@ -108,14 +141,14 @@ pub fn queue_item(
         plaintext,
     )
     .map_err(|e| anyhow!("cannot seal a {tag} record: {e}"))?;
-    tx.execute(
-        "INSERT INTO sync_own (tag, idx, record_id, epoch, blob, deleted) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
-        params![tag, idx as i64, id.to_string(), key.epoch(), blob],
-    )?;
-    tx.execute(
-        "INSERT INTO sync_outbox (kind, ref, created_at) VALUES (?1, ?2, ?3)",
-        params![kind, format!("{tag}:{idx}"), now_ms],
-    )?;
+    let item = OwnItem {
+        tag,
+        idx,
+        id,
+        epoch: key.epoch(),
+        blob: &blob,
+    };
+    insert_own(&tx, ident, &item, kind, now_ms)?;
     if tag == ROSTER_TAG {
         roster::store_record(
             &tx,
@@ -127,7 +160,6 @@ pub fn queue_item(
             &blob,
         )?;
     }
-    set_head(&tx, ident, tag, idx)?;
     tx.commit()?;
     Ok((idx, id))
 }
@@ -205,71 +237,65 @@ pub struct Scan {
     pub counts: BTreeMap<String, u64>,
 }
 
-fn tool_of(s: &str) -> Option<Tool> {
-    match s {
-        "WebSearch" => Some(Tool::WebSearch),
-        "WebFetch" => Some(Tool::WebFetch),
-        _ => None,
-    }
-}
-
-fn status_of(s: &str) -> Option<Status> {
-    match s {
-        "ok" => Some(Status::Ok),
-        "dead_end" => Some(Status::DeadEnd),
-        "refusal" => Some(Status::Refusal),
-        "placeholder" => Some(Status::Placeholder),
-        _ => None,
-    }
-}
-
 /// A row of `event` as a [`Record`], with its results, and its `repo_key`.
 pub fn load_record(conn: &Connection, id: i64) -> Result<Option<(Record, Option<String>)>> {
     let row = conn
-        .query_row(
+        .prepare_cached(
             "SELECT tool_use_id, tool, session_id, agent_id, agent_type, cwd_hash, created_at, \
              query, url, url_norm, fetch_prompt, http_code, bytes, duration_ms, status, summary, \
              match_text, source, quarantined, quarantine_reason, agent, repo_key \
              FROM event WHERE id = ?1",
-            [id],
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, Option<String>>(3)?,
-                    r.get::<_, Option<String>>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, i64>(6)?,
-                    r.get::<_, Option<String>>(7)?,
-                    r.get::<_, Option<String>>(8)?,
-                    r.get::<_, Option<String>>(9)?,
-                    r.get::<_, Option<String>>(10)?,
-                    r.get::<_, Option<i64>>(11)?,
-                    r.get::<_, Option<i64>>(12)?,
-                    r.get::<_, Option<i64>>(13)?,
-                    r.get::<_, String>(14)?,
-                    r.get::<_, Option<String>>(15)?,
-                    r.get::<_, String>(16)?,
-                    r.get::<_, String>(17)?,
-                    r.get::<_, i64>(18)?,
-                    r.get::<_, Option<String>>(19)?,
-                    r.get::<_, String>(20)?,
-                    r.get::<_, Option<String>>(21)?,
-                ))
-            },
-        )
-        .optional()?;
-    let Some(t) = row else {
+        )?
+        .query_row([id], |r| {
+            let (Some(tool), Some(status)) = (
+                Tool::from_db_str(&r.get::<_, String>("tool")?),
+                Status::from_db_str(&r.get::<_, String>("status")?),
+            ) else {
+                return Ok(None);
+            };
+            let quarantined: i64 = r.get("quarantined")?;
+            let quarantine_reason = r
+                .get::<_, Option<String>>("quarantine_reason")?
+                .or_else(|| (quarantined != 0).then(|| "quarantined".to_string()));
+            let agent: String = r.get("agent")?;
+            let rec = Record {
+                tool_use_id: r.get("tool_use_id")?,
+                tool,
+                session_id: r.get("session_id")?,
+                agent_id: r.get("agent_id")?,
+                agent_type: r.get("agent_type")?,
+                cwd_hash: r.get("cwd_hash")?,
+                created_at: r.get("created_at")?,
+                query: r.get("query")?,
+                url: r.get("url")?,
+                url_norm: r.get("url_norm")?,
+                fetch_prompt: r.get("fetch_prompt")?,
+                http_code: r.get("http_code")?,
+                bytes: r.get("bytes")?,
+                duration_ms: r.get("duration_ms")?,
+                status,
+                summary: r.get("summary")?,
+                match_text: r.get("match_text")?,
+                source: r.get("source")?,
+                agent: if agent == "codex" {
+                    Agent::Codex
+                } else {
+                    Agent::Claude
+                },
+                results: Vec::new(),
+                quarantine_reason,
+            };
+            Ok(Some((rec, r.get::<_, Option<String>>("repo_key")?)))
+        })
+        .optional()?
+        .flatten();
+    let Some((mut rec, repo_key)) = row else {
         return Ok(None);
     };
-    let (Some(tool), Some(status)) = (tool_of(&t.1), status_of(&t.14)) else {
-        return Ok(None);
-    };
-    let mut st = conn.prepare(
+    let mut st = conn.prepare_cached(
         "SELECT rank, url, url_norm, title FROM result WHERE event_id = ?1 ORDER BY rank",
     )?;
-    let results = st
+    rec.results = st
         .query_map([id], |r| {
             Ok(ResultRow {
                 rank: r.get(0)?,
@@ -279,37 +305,7 @@ pub fn load_record(conn: &Connection, id: i64) -> Result<Option<(Record, Option<
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    let quarantine_reason =
-        t.19.clone()
-            .or_else(|| (t.18 != 0).then(|| "quarantined".to_string()));
-    let rec = Record {
-        tool_use_id: t.0,
-        tool,
-        session_id: t.2,
-        agent_id: t.3,
-        agent_type: t.4,
-        cwd_hash: t.5,
-        created_at: t.6,
-        query: t.7,
-        url: t.8,
-        url_norm: t.9,
-        fetch_prompt: t.10,
-        http_code: t.11,
-        bytes: t.12,
-        duration_ms: t.13,
-        status,
-        summary: t.15,
-        match_text: t.16,
-        source: t.17,
-        agent: if t.20 == "codex" {
-            Agent::Codex
-        } else {
-            Agent::Claude
-        },
-        results,
-        quarantine_reason,
-    };
-    Ok(Some((rec, t.21)))
+    Ok(Some((rec, repo_key)))
 }
 
 /// The local opt-in state (`share_rule`, `project`, `sync_state.share_all_since`).
@@ -378,6 +374,10 @@ pub fn scan(
     let share_all = cfg.team.share_all_projects && opt_in.share_all_since.is_some();
     let all_since = opt_in.share_all_since.unwrap_or(i64::MAX);
     let since = backfill.and_then(|b| b.since_ms).unwrap_or(0);
+    // Nothing can match: no rule, no share-all and no backfill value (every row stays local).
+    if opt_in.rules.is_empty() && !share_all && values.is_empty() {
+        return Ok(Scan::default());
+    }
     let policy = load_policy(conn, opt_in)?;
     let bf_json = serde_json::to_string(&values)?;
     let mut st = conn.prepare(
@@ -509,16 +509,14 @@ pub fn queue_records(s: &mut Session<'_>, scan: &mut Scan) -> Result<usize> {
             if n == 0 {
                 continue;
             }
-            tx.execute(
-                "INSERT INTO sync_own (tag, idx, record_id, epoch, blob, deleted) \
-                 VALUES ('rec', ?1, ?2, ?3, ?4, 0)",
-                params![idx as i64, id.to_string(), key.epoch(), blob],
-            )?;
-            tx.execute(
-                "INSERT INTO sync_outbox (kind, ref, created_at) VALUES ('record', ?1, ?2)",
-                params![format!("rec:{idx}"), now],
-            )?;
-            set_head(&tx, &s.ident, "rec", idx)?;
+            let item = OwnItem {
+                tag: "rec",
+                idx,
+                id,
+                epoch: key.epoch(),
+                blob: &blob,
+            };
+            insert_own(&tx, &s.ident, &item, "record", now)?;
             idx += 1;
             queued += 1;
         }
@@ -611,7 +609,11 @@ pub fn refresh_keys(s: &mut Session<'_>) -> Result<bool> {
         };
         // A wrap that does not verify (a server-made one) is skipped, never accepted.
         if s.ring
-            .accept_rotation(*s.ident.team.device_id.as_uuid(), &s.device, &wrap)
+            .accept_rotation(
+                *s.ident.team.device_id.as_uuid(),
+                &s.ident.device_keys(),
+                &wrap,
+            )
             .is_err()
         {
             state::bump(&s.conn, "dropped.bad_wrap", 1)?;
@@ -626,6 +628,31 @@ pub fn refresh_keys(s: &mut Session<'_>) -> Result<bool> {
     Ok(advanced)
 }
 
+impl Session<'_> {
+    /// Opens the stored item `(tag, idx)` of this device's own stream, sealed under `epoch`.
+    fn open_own(&self, tag: &str, idx: u64, id: Id, epoch: u32, blob: &[u8]) -> Result<Vec<u8>> {
+        open_record(
+            &self.ring,
+            &own_ad(&self.ident, &self.ring, tag, idx, id, epoch),
+            blob,
+        )
+        .map_err(|e| anyhow!("cannot re-seal a stored item: {e}"))
+    }
+
+    /// Seals `plain` as the item `(tag, idx)` with record id `id` under the current epoch;
+    /// returns that epoch and the blob.
+    fn seal_own(&self, tag: &str, idx: u64, id: Id, plain: &[u8]) -> Result<(u32, Vec<u8>)> {
+        let key = self.ring.current();
+        let blob = seal_record(
+            key,
+            &own_ad(&self.ident, &self.ring, tag, idx, id, key.epoch()),
+            plain,
+        )
+        .map_err(|e| anyhow!("cannot re-seal a stored item: {e}"))?;
+        Ok((key.epoch(), blob))
+    }
+}
+
 /// Re-seals the stored item (tag, idx) under the current epoch with the same idx and id.
 pub(crate) fn reseal(s: &mut Session<'_>, tag: &str, idx: u64) -> Result<()> {
     let Some(p) = load_pending(&s.conn, tag, idx)? else {
@@ -637,28 +664,17 @@ pub(crate) fn reseal(s: &mut Session<'_>, tag: &str, idx: u64) -> Result<()> {
     if epoch == s.ring.current_epoch() {
         return Ok(());
     }
-    let plain = open_record(
-        &s.ring,
-        &own_ad(&s.ident, &s.ring, tag, idx, p.id, epoch),
-        &blob,
-    )
-    .map_err(|e| anyhow!("cannot re-seal a stored item: {e}"))?;
-    let key = s.ring.current();
-    let fresh = seal_record(
-        key,
-        &own_ad(&s.ident, &s.ring, tag, idx, p.id, key.epoch()),
-        &plain,
-    )
-    .map_err(|e| anyhow!("cannot re-seal a stored item: {e}"))?;
+    let plain = s.open_own(tag, idx, p.id, epoch, &blob)?;
+    let (new_epoch, fresh) = s.seal_own(tag, idx, p.id, &plain)?;
     s.conn.execute(
         "UPDATE sync_own SET epoch = ?1, blob = ?2 WHERE tag = ?3 AND idx = ?4",
-        params![key.epoch(), fresh, tag, idx as i64],
+        params![new_epoch, fresh, tag, idx as i64],
     )?;
     if tag == ROSTER_TAG {
         s.conn.execute(
             "UPDATE roster_record SET epoch = ?1, blob = ?2 WHERE member_id = ?3 AND device_id = ?4 AND idx = ?5",
             params![
-                key.epoch(),
+                new_epoch,
                 fresh,
                 s.ident.team.member_id.to_string(),
                 s.ident.team.device_id.to_string(),
@@ -676,22 +692,11 @@ fn renew_id(s: &mut Session<'_>, tag: &str, idx: u64) -> Result<()> {
     };
     let new = Id::new_v4();
     if let (Some(blob), Some(epoch)) = (p.blob, p.epoch) {
-        let plain = open_record(
-            &s.ring,
-            &own_ad(&s.ident, &s.ring, tag, idx, p.id, epoch),
-            &blob,
-        )
-        .map_err(|e| anyhow!("cannot re-seal a stored item: {e}"))?;
-        let key = s.ring.current();
-        let fresh = seal_record(
-            key,
-            &own_ad(&s.ident, &s.ring, tag, idx, new, key.epoch()),
-            &plain,
-        )
-        .map_err(|e| anyhow!("cannot re-seal a stored item: {e}"))?;
+        let plain = s.open_own(tag, idx, p.id, epoch, &blob)?;
+        let (new_epoch, fresh) = s.seal_own(tag, idx, new, &plain)?;
         s.conn.execute(
             "UPDATE sync_own SET record_id = ?1, epoch = ?2, blob = ?3 WHERE tag = ?4 AND idx = ?5",
-            params![new.to_string(), key.epoch(), fresh, tag, idx as i64],
+            params![new.to_string(), new_epoch, fresh, tag, idx as i64],
         )?;
         if tag == "rec" {
             s.conn.execute(
@@ -707,19 +712,12 @@ fn renew_id(s: &mut Session<'_>, tag: &str, idx: u64) -> Result<()> {
 /// and the item becomes a marker at the same idx so the stream stays contiguous (§9.3).
 pub fn mark_deleted(conn: &Connection, id: Id, now_ms: i64) -> Result<()> {
     let id = id.to_string();
-    conn.execute(
-        "UPDATE sync_own SET deleted = 1, blob = NULL, epoch = NULL WHERE record_id = ?1",
-        [&id],
-    )?;
+    apply::mark_own_deleted(conn, &id)?;
     conn.execute(
         "DELETE FROM event WHERE sync_id = ?1 AND origin = 'local'",
         [&id],
     )?;
-    conn.execute(
-        "INSERT OR IGNORE INTO tombstone (kind, value, created_at) VALUES ('tool_use_id', ?1, ?2)",
-        params![format!("team:{id}"), now_ms],
-    )?;
-    Ok(())
+    apply::tombstone_team(conn, &id, now_ms)
 }
 
 #[derive(serde::Deserialize)]
@@ -764,10 +762,7 @@ fn finish(s: &mut Session<'_>, keys: &[(String, u64)]) -> Result<()> {
         .conn
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
     for (tag, idx) in keys {
-        tx.execute(
-            "DELETE FROM sync_outbox WHERE ref = ?1",
-            [format!("{tag}:{idx}")],
-        )?;
+        drop_outbox_ref(&tx, tag, idx)?;
         // A refused item kept its sealed blob while its marker was in flight (RVT3v V2).
         tx.execute(
             "UPDATE sync_own SET blob = NULL, epoch = NULL \
@@ -854,10 +849,7 @@ pub fn send_keys(
         if take == 0 {
             // A queued key without a sync_own row: nothing to send, drop the outbox row.
             let (tag, idx) = &rest[0];
-            s.conn.execute(
-                "DELETE FROM sync_outbox WHERE ref = ?1",
-                [format!("{tag}:{idx}")],
-            )?;
+            drop_outbox_ref(&s.conn, tag, idx)?;
             rest = &rest[1..];
             continue;
         }
@@ -916,10 +908,7 @@ pub fn send_keys(
                          WHERE tag = ?1 AND idx = ?2 AND deleted = 1",
                         params![tag, *idx as i64],
                     )?;
-                    s.conn.execute(
-                        "DELETE FROM sync_outbox WHERE ref = ?1",
-                        [format!("{tag}:{idx}")],
-                    )?;
+                    drop_outbox_ref(&s.conn, tag, idx)?;
                     break;
                 }
                 Err(e) if tries < 4 => match (e.status(), e.code()) {
@@ -951,15 +940,12 @@ pub fn send_keys(
                         let (tag, idx) =
                             batch.get(item).cloned().unwrap_or_else(|| batch[0].clone());
                         let status = s.client.status()?;
-                        let head = status
-                            .streams
-                            .iter()
-                            .find(|h| {
-                                h.member == s.ident.team.member_id
-                                    && h.device == s.ident.team.device_id
-                                    && h.tag.as_str() == tag
-                            })
-                            .map_or(-1, |h| h.head);
+                        let head = head_of(
+                            &status,
+                            s.ident.team.member_id,
+                            s.ident.team.device_id,
+                            &tag,
+                        );
                         s.status = Some(status);
                         if head < idx as i64 - 1 {
                             return Ok(Err(SendStop::NeedsReseed(tag)));
@@ -1066,7 +1052,7 @@ fn record_attempt(conn: &Connection, keys: &[(String, u64)], message: &str) -> R
     for (tag, idx) in keys {
         conn.execute(
             "UPDATE sync_outbox SET attempts = attempts + 1, last_error = ?2 WHERE ref = ?1",
-            params![format!("{tag}:{idx}"), one],
+            params![outbox_ref(tag, idx), one],
         )?;
     }
     Ok(())
@@ -1075,78 +1061,91 @@ fn record_attempt(conn: &Connection, keys: &[(String, u64)], message: &str) -> R
 /// Sends the outbox rows of kind `delete` (§4.6 step 4): a row's `ref` is a record id or the
 /// JSON of a `DeleteRequest`. Returns the number of requests that went through. A refusal
 /// (403, 404) is final and drops the row; anything else keeps it.
-pub fn deletions(s: &mut Session<'_>) -> Result<usize> {
-    let mut st = s
-        .conn
-        .prepare("SELECT id, ref FROM sync_outbox WHERE kind = 'delete' ORDER BY id")?;
+pub fn deletions(conn: &Connection, client: &Client) -> Result<usize> {
+    let mut st =
+        conn.prepare("SELECT id, ref FROM sync_outbox WHERE kind = 'delete' ORDER BY id")?;
     let rows: Vec<(i64, String)> = st
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
     drop(st);
     let mut done = 0;
     let mut ids: Vec<(i64, Id)> = Vec::new();
-    let flush_ids = |s: &mut Session<'_>, ids: &mut Vec<(i64, Id)>| -> Result<usize> {
+    let flush_ids = |ids: &mut Vec<(i64, Id)>| -> Result<usize> {
         if ids.is_empty() {
             return Ok(0);
         }
         let req = awm_proto::wire::DeleteRequest::Ids(ids.iter().map(|(_, id)| *id).collect());
-        let outcome = s.client.delete(&req);
-        let finished = match &outcome {
-            Ok(_) => true,
-            Err(e) => matches!(e.status(), Some(400 | 403 | 404)),
-        };
-        if finished {
-            for (row, _) in ids.iter() {
-                s.conn
-                    .execute("DELETE FROM sync_outbox WHERE id = ?1", [row])?;
-            }
-            if outcome.is_err() {
-                state::bump(&s.conn, "dropped.delete_refused", ids.len() as i64)?;
-            }
-        }
+        let rows: Vec<i64> = ids.iter().map(|(row, _)| *row).collect();
         ids.clear();
-        match outcome {
-            Ok(_) => Ok(1),
-            Err(e) if finished => {
-                let _ = e;
-                Ok(0)
-            }
-            Err(e) => Err(e.into()),
-        }
+        send_delete(conn, client, &req, &rows)
     };
     for (row, r) in rows {
         if r.trim_start().starts_with('{') {
-            done += flush_ids(s, &mut ids)?;
+            done += flush_ids(&mut ids)?;
             let Ok(req) = serde_json::from_str::<awm_proto::wire::DeleteRequest>(&r) else {
-                s.conn
-                    .execute("DELETE FROM sync_outbox WHERE id = ?1", [row])?;
+                drop_outbox_rows(conn, &[row])?;
                 continue;
             };
-            match s.client.delete(&req) {
-                Ok(_) => {
-                    s.conn
-                        .execute("DELETE FROM sync_outbox WHERE id = ?1", [row])?;
-                    done += 1;
-                }
-                Err(e) if matches!(e.status(), Some(400 | 403 | 404)) => {
-                    s.conn
-                        .execute("DELETE FROM sync_outbox WHERE id = ?1", [row])?;
-                    state::bump(&s.conn, "dropped.delete_refused", 1)?;
-                }
-                Err(e) => return Err(e.into()),
-            }
+            done += send_delete(conn, client, &req, &[row])?;
         } else if let Ok(id) = Id::parse(r.trim()) {
             ids.push((row, id));
             if ids.len() >= awm_proto::wire::limits::DELETE_IDS {
-                done += flush_ids(s, &mut ids)?;
+                done += flush_ids(&mut ids)?;
             }
         } else {
-            s.conn
-                .execute("DELETE FROM sync_outbox WHERE id = ?1", [row])?;
+            drop_outbox_rows(conn, &[row])?;
         }
     }
-    done += flush_ids(s, &mut ids)?;
+    done += flush_ids(&mut ids)?;
     Ok(done)
+}
+
+/// Sends one delete request for the outbox `rows`. A success, or a refusal that is final (400,
+/// 403, 404), drops the rows (a refusal also counts `dropped.delete_refused` per row); any
+/// other failure is returned and keeps them. `Ok(1)` when the request went through.
+fn send_delete(
+    conn: &Connection,
+    client: &Client,
+    req: &awm_proto::wire::DeleteRequest,
+    rows: &[i64],
+) -> Result<usize> {
+    let outcome = client.delete(req);
+    let finished = match &outcome {
+        Ok(_) => true,
+        Err(e) => matches!(e.status(), Some(400 | 403 | 404)),
+    };
+    if finished {
+        drop_outbox_rows(conn, rows)?;
+        if outcome.is_err() {
+            state::bump(conn, "dropped.delete_refused", rows.len() as i64)?;
+        }
+    }
+    match outcome {
+        Ok(_) => Ok(1),
+        Err(_) if finished => Ok(0),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The outbox `ref` of the item `idx` of stream `tag`.
+fn outbox_ref(tag: &str, idx: impl std::fmt::Display) -> String {
+    format!("{tag}:{idx}")
+}
+
+/// Drops the outbox row of the item `idx` of stream `tag`.
+fn drop_outbox_ref(conn: &Connection, tag: &str, idx: impl std::fmt::Display) -> Result<()> {
+    conn.execute(
+        "DELETE FROM sync_outbox WHERE ref = ?1",
+        [outbox_ref(tag, idx)],
+    )?;
+    Ok(())
+}
+
+fn drop_outbox_rows(conn: &Connection, rows: &[i64]) -> Result<()> {
+    for row in rows {
+        conn.execute("DELETE FROM sync_outbox WHERE id = ?1", [row])?;
+    }
+    Ok(())
 }
 
 /// Whether the pushes wait for `team.push_delay_s` (plan-v3-team §4.7): the oldest unpushed
@@ -1178,7 +1177,7 @@ pub fn run(s: &mut Session<'_>) -> Result<usize> {
     state::set_skipped(&s.conn, &scan.counts)?;
     s.report.skipped = scan.counts.clone();
     let mut sent = flush(s)?;
-    sent += deletions(s)?;
+    sent += deletions(&s.conn, &s.client)?;
     s.report.pushed += sent;
     Ok(sent)
 }

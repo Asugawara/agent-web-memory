@@ -105,7 +105,7 @@ pub fn run_with_origin(
     input: &mut dyn BufRead,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
-    let own = super::stats::own_member_id();
+    let own = crate::matching::own_member_id();
     let items = unlabelled(conn, limit, origin, own.as_deref())?;
     if items.is_empty() {
         writeln!(out, "Nothing to review.")?;
