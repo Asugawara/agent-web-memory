@@ -7,8 +7,9 @@
 //! end with an HTTP code (202, 3xx, 4xx except 429: such a URL never succeeded on a repeat), not
 //! quarantined, not tombstoned; a teammate's row never counts. The newest usable row decides the
 //! kind: a coded dead end says the URL returned that code. Otherwise the reason carries one earlier
-//! answer, the one whose stored prompt is closest to the call's own (token Jaccard, ties and
-//! unscorable prompts keep the newest); the retry passes (once per session, agent and URL).
+//! answer, the one FTS5 BM25 ranks best for the call's own prompt among the URL's ok rows (ties,
+//! a missing prompt, a prompt without tokens and rows without an FTS row keep the newest); the
+//! retry passes (once per session, agent and URL).
 //!
 //! `WebSearch` (Claude Code) and `webrun` (Codex) go to [`super::pre_search`].
 
@@ -16,7 +17,6 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use super::{append_canary, canary_line, deny_json, Env, HookArgs, Injection, Verdict};
 use crate::config::ShortCircuitMode;
-use crate::matching::overlap;
 use crate::matching::{self, Hit};
 use crate::note::{Channel, Relation, Status};
 use crate::record::redact_url;
@@ -149,7 +149,6 @@ struct Candidate {
     id: i64,
     own: bool,
     ok: bool,
-    asked: Option<String>,
 }
 
 /// The usable fetches of `norm` within the window, by any agent of the owner (the same agent, a
@@ -157,13 +156,13 @@ struct Candidate {
 /// [`CANDIDATE_LIMIT`]. Usable: status ok with code 200, or a dead end with an HTTP code that is
 /// 202, 3xx, or 4xx but not 429 (such a URL rarely succeeds on a repeat); 429,
 /// 5xx, a dead end without a code and a refusal never count. The newest row decides the kind of
-/// deny; for a cached answer the ok row whose stored prompt is closest to the call's prompt is the
-/// one handed over (the newest on a tie or when no prompt can be scored).
+/// deny; for a cached answer the ok row BM25 ranks best for the call's prompt ([`best_match`]) is
+/// the one handed over (the newest on a tie or when nothing can be ranked).
 fn find_cached(env: &Env, conn: &Connection, norm: &str) -> anyhow::Result<Option<Cached>> {
     let window_ms = i64::from(env.config.short_circuit.window_days) * 86_400_000;
     let mut st = conn.prepare_cached(
         "SELECT e.id, (e.origin = 'local' AND e.session_id = ?2 AND e.agent_id IS ?3), \
-                e.status = 'ok', e.fetch_prompt FROM event e \
+                e.status = 'ok' FROM event e \
          WHERE e.tool = 'WebFetch' AND e.url_norm = ?1 \
            AND ((e.status = 'ok' AND e.http_code = 200) \
              OR (e.status = 'dead_end' AND (e.http_code = 202 \
@@ -190,7 +189,6 @@ fn find_cached(env: &Env, conn: &Connection, norm: &str) -> anyhow::Result<Optio
                 id: r.get(0)?,
                 own: r.get(1)?,
                 ok: r.get(2)?,
-                asked: r.get(3)?,
             })
         },
     )?;
@@ -214,9 +212,8 @@ fn find_cached(env: &Env, conn: &Connection, norm: &str) -> anyhow::Result<Optio
         }));
     }
     let oks: Vec<&Candidate> = all.iter().filter(|c| c.ok).collect();
-    let (best, overlap) = if oks.len() > 1 {
-        let current = env.input.tool_input_str("prompt");
-        overlap::closest_prompt(current, oks.iter().map(|c| c.asked.as_deref()))
+    let (best, score) = if oks.len() > 1 {
+        best_match(conn, env.input.tool_input_str("prompt"), &oks)?
     } else {
         (0, 1.0)
     };
@@ -225,12 +222,57 @@ fn find_cached(env: &Env, conn: &Connection, norm: &str) -> anyhow::Result<Optio
     Ok(Some(Cached {
         hit: Hit {
             event_id: chosen.id,
-            score: overlap,
+            score,
             seen: 1,
         },
         own: chosen.own,
         candidates: oks.len(),
     }))
+}
+
+/// Index in `oks` (newest first) of the candidate whose FTS document (fetch prompt, URL, start of
+/// the answer) BM25 ranks best for `prompt`, with its score (negated bm25, as the query channel
+/// stores it). Idf comes from the whole index. `+rowid` keeps SQLite from pushing the rowid list into
+/// FTS5, which would re-run the MATCH once per id (19 ms for 20 ids against 2 ms on a
+/// test copy); bm25 is then computed only for the rows that pass the filter. The
+/// first, newest candidate and a score of 0.0 when nothing can be ranked: no prompt, no token in
+/// it, or none of the candidates matched (a missing FTS row scores nothing).
+fn best_match(
+    conn: &Connection,
+    prompt: Option<&str>,
+    oks: &[&Candidate],
+) -> anyhow::Result<(usize, f64)> {
+    // A prompt of one-character tokens only ("a", "1") carries no signal and would match noise.
+    let usable = prompt.filter(|p| {
+        crate::normalize::words(p)
+            .iter()
+            .any(|w| w.chars().count() >= 2)
+    });
+    let Some(expr) = usable.and_then(matching::fts::match_expr) else {
+        return Ok((0, 0.0));
+    };
+    let marks = vec!["?"; oks.len()].join(",");
+    let mut st = conn.prepare_cached(&format!(
+        "SELECT rowid, bm25(event_fts) FROM event_fts WHERE event_fts MATCH ?1 AND +rowid IN ({marks})"
+    ))?;
+    let args = std::iter::once(rusqlite::types::Value::Text(expr))
+        .chain(oks.iter().map(|c| rusqlite::types::Value::Integer(c.id)));
+    let mut ranked: Vec<(i64, f64)> = Vec::new();
+    for row in st.query_map(rusqlite::params_from_iter(args), |r| {
+        Ok((r.get(0)?, r.get(1)?))
+    })? {
+        ranked.push(row?);
+    }
+    // Lowest bm25 is the most relevant; a strict comparison keeps the newest on a tie.
+    let mut best: Option<(usize, f64)> = None;
+    for (i, c) in oks.iter().enumerate() {
+        if let Some(&(_, b)) = ranked.iter().find(|(id, _)| *id == c.id) {
+            if best.is_none_or(|(_, lowest)| b < lowest) {
+                best = Some((i, b));
+            }
+        }
+    }
+    Ok(best.map_or((0, 0.0), |(i, b)| (i, -b)))
 }
 
 /// This (session, agent) was already denied this URL.
