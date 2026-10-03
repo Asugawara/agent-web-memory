@@ -78,7 +78,7 @@ impl Home {
         .unwrap();
         // A tiny corpus never reaches the shipped default cutoff.
         conn.execute(
-            "INSERT INTO meta (key, value) VALUES ('cutoff.query', '0'), ('cutoff.prompt', '0')",
+            "INSERT INTO meta (key, value) VALUES ('cutoff.query', '0'), ('cutoff.query_deny', '0'), ('cutoff.prompt', '0')",
             [],
         )
         .unwrap();
@@ -1597,13 +1597,104 @@ fn a_search_below_the_cutoff_is_not_denied() {
     seed_repeat(&home);
     home.conn()
         .execute(
-            "UPDATE meta SET value = '1000' WHERE key = 'cutoff.query'",
+            "UPDATE meta SET value = '1000' WHERE key = 'cutoff.query_deny'",
             [],
         )
         .unwrap();
     assert_silent(&home.hook("pre-fetch", &main_search("toolu_1")));
     assert_eq!(home.count("SELECT COUNT(*) FROM injection"), 0);
     assert_eq!(run_outcome(&home), "no_match");
+}
+
+/// The BM25 score at which `QD_QUERY` matches the seeded repeat (the corpus is the same in every home).
+fn repeat_score() -> f64 {
+    let home = Home::new();
+    on(&home);
+    seed_repeat(&home);
+    deny_reason(&home.hook("pre-fetch", &main_search("toolu_probe")));
+    let s: f64 = home
+        .conn()
+        .query_row("SELECT score FROM injection_item", [], |r| r.get(0))
+        .unwrap();
+    assert!(s > 0.0, "{s}");
+    s
+}
+
+fn set_cutoffs(home: &Home, query: f64, query_deny: f64) {
+    home.conn()
+        .execute(
+            "UPDATE meta SET value = ?1 WHERE key = 'cutoff.query'",
+            [query.to_string()],
+        )
+        .unwrap();
+    home.conn()
+        .execute(
+            "UPDATE meta SET value = ?1 WHERE key = 'cutoff.query_deny'",
+            [query_deny.to_string()],
+        )
+        .unwrap();
+}
+
+fn repeated_search_result() -> Value {
+    json!({
+        "session_id": main_search("x")["session_id"], "cwd": "/home/user/dev",
+        "hook_event_name": "PostToolUse", "tool_name": "WebSearch", "tool_use_id": "toolu_1",
+        "tool_input": {"query": QD_QUERY},
+        "tool_response": {"query": QD_QUERY, "results": ["Fresh results."]}
+    })
+}
+
+#[test]
+fn a_match_between_the_note_and_the_deny_cutoff_is_not_denied_but_is_shown_as_a_note() {
+    let s = repeat_score();
+    let home = Home::new();
+    on(&home);
+    seed_repeat(&home);
+    set_cutoffs(&home, s / 2.0, s + 1.0);
+    assert_silent(&home.hook("pre-fetch", &main_search("toolu_1")));
+    assert_eq!(run_outcome(&home), "no_match");
+    assert_eq!(home.count("SELECT COUNT(*) FROM injection"), 0);
+    let out = home.hook("post-tool", &repeated_search_result());
+    assert!(out.context().starts_with("<awm-notes"), "{}", out.stdout);
+    assert_eq!(
+        home.count("SELECT COUNT(*) FROM injection WHERE hook = 'PostToolUse'"),
+        1
+    );
+}
+
+#[test]
+fn a_match_above_the_deny_cutoff_is_denied() {
+    let s = repeat_score();
+    let home = Home::new();
+    on(&home);
+    seed_repeat(&home);
+    set_cutoffs(&home, s / 2.0, s / 2.0);
+    deny_reason(&home.hook("pre-fetch", &main_search("toolu_1")));
+    assert_eq!(run_outcome(&home), "denied");
+}
+
+#[test]
+fn query_min_score_overrides_the_calibrated_deny_cutoff_both_ways() {
+    let s = repeat_score();
+    // Calibrated cutoff too high to deny, the override lets the match through to a deny.
+    let home = Home::new();
+    seed_repeat(&home);
+    set_cutoffs(&home, 0.0, s + 1000.0);
+    home.config(|c| {
+        c.short_circuit.query = ShortCircuitMode::On;
+        c.short_circuit.query_min_score = Some(s / 2.0);
+    });
+    deny_reason(&home.hook("pre-fetch", &main_search("toolu_1")));
+    // Calibrated cutoff low enough to deny, the override stops it.
+    let home = Home::new();
+    seed_repeat(&home);
+    set_cutoffs(&home, 0.0, 0.0);
+    home.config(|c| {
+        c.short_circuit.query = ShortCircuitMode::On;
+        c.short_circuit.query_min_score = Some(s + 1.0);
+    });
+    assert_silent(&home.hook("pre-fetch", &main_search("toolu_1")));
+    assert_eq!(home.count("SELECT COUNT(*) FROM injection"), 0);
 }
 
 #[test]

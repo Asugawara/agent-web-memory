@@ -1494,7 +1494,7 @@ fn applying_10000_pulled_rows_loses_no_injection_row_of_200_concurrent_hook_runs
     b.conn()
         .execute_batch(
             "INSERT INTO meta (key, value) VALUES ('consent.record', 'yes'); \
-             INSERT INTO meta (key, value) VALUES ('cutoff.query', '0'), ('cutoff.prompt', '0');",
+             INSERT INTO meta (key, value) VALUES ('cutoff.query', '0'), ('cutoff.query_deny', '0'), ('cutoff.prompt', '0');",
         )
         .unwrap();
     let fixture = |name: &str| -> Value {

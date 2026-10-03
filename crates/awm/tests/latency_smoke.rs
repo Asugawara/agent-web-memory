@@ -135,7 +135,7 @@ fn similar_search_lookup_p95_is_within_50_ms_at_3000_searches_in_7_days() {
     }
     tx.commit().unwrap();
     conn.execute(
-        "INSERT INTO meta (key, value) VALUES ('cutoff.query', '0')",
+        "INSERT INTO meta (key, value) VALUES ('cutoff.query', '0'), ('cutoff.query_deny', '0')",
         [],
     )
     .unwrap();

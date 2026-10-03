@@ -151,6 +151,44 @@ fn save_writes_the_file_with_mode_0600() {
 }
 
 #[test]
+fn query_min_score_is_optional_ranged_and_round_trips() {
+    let mut c = Config::default();
+    assert_eq!(c.short_circuit.query_min_score, None);
+    assert_eq!(c.get("short_circuit.query_min_score").unwrap(), "auto");
+    c.set("short_circuit.query_min_score", "42.5").unwrap();
+    assert_eq!(c.short_circuit.query_min_score, Some(42.5));
+    assert_eq!(c.get("short_circuit.query_min_score").unwrap(), "42.5");
+    c.set("short_circuit.query_min_score", "0").unwrap();
+    c.set("short_circuit.query_min_score", "1000").unwrap();
+    assert_eq!(c.short_circuit.query_min_score, Some(1000.0));
+    for bad in ["-1", "1000.5", "nan", "inf", "high"] {
+        assert!(
+            c.set("short_circuit.query_min_score", bad).is_err(),
+            "{bad}"
+        );
+    }
+    assert_eq!(c.short_circuit.query_min_score, Some(1000.0));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    c.set("short_circuit.query_min_score", "40").unwrap();
+    c.save(&path).unwrap();
+    assert_eq!(config::load(&path).unwrap(), c);
+    // An integer in the file reads as a float; an out-of-range value is clamped with a warning.
+    std::fs::write(&path, "[short_circuit]\nquery_min_score = 55\n").unwrap();
+    let loaded = config::load(&path).unwrap();
+    assert_eq!(loaded.short_circuit.query_min_score, Some(55.0));
+    assert!(loaded.warnings.is_empty());
+    std::fs::write(&path, "[short_circuit]\nquery_min_score = 5000.0\n").unwrap();
+    let loaded = config::load(&path).unwrap();
+    assert_eq!(loaded.short_circuit.query_min_score, Some(1000.0));
+    assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+    // `auto` clears it again and nothing is written for a default file.
+    c.set("short_circuit.query_min_score", "auto").unwrap();
+    assert_eq!(c.short_circuit.query_min_score, None);
+}
+
+#[test]
 fn the_query_deny_keys_set_validate_and_clamp() {
     let mut c = Config::default();
     c.set("short_circuit.query", "on").unwrap();

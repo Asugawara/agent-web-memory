@@ -2,7 +2,8 @@
 //! earlier research already answers (amendment 2 of DENY, 2026-10-03).
 //!
 //! `short_circuit.query = "on"` (the default) runs the matching of the query channel
-//! (`matching::query_channel` at `calibrate::cutoff_query`) read-only on the search text. When
+//! (`matching::query_channel` at the deny cutoff, `calibrate::deny_cutoff`: the 75th percentile
+//! of the top-1 scores, stricter than the median `cutoff.query` of the notes) read-only on the search text. When
 //! earlier records score at or above the cutoff, the search is denied once with up to
 //! `inject.max_notes` of them in the reason, and the retry passes. Any earlier usable record
 //! counts: the caller's own agent, a sibling, another session or project, the owner's other
@@ -55,10 +56,11 @@ pub fn search_text(input: &super::HookInput) -> Option<String> {
     input.tool_input_str("query").map(str::to_string)
 }
 
-/// Earlier usable records that match `text` at or above the calibrated cutoff, best first, at
+/// Earlier usable records that match `text` at or above the deny cutoff (`short_circuit.query_min_score`,
+/// else the calibrated `cutoff.query_deny`, stricter than the note cutoff), best first, at
 /// most `inject.max_notes`, each with its score. Read-only use of the query channel.
 pub fn find_similar(env: &Env, conn: &Connection, text: &str) -> anyhow::Result<Vec<(Note, f64)>> {
-    let cutoff = calibrate::cutoff_query(conn)?;
+    let (cutoff, _) = calibrate::deny_cutoff(conn, env.config.short_circuit.query_min_score)?;
     let mut opts = env.match_opts(conn)?;
     // The caller's own earlier research counts as well; a teammate's row and a row older than the
     // window are skipped in SQL, so neither takes one of the three hits (or a newer teammate's

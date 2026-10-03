@@ -12,6 +12,9 @@ use crate::paths;
 
 pub const DEFAULT_CUTOFF_QUERY: f64 = 42.0;
 pub const DEFAULT_CUTOFF_PROMPT: f64 = 49.0;
+/// The WebSearch deny cutoff below `MIN_RECORDS` records (assumption: the 40-60 score bucket
+/// of early denies retried 13%, DENY3; measured corpora replace it).
+pub const DEFAULT_CUTOFF_QUERY_DENY: f64 = 55.0;
 /// Fewer records than this keep the defaults.
 pub const MIN_RECORDS: usize = 50;
 const SAMPLE: i64 = 500;
@@ -19,6 +22,8 @@ const SAMPLE: i64 = 500;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Calibration {
     pub cutoff_query: f64,
+    /// The stricter cutoff of the WebSearch deny: the 75th percentile of the same sample.
+    pub cutoff_query_deny: f64,
     pub cutoff_prompt: Option<f64>,
     /// Records with text that were sampled.
     pub n: usize,
@@ -233,9 +238,28 @@ fn median(sorted: &[f64]) -> f64 {
     }
 }
 
+/// The `p` quantile (0..=1, nearest rank) of an ascending slice; the slice is not empty.
+fn nearest_rank(sorted: &[f64], p: f64) -> f64 {
+    sorted[((sorted.len() - 1) as f64 * p).round() as usize]
+}
+
 /// Stored query cutoff, or the default.
 pub fn cutoff_query(conn: &Connection) -> Result<f64> {
     Ok(meta_f64(conn, "cutoff.query")?.unwrap_or(DEFAULT_CUTOFF_QUERY))
+}
+
+/// Stored cutoff of the WebSearch deny (`meta.cutoff.query_deny`), or the default.
+pub fn cutoff_query_deny(conn: &Connection) -> Result<f64> {
+    Ok(meta_f64(conn, "cutoff.query_deny")?.unwrap_or(DEFAULT_CUTOFF_QUERY_DENY))
+}
+
+/// The cutoff the search deny uses and where it comes from: `short_circuit.query_min_score` when
+/// set (`"config"`), else [`cutoff_query_deny`] (`"calibrated"`).
+pub fn deny_cutoff(conn: &Connection, query_min_score: Option<f64>) -> Result<(f64, &'static str)> {
+    Ok(match query_min_score {
+        Some(v) => (v, "config"),
+        None => (cutoff_query_deny(conn)?, "calibrated"),
+    })
 }
 
 /// Stored prompt cutoff, or the default.
@@ -243,9 +267,10 @@ pub fn cutoff_prompt(conn: &Connection) -> Result<f64> {
     Ok(meta_f64(conn, "cutoff.prompt")?.unwrap_or(DEFAULT_CUTOFF_PROMPT))
 }
 
-/// Sets `meta.cutoff.query` to the median top-1 score of the 500 most recent
-/// records with text, each searched against strictly older records (rules 1 and 3
-/// only). Records without any hit have no score and are left out of the median.
+/// Sets `meta.cutoff.query` to the median and `meta.cutoff.query_deny` to the 75th percentile
+/// (nearest rank) of the top-1 scores of the 500 most recent records with text, each searched
+/// against strictly older records (rules 1 and 3 only). Records without any hit have no score
+/// and are left out of both.
 /// `meta.calibrated_n` is the total record count, which [`should_recalibrate`] compares.
 pub fn run(conn: &Connection) -> Result<Calibration> {
     let recent: Vec<(String, String, i64)> = {
@@ -266,8 +291,8 @@ pub fn run(conn: &Connection) -> Result<Calibration> {
         LocalCopy::of(conn).unwrap_or(None)
     };
     let corpus = copy.as_ref().map_or(conn, |c| &c.conn);
-    let cutoff_query = if n < MIN_RECORDS {
-        DEFAULT_CUTOFF_QUERY
+    let (cutoff_query, cutoff_query_deny) = if n < MIN_RECORDS {
+        (DEFAULT_CUTOFF_QUERY, DEFAULT_CUTOFF_QUERY_DENY)
     } else {
         let mut scores = Vec::new();
         for (tool_use_id, text, created_at) in &recent {
@@ -283,18 +308,20 @@ pub fn run(conn: &Connection) -> Result<Calibration> {
         }
         scores.sort_by(f64::total_cmp);
         if scores.is_empty() {
-            DEFAULT_CUTOFF_QUERY
+            (DEFAULT_CUTOFF_QUERY, DEFAULT_CUTOFF_QUERY_DENY)
         } else {
-            median(&scores)
+            (median(&scores), nearest_rank(&scores, 0.75))
         }
     };
     meta_set(conn, "cutoff.query", &cutoff_query.to_string())?;
+    meta_set(conn, "cutoff.query_deny", &cutoff_query_deny.to_string())?;
     meta_set(conn, "calibrated_at", &now_ms().to_string())?;
     meta_set(conn, "calibrated_n", &record_count(conn)?.to_string())?;
     let stored_prompt = meta_f64(conn, "cutoff.prompt")?;
     let cutoff_prompt = stored_prompt.or((n < MIN_RECORDS).then_some(DEFAULT_CUTOFF_PROMPT));
     Ok(Calibration {
         cutoff_query,
+        cutoff_query_deny,
         cutoff_prompt,
         n,
     })
@@ -319,8 +346,7 @@ pub fn set_prompt_cutoff(conn: &Connection, scores: &[f64]) -> Result<()> {
     }
     let mut s = scores.to_vec();
     s.sort_by(f64::total_cmp);
-    let idx = ((s.len() - 1) as f64 * 0.75).round() as usize;
-    meta_set(conn, "cutoff.prompt", &s[idx].to_string())
+    meta_set(conn, "cutoff.prompt", &nearest_rank(&s, 0.75).to_string())
 }
 
 fn now_ms() -> i64 {
@@ -334,6 +360,7 @@ pub fn run_cli(_args: Args) -> Result<()> {
     let conn = db::open(&paths::db_path()?, Role::Cli)?;
     let c = run(&conn)?;
     println!("cutoff.query  {:.2}", c.cutoff_query);
+    println!("cutoff.query_deny {:.2}", c.cutoff_query_deny);
     match c.cutoff_prompt {
         Some(p) => println!("cutoff.prompt {p:.2}"),
         None => println!("cutoff.prompt not set (computed during import)"),
@@ -348,6 +375,15 @@ pub fn run_cli(_args: Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_deny_cutoff_is_the_75th_percentile_by_nearest_rank() {
+        let scores = [10.0, 20.0, 30.0, 40.0, 50.0];
+        assert_eq!(median(&scores), 30.0);
+        assert_eq!(nearest_rank(&scores, 0.75), 40.0);
+        assert_eq!(nearest_rank(&[7.0], 0.75), 7.0);
+        assert_eq!(nearest_rank(&[1.0, 2.0, 3.0, 4.0], 0.75), 3.0);
+    }
 
     #[test]
     fn two_sweeps_over_one_stale_copy_are_both_ok_and_only_the_first_lists_it() {
