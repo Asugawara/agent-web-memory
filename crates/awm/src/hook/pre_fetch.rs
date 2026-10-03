@@ -5,9 +5,10 @@
 //! `short_circuit.window_days`, whoever made it: the caller itself, a sibling agent, another
 //! session or project, the owner's other device. Usable means status ok with code 200, or a dead
 //! end with an HTTP code (202, 3xx, 4xx except 429: such a URL never succeeded on a repeat), not
-//! quarantined, not tombstoned; a teammate's row never counts. The newest usable row decides: the
-//! reason carries the earlier answer, or says the URL returned that code; the retry passes (once
-//! per session, agent and URL).
+//! quarantined, not tombstoned; a teammate's row never counts. The newest usable row decides the
+//! kind: a coded dead end says the URL returned that code. Otherwise the reason carries one earlier
+//! answer, the one whose stored prompt is closest to the call's own (token Jaccard, ties and
+//! unscorable prompts keep the newest); the retry passes (once per session, agent and URL).
 //!
 //! `WebSearch` (Claude Code) and `webrun` (Codex) go to [`super::pre_search`].
 
@@ -15,6 +16,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use super::{append_canary, canary_line, deny_json, Env, HookArgs, Injection, Verdict};
 use crate::config::ShortCircuitMode;
+use crate::matching::overlap;
 use crate::matching::{self, Hit};
 use crate::note::{Channel, Relation, Status};
 use crate::record::redact_url;
@@ -79,7 +81,7 @@ fn handle_fetch(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
             if note.status == Status::DeadEnd {
                 render::deny_reason_dead_url(&note, &ctx, &who)
             } else {
-                render::deny_reason(&note, &ctx, &who)
+                render::deny_reason(&note, &ctx, &who, c.candidates)
             }
         }
         None => "agent-web-memory: canary deny. Call WebFetch again with the same URL; it will not be blocked again."
@@ -136,48 +138,98 @@ struct Cached {
     hit: Hit,
     /// Made by the caller itself (same session and agent).
     own: bool,
+    /// Earlier answers (status ok) the choice was made among; 1 when there was no choice.
+    candidates: usize,
 }
 
-/// The newest usable fetch of `norm` within the window, by any agent of the owner (the same
-/// agent, a sibling, another session or project, the owner's other device). Usable: status ok
-/// with code 200, or a dead end with an HTTP code that is 202, 3xx, or 4xx but not 429 (such a URL rarely
-/// succeeds on a repeat); 429, 5xx, a dead end without a code and
-/// a refusal never count. The newest usable row decides which reason the deny carries.
+/// Most usable rows read per deny.
+const CANDIDATE_LIMIT: usize = 20;
+
+struct Candidate {
+    id: i64,
+    own: bool,
+    ok: bool,
+    asked: Option<String>,
+}
+
+/// The usable fetches of `norm` within the window, by any agent of the owner (the same agent, a
+/// sibling, another session or project, the owner's other device), newest first, at most
+/// [`CANDIDATE_LIMIT`]. Usable: status ok with code 200, or a dead end with an HTTP code that is
+/// 202, 3xx, or 4xx but not 429 (such a URL rarely succeeds on a repeat); 429,
+/// 5xx, a dead end without a code and a refusal never count. The newest row decides the kind of
+/// deny; for a cached answer the ok row whose stored prompt is closest to the call's prompt is the
+/// one handed over (the newest on a tie or when no prompt can be scored).
 fn find_cached(env: &Env, conn: &Connection, norm: &str) -> anyhow::Result<Option<Cached>> {
     let window_ms = i64::from(env.config.short_circuit.window_days) * 86_400_000;
-    let row: Option<(i64, bool)> = conn
-        .prepare_cached(
-            "SELECT e.id, (e.origin = 'local' AND e.session_id = ?2 AND e.agent_id IS ?3) FROM event e \
-             WHERE e.tool = 'WebFetch' AND e.url_norm = ?1 \
-               AND ((e.status = 'ok' AND e.http_code = 200) \
-                 OR (e.status = 'dead_end' AND (e.http_code = 202 \
-                     OR (e.http_code BETWEEN 300 AND 499 AND e.http_code != 429)))) \
-               AND e.created_at >= ?4 AND e.quarantined = 0 \
-               AND (e.origin = 'local' OR e.member = ?6) \
-               AND (?5 IS NULL OR e.tool_use_id != ?5) \
-               AND NOT EXISTS (SELECT 1 FROM tombstone t \
-                               WHERE t.kind = 'tool_use_id' AND t.value = e.tool_use_id) \
-             ORDER BY e.created_at DESC, e.id DESC LIMIT 1",
-        )?
-        .query_row(
-            params![
-                norm,
-                env.input.session_id,
-                env.input.agent_id,
-                env.started_at_ms - window_ms,
-                env.input.tool_use_id,
-                matching::own_member_id()
-            ],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    Ok(row.map(|(event_id, own)| Cached {
+    let mut st = conn.prepare_cached(
+        "SELECT e.id, (e.origin = 'local' AND e.session_id = ?2 AND e.agent_id IS ?3), \
+                e.status = 'ok', e.fetch_prompt FROM event e \
+         WHERE e.tool = 'WebFetch' AND e.url_norm = ?1 \
+           AND ((e.status = 'ok' AND e.http_code = 200) \
+             OR (e.status = 'dead_end' AND (e.http_code = 202 \
+                 OR (e.http_code BETWEEN 300 AND 499 AND e.http_code != 429)))) \
+           AND e.created_at >= ?4 AND e.quarantined = 0 \
+           AND (e.origin = 'local' OR e.member = ?6) \
+           AND (?5 IS NULL OR e.tool_use_id != ?5) \
+           AND NOT EXISTS (SELECT 1 FROM tombstone t \
+                           WHERE t.kind = 'tool_use_id' AND t.value = e.tool_use_id) \
+         ORDER BY e.created_at DESC, e.id DESC LIMIT ?7",
+    )?;
+    let rows = st.query_map(
+        params![
+            norm,
+            env.input.session_id,
+            env.input.agent_id,
+            env.started_at_ms - window_ms,
+            env.input.tool_use_id,
+            matching::own_member_id(),
+            CANDIDATE_LIMIT as i64
+        ],
+        |r| {
+            Ok(Candidate {
+                id: r.get(0)?,
+                own: r.get(1)?,
+                ok: r.get(2)?,
+                asked: r.get(3)?,
+            })
+        },
+    )?;
+    let mut all = Vec::new();
+    for r in rows {
+        all.push(r?);
+    }
+    let Some(newest) = all.first() else {
+        return Ok(None);
+    };
+    if !newest.ok {
+        // A coded dead end decides: the dead-URL deny, rendered from that row.
+        return Ok(Some(Cached {
+            hit: Hit {
+                event_id: newest.id,
+                score: 1.0,
+                seen: 1,
+            },
+            own: newest.own,
+            candidates: 1,
+        }));
+    }
+    let oks: Vec<&Candidate> = all.iter().filter(|c| c.ok).collect();
+    let (best, overlap) = if oks.len() > 1 {
+        let current = env.input.tool_input_str("prompt");
+        overlap::closest_prompt(current, oks.iter().map(|c| c.asked.as_deref()))
+    } else {
+        (0, 1.0)
+    };
+    let chosen = oks[best];
+    // `Hit.seen` is the size of a note's group, not a candidate count; it stays 1.
+    Ok(Some(Cached {
         hit: Hit {
-            event_id,
-            score: 1.0,
+            event_id: chosen.id,
+            score: overlap,
             seen: 1,
         },
-        own,
+        own: chosen.own,
+        candidates: oks.len(),
     }))
 }
 
