@@ -132,6 +132,11 @@ impl Home {
         c.save(&self.dir.path().join("config.toml")).unwrap();
     }
 
+    /// Writes `config.toml` as text (a file of an older version, for instance).
+    fn write_config(&self, text: &str) {
+        std::fs::write(self.dir.path().join("config.toml"), text).unwrap();
+    }
+
     /// Stores a payload as an earlier record, `age_ms` ago.
     fn seed(&self, payload: &Value, age_ms: i64) {
         let opts = CaptureOpts {
@@ -367,49 +372,53 @@ fn the_same_record_is_not_shown_twice_to_one_agent() {
 }
 
 #[test]
-fn max_per_agent_caps_the_injections() {
+fn there_is_no_per_agent_cap_eleven_notes_in_one_agent_are_all_delivered() {
     let home = Home::new();
-    home.config(|c| c.inject.max_per_agent = 1);
-    seed_example_fetch(&home);
-    home.seed(
-        &patch(
+    let fetch = |session: Option<&str>, id: &str, url: &str| {
+        let mut v = patch(
             fixture("PostToolUse-WebFetch-plugin-3.json"),
             &[
-                ("tool_use_id", json!("toolu_b")),
-                (
-                    "tool_input",
-                    json!({"url": "https://example.org/b", "prompt": "x"}),
-                ),
+                ("tool_use_id", json!(id)),
+                ("tool_input", json!({"url": url, "prompt": "x"})),
             ],
-        ),
-        DAY_MS,
+        );
+        if let Some(session) = session {
+            v["session_id"] = json!(session);
+        }
+        v
+    };
+    for i in 0..11 {
+        let url = format!("https://example.org/page{i}");
+        home.seed(&fetch(None, &format!("toolu_old_{i}"), &url), DAY_MS);
+        let now = fetch(Some("sess-new"), &format!("toolu_new_{i}"), &url);
+        let out = home.hook("post-tool", &now);
+        assert!(out.context().starts_with("<awm-notes"), "note {i}");
+    }
+    assert_eq!(
+        home.count("SELECT COUNT(*) FROM injection WHERE mode = 'inject'"),
+        11
     );
-    assert!(!home.hook("post-tool", &new_fetch()).stdout.is_empty());
-    let second = patch(
-        new_fetch(),
-        &[
-            ("tool_use_id", json!("toolu_new_b")),
-            (
-                "tool_input",
-                json!({"url": "https://example.org/b", "prompt": "x"}),
-            ),
-        ],
+    assert_eq!(
+        home.count("SELECT COUNT(*) FROM hook_run WHERE outcome = 'skipped'"),
+        0
     );
-    assert_silent(&home.hook("post-tool", &second));
 }
 
 #[test]
-fn shadow_mode_logs_a_shadow_row_and_prints_nothing() {
+fn a_legacy_shadow_mode_reads_as_inject_and_writes_no_shadow_row() {
     let home = Home::new();
-    home.config(|c| c.mode = Mode::Shadow);
+    home.write_config("mode = \"shadow\"\n\n[inject]\nmax_per_agent = 1\n");
     seed_example_fetch(&home);
     let out = home.hook("post-tool", &new_fetch());
-    assert_silent(&out);
-    assert_eq!(home.text("SELECT mode FROM injection"), "shadow");
-    assert_eq!(home.count("SELECT COUNT(*) FROM injection_item"), 1);
+    assert!(out.context().starts_with("<awm-notes"));
+    assert_eq!(home.text("SELECT mode FROM injection"), "inject");
     assert_eq!(
-        home.text("SELECT outcome FROM hook_run WHERE hook = 'post-tool'"),
-        "shadow"
+        home.count("SELECT COUNT(*) FROM injection WHERE mode LIKE 'shadow%'"),
+        0
+    );
+    assert_eq!(
+        home.count("SELECT COUNT(*) FROM hook_run WHERE outcome = 'shadow'"),
+        0
     );
 }
 
@@ -557,9 +566,8 @@ fn deny_reason(out: &Out) -> String {
 }
 
 #[test]
-fn a_sibling_fetch_is_denied_once_when_short_circuit_is_on() {
+fn a_sibling_fetch_is_denied_once_by_default() {
     let home = Home::new();
-    home.config(|c| c.short_circuit.mode = ShortCircuitMode::On);
     home.seed(
         &sibling_fetch(Some(("agent-a", "researcher")), "toolu_a"),
         60_000,
@@ -570,8 +578,12 @@ fn a_sibling_fetch_is_denied_once_when_short_circuit_is_on() {
         reason.starts_with("agent-web-memory: this URL was already fetched"),
         "{reason}"
     );
-    assert!(reason.contains("researcher"));
-    assert!(reason.contains("it will not be blocked again"));
+    assert!(reason.contains("by a researcher subagent"), "{reason}");
+    assert!(reason.contains("asked: "), "{reason}");
+    assert!(reason.contains("found: "), "{reason}");
+    assert!(reason.ends_with(
+        "If this does not answer your question, call WebFetch again with the same URL; it will not be blocked again."
+    ));
     // The second attempt of the same agent for the same URL passes.
     assert_silent(&home.hook("pre-fetch", &pre_fetch(None, "toolu_main_2")));
     assert_eq!(
@@ -582,23 +594,33 @@ fn a_sibling_fetch_is_denied_once_when_short_circuit_is_on() {
         home.text("SELECT outcome FROM hook_run WHERE hook = 'pre-fetch' ORDER BY id LIMIT 1"),
         "denied"
     );
+    assert_eq!(home.count("SELECT COUNT(*) FROM injection_item"), 1);
+    // No shadow row or outcome is written any more.
+    assert_eq!(
+        home.count("SELECT COUNT(*) FROM injection WHERE mode LIKE 'shadow%'"),
+        0
+    );
+    assert_eq!(
+        home.count("SELECT COUNT(*) FROM hook_run WHERE outcome = 'shadow'"),
+        0
+    );
 }
 
 #[test]
-fn the_default_short_circuit_mode_only_logs_a_shadow_deny() {
+fn short_circuit_off_never_denies_a_fetch() {
     let home = Home::new();
-    home.seed(
-        &sibling_fetch(Some(("agent-a", "researcher")), "toolu_a"),
-        60_000,
-    );
-    let out = home.hook("pre-fetch", &pre_fetch(None, "toolu_main_1"));
-    assert_silent(&out);
-    assert_eq!(home.text("SELECT mode FROM injection"), "shadow_deny");
-    assert_eq!(
-        home.text("SELECT outcome FROM hook_run WHERE hook = 'pre-fetch'"),
-        "shadow"
-    );
-    assert_eq!(home.count("SELECT COUNT(*) FROM injection_item"), 1);
+    home.config(|c| c.short_circuit.mode = ShortCircuitMode::Off);
+    home.seed(&sibling_fetch(None, "toolu_main_0"), 60_000);
+    assert_silent(&home.hook("pre-fetch", &pre_fetch(None, "toolu_main_1")));
+    assert_eq!(home.count("SELECT COUNT(*) FROM injection"), 0);
+}
+
+#[test]
+fn a_legacy_shadow_short_circuit_mode_reads_as_on() {
+    let home = Home::new();
+    home.write_config("[short_circuit]\nmode = \"shadow\"\n");
+    home.seed(&sibling_fetch(None, "toolu_main_0"), 60_000);
+    deny_reason(&home.hook("pre-fetch", &pre_fetch(None, "toolu_main_1")));
 }
 
 #[test]
@@ -612,7 +634,8 @@ fn the_pre_fetch_trigger_text_is_redacted() {
     request["tool_input"]["url"] = json!(url);
     let home = Home::new();
     home.seed(&sibling, 60_000);
-    assert_silent(&home.hook("pre-fetch", &request));
+    let reason = deny_reason(&home.hook("pre-fetch", &request));
+    assert!(!reason.contains(key), "{reason}");
     let trigger = home.text("SELECT trigger_text FROM injection WHERE hook = 'PreToolUse'");
     assert!(
         trigger.contains("example.com") && !trigger.contains(key),
@@ -621,45 +644,133 @@ fn the_pre_fetch_trigger_text_is_redacted() {
 }
 
 #[test]
-fn the_callers_own_earlier_fetch_never_triggers_a_deny() {
+fn the_callers_own_earlier_fetch_is_denied() {
     let home = Home::new();
-    home.config(|c| c.short_circuit.mode = ShortCircuitMode::On);
     home.seed(&sibling_fetch(None, "toolu_main_0"), 60_000);
-    assert_silent(&home.hook("pre-fetch", &pre_fetch(None, "toolu_main_1")));
-    assert_eq!(home.count("SELECT COUNT(*) FROM injection"), 0);
+    let reason = deny_reason(&home.hook("pre-fetch", &pre_fetch(None, "toolu_main_1")));
+    assert!(
+        reason.contains("already fetched 1 min ago by you, earlier in this session"),
+        "{reason}"
+    );
+    assert_eq!(
+        home.count("SELECT COUNT(*) FROM injection WHERE mode = 'deny'"),
+        1
+    );
 }
 
 #[test]
-fn a_subagent_is_denied_only_with_short_circuit_subagents() {
-    let off = Home::new();
-    off.config(|c| c.short_circuit.mode = ShortCircuitMode::On);
-    off.seed(&sibling_fetch(None, "toolu_main_0"), 60_000);
-    let sub = Some(("agent-b", "general-purpose"));
-    assert_silent(&off.hook("pre-fetch", &pre_fetch(sub, "toolu_b_1")));
+fn another_sessions_fetch_is_denied() {
+    let home = Home::new();
+    let earlier = |cwd: &str| {
+        patch(
+            sibling_fetch(None, "toolu_other"),
+            &[("session_id", json!("sess-other")), ("cwd", json!(cwd))],
+        )
+    };
+    let request = pre_fetch(None, "toolu_main_1");
+    // The same project (the cwd of the request).
+    home.seed(&earlier(request["cwd"].as_str().unwrap()), 60_000);
+    let reason = deny_reason(&home.hook("pre-fetch", &request));
+    assert!(
+        reason.contains("by another session of this project"),
+        "{reason}"
+    );
 
-    let on = Home::new();
-    on.config(|c| {
-        c.short_circuit.mode = ShortCircuitMode::On;
-        c.short_circuit.subagents = true;
-    });
-    on.seed(&sibling_fetch(None, "toolu_main_0"), 60_000);
-    let reason = deny_reason(&on.hook("pre-fetch", &pre_fetch(sub, "toolu_b_1")));
-    assert!(reason.contains("the main agent"));
+    // Another project.
+    let elsewhere = Home::new();
+    elsewhere.seed(&earlier("/work/somewhere-else"), 60_000);
+    let reason = deny_reason(&elsewhere.hook("pre-fetch", &request));
+    assert!(reason.contains("by another session."), "{reason}");
+}
+
+#[test]
+fn a_subagent_is_denied_without_any_flag_and_once() {
+    let home = Home::new();
+    home.seed(&sibling_fetch(None, "toolu_main_0"), 60_000);
+    let sub = Some(("agent-b", "general-purpose"));
+    let reason = deny_reason(&home.hook("pre-fetch", &pre_fetch(sub, "toolu_b_1")));
+    assert!(reason.contains("by the main agent"), "{reason}");
     assert_eq!(
-        on.text("SELECT agent_id FROM injection WHERE mode = 'deny'"),
+        home.text("SELECT agent_id FROM injection WHERE mode = 'deny'"),
         "agent-b"
     );
+    assert_silent(&home.hook("pre-fetch", &pre_fetch(sub, "toolu_b_2")));
+    // Another subagent of the same session is denied once on its own.
+    let other = Some(("agent-c", "general-purpose"));
+    deny_reason(&home.hook("pre-fetch", &pre_fetch(other, "toolu_c_1")));
+    assert_eq!(
+        home.count("SELECT COUNT(*) FROM injection WHERE mode = 'deny'"),
+        2
+    );
 }
 
 #[test]
-fn an_old_sibling_fetch_outside_the_window_does_not_deny() {
+fn an_old_fetch_outside_the_window_does_not_deny() {
     let home = Home::new();
-    home.config(|c| c.short_circuit.mode = ShortCircuitMode::On);
-    home.seed(
-        &sibling_fetch(Some(("agent-a", "researcher")), "toolu_a"),
-        31 * 60_000,
-    );
+    // The default window is 7 days.
+    home.seed(&sibling_fetch(None, "toolu_old"), 8 * 86_400_000);
     assert_silent(&home.hook("pre-fetch", &pre_fetch(None, "toolu_main_1")));
+    assert_eq!(home.count("SELECT COUNT(*) FROM injection"), 0);
+    let fresh = Home::new();
+    fresh.seed(&sibling_fetch(None, "toolu_old"), 6 * 86_400_000);
+    deny_reason(&fresh.hook("pre-fetch", &pre_fetch(None, "toolu_main_1")));
+
+    // A shorter window of the owner's own choice.
+    let short = Home::new();
+    short.config(|c| c.short_circuit.window_days = 1);
+    short.seed(&sibling_fetch(None, "toolu_old"), 25 * 3_600_000);
+    assert_silent(&short.hook("pre-fetch", &pre_fetch(None, "toolu_main_1")));
+    assert_eq!(short.count("SELECT COUNT(*) FROM injection"), 0);
+}
+
+/// The earlier fetch is made unusable by `sql`; the repeat must not deny.
+fn assert_unusable_earlier_fetch_does_not_deny(sql: &str) {
+    let home = Home::new();
+    home.seed(&sibling_fetch(None, "toolu_old"), 60_000);
+    home.conn().execute(sql, []).unwrap();
+    assert_silent(&home.hook("pre-fetch", &pre_fetch(None, "toolu_main_1")));
+    assert_eq!(home.count("SELECT COUNT(*) FROM injection"), 0);
+    assert_eq!(
+        home.text("SELECT outcome FROM hook_run WHERE hook = 'pre-fetch'"),
+        "no_match"
+    );
+}
+
+#[test]
+fn a_fetch_that_was_not_ok_does_not_deny() {
+    assert_unusable_earlier_fetch_does_not_deny("UPDATE event SET status = 'dead_end'");
+}
+
+#[test]
+fn a_fetch_with_another_http_code_does_not_deny() {
+    assert_unusable_earlier_fetch_does_not_deny("UPDATE event SET http_code = 404");
+}
+
+#[test]
+fn a_quarantined_fetch_does_not_deny() {
+    assert_unusable_earlier_fetch_does_not_deny("UPDATE event SET quarantined = 1");
+}
+
+#[test]
+fn a_tombstoned_fetch_does_not_deny() {
+    assert_unusable_earlier_fetch_does_not_deny(
+        "INSERT INTO tombstone (kind, value, created_at) VALUES ('tool_use_id', 'toolu_old', 1)",
+    );
+}
+
+#[test]
+fn the_newest_usable_fetch_is_the_one_handed_over() {
+    let home = Home::new();
+    home.seed(
+        &sibling_fetch(Some(("agent-a", "old-agent")), "toolu_a"),
+        120_000,
+    );
+    home.seed(
+        &sibling_fetch(Some(("agent-b", "new-agent")), "toolu_b"),
+        60_000,
+    );
+    let reason = deny_reason(&home.hook("pre-fetch", &pre_fetch(None, "toolu_main_1")));
+    assert!(reason.contains("by a new-agent subagent"), "{reason}");
 }
 
 #[test]
@@ -716,7 +827,7 @@ fn a_prompt_with_a_known_url_injects_and_keeps_200_characters() {
 }
 
 #[test]
-fn a_plain_prompt_is_a_shadow_match_unless_prompt_bm25_is_inject() {
+fn a_plain_prompt_is_matched_only_when_prompt_bm25_is_inject() {
     let text = "explain sqlite fts5 bm25 ranking weights for column scoring";
     let prompt = patch(
         fixture("UserPromptSubmit-none-plugin-1.json"),
@@ -735,14 +846,12 @@ fn a_plain_prompt_is_a_shadow_match_unless_prompt_bm25_is_inject() {
         "gated"
     );
 
-    let shadow = Home::new();
-    shadow.config(|c| c.channels.prompt_bm25 = PromptBm25::Shadow);
-    seed_search(&shadow);
-    assert_silent(&shadow.hook("prompt", &prompt));
-    assert_eq!(
-        shadow.text("SELECT channel || '/' || mode || '/' || cutoff FROM injection"),
-        "prompt_bm25/shadow/0.0"
-    );
+    // A config file of an older version may still say "shadow": it reads as off.
+    let legacy = Home::new();
+    legacy.write_config("[channels]\nprompt_bm25 = \"shadow\"\n");
+    seed_search(&legacy);
+    assert_silent(&legacy.hook("prompt", &prompt));
+    assert_eq!(legacy.count("SELECT COUNT(*) FROM injection"), 0);
 
     let inject = Home::new();
     inject.config(|c| {
@@ -1065,8 +1174,7 @@ fn a_codex_webrun_matches_an_earlier_search_through_the_query_channel() {
         home.text("SELECT mode || '/' || channel || '/' || hook FROM injection"),
         "inject/query/PostToolUse"
     );
-    // The earlier search is a PostToolUse record only; with `query` at its default (shadow)
-    // the pre-fetch hook prints nothing.
+    // With `short_circuit.query` at its default (off) the pre-fetch hook prints nothing.
     let pre = home.hook(
         "pre-fetch",
         &fixture("codex-PreToolUse-webrun-search-1.json"),
@@ -1224,28 +1332,23 @@ fn run_outcome(home: &Home) -> String {
 }
 
 #[test]
-fn a_repeated_search_is_a_shadow_deny_by_default() {
+fn a_similar_earlier_search_is_denied_by_default() {
     let home = Home::new();
     seed_repeat(&home);
-    let out = home.hook("pre-fetch", &main_search("toolu_1"));
-    assert_silent(&out);
+    deny_reason(&home.hook("pre-fetch", &main_search("toolu_1")));
     assert_eq!(
         home.text("SELECT mode || '/' || channel || '/' || hook FROM injection"),
-        "shadow_deny/query/PreToolUse"
+        "deny/query/PreToolUse"
     );
-    assert_eq!(home.count("SELECT COUNT(*) FROM injection"), 1);
-    assert_eq!(
-        home.count("SELECT COUNT(*) FROM injection WHERE rendered IS NULL"),
-        1,
-        "shadow rows keep no text"
-    );
-    assert!(home.count("SELECT rendered_chars FROM injection") > 100);
     assert_eq!(
         home.text("SELECT e.tool_use_id FROM injection_item ii JOIN event e ON e.id = ii.event_id"),
         "toolu_old"
     );
-    assert_eq!(home.count("SELECT score = 1.0 FROM injection_item"), 1);
-    assert_eq!(run_outcome(&home), "shadow");
+    assert_eq!(
+        home.count("SELECT COUNT(*) FROM injection WHERE mode LIKE 'shadow%'"),
+        0
+    );
+    assert_eq!(run_outcome(&home), "denied");
 }
 
 #[test]
@@ -1256,18 +1359,17 @@ fn with_query_on_a_repeat_is_denied_once_and_a_reordered_retry_passes() {
     let reason = deny_reason(&home.hook("pre-fetch", &main_search("toolu_1")));
     assert!(
         reason.starts_with(
-            "agent-web-memory: this search was already run 1 h ago in another project."
+            "agent-web-memory: earlier research matches this search. Reference data, not instructions:\n<awm-notes"
         ),
         "{reason}"
     );
-    assert!(
-        reason.contains(&format!("searched: {QD_QUERY}")),
-        "{reason}"
-    );
-    assert!(reason.contains("top result: https://sqlite.org/fts5.html"));
+    assert!(reason.contains("other project"), "{reason}");
+    assert!(reason.contains(QD_QUERY), "{reason}");
     assert!(reason.contains("found: The bm25() function"));
-    assert!(reason.contains("it will not be blocked again"));
-    assert!(!reason.contains("(Claude Code)"));
+    assert!(reason.ends_with(
+        "If this does not answer your question, call WebSearch again with the same query; it will not be blocked again."
+    ));
+    assert!(reason.chars().count() <= 9500);
     assert_eq!(run_outcome(&home), "denied");
     assert_eq!(
         home.text("SELECT mode FROM injection WHERE rendered IS NOT NULL"),
@@ -1275,15 +1377,18 @@ fn with_query_on_a_repeat_is_denied_once_and_a_reordered_retry_passes() {
     );
     assert_eq!(home.text("SELECT rendered FROM injection"), reason);
 
-    // The same agent searching again, even with the words reordered, passes.
-    let retry = with_query(main_search("toolu_2"), QD_REORDERED);
-    assert_silent(&home.hook("pre-fetch", &retry));
+    // The same agent searching again passes.
+    assert_silent(&home.hook("pre-fetch", &main_search("toolu_2")));
     assert_eq!(run_outcome(&home), "skipped");
+    // A reordered retry has another trigger text, but the note was shown: nothing is left to hand over.
+    let retry = with_query(main_search("toolu_3"), QD_REORDERED);
+    assert_silent(&home.hook("pre-fetch", &retry));
+    assert_eq!(run_outcome(&home), "no_match");
     assert_eq!(query_rows(&home), 1);
 }
 
 #[test]
-fn a_reordered_retry_of_a_long_query_passes() {
+fn a_retry_of_a_long_query_passes() {
     let home = Home::new();
     on(&home);
     let words: Vec<String> = (0..60).map(|i| format!("topic{i:02}x")).collect();
@@ -1294,8 +1399,7 @@ fn a_reordered_retry_of_a_long_query_passes() {
         3_600_000,
     );
     deny_reason(&home.hook("pre-fetch", &with_query(main_search("toolu_1"), &long)));
-    let reversed: Vec<&str> = words.iter().rev().map(String::as_str).collect();
-    let retry = with_query(main_search("toolu_2"), &reversed.join(" "));
+    let retry = with_query(main_search("toolu_2"), &long);
     assert_silent(&home.hook("pre-fetch", &retry));
     assert_eq!(run_outcome(&home), "skipped");
     assert_eq!(
@@ -1306,7 +1410,7 @@ fn a_reordered_retry_of_a_long_query_passes() {
 }
 
 #[test]
-fn the_callers_own_earlier_search_never_denies() {
+fn the_callers_own_earlier_search_is_denied_too() {
     let home = Home::new();
     on(&home);
     let session = main_search("x")["session_id"].as_str().unwrap().to_string();
@@ -1314,21 +1418,37 @@ fn the_callers_own_earlier_search_never_denies() {
         &search_record(&session, None, "toolu_own", QD_QUERY, "/home/user/dev"),
         60_000,
     );
+    let reason = deny_reason(&home.hook("pre-fetch", &main_search("toolu_1")));
+    assert!(reason.contains("this session, main agent"), "{reason}");
+    assert_eq!(run_outcome(&home), "denied");
+}
+
+#[test]
+fn a_search_below_the_cutoff_is_not_denied() {
+    let home = Home::new();
+    on(&home);
+    seed_repeat(&home);
+    home.conn()
+        .execute(
+            "UPDATE meta SET value = '1000' WHERE key = 'cutoff.query'",
+            [],
+        )
+        .unwrap();
     assert_silent(&home.hook("pre-fetch", &main_search("toolu_1")));
     assert_eq!(home.count("SELECT COUNT(*) FROM injection"), 0);
     assert_eq!(run_outcome(&home), "no_match");
 }
 
 #[test]
-fn an_added_word_does_not_deny() {
+fn an_unrelated_search_does_not_deny() {
     let home = Home::new();
     on(&home);
     seed_repeat(&home);
-    let longer = with_query(main_search("toolu_1"), &format!("{QD_QUERY} 2026"));
-    assert_silent(&home.hook("pre-fetch", &longer));
-    assert_eq!(home.count("SELECT COUNT(*) FROM injection"), 0);
-    let short = with_query(main_search("toolu_2"), "sqlite fts5");
-    assert_silent(&home.hook("pre-fetch", &short));
+    let other = with_query(
+        main_search("toolu_1"),
+        "kubernetes ingress annotations timeout",
+    );
+    assert_silent(&home.hook("pre-fetch", &other));
     assert_eq!(home.count("SELECT COUNT(*) FROM injection"), 0);
 }
 
@@ -1380,16 +1500,16 @@ fn the_main_agent_counts_as_another_agent_for_a_subagent() {
         &search_record(&session, None, "toolu_main", QD_QUERY, "/home/user/dev"),
         120_000,
     );
-    assert_silent(&home.hook("pre-fetch", &sub));
+    deny_reason(&home.hook("pre-fetch", &sub));
     assert_eq!(
         home.text("SELECT mode || '/' || agent_id FROM injection"),
-        "shadow_deny/a0000000000000002"
+        "deny/a0000000000000002"
     );
     assert_eq!(
         home.text("SELECT e.tool_use_id FROM injection_item ii JOIN event e ON e.id = ii.event_id"),
         "toolu_main"
     );
-    assert_eq!(run_outcome(&home), "shadow");
+    assert_eq!(run_outcome(&home), "denied");
 }
 
 #[test]
@@ -1398,40 +1518,26 @@ fn a_repeat_outside_the_window_does_not_deny() {
     on(&home);
     home.seed(
         &search_record("sess-old", None, "toolu_old", QD_QUERY, "/work/other"),
-        25 * 3_600_000,
+        8 * 86_400_000,
     );
     assert_silent(&home.hook("pre-fetch", &main_search("toolu_1")));
     assert_eq!(home.count("SELECT COUNT(*) FROM injection"), 0);
     // A longer window brings it back in.
     home.config(|c| {
         c.short_circuit.query = ShortCircuitMode::On;
-        c.short_circuit.query_window_minutes = 2 * 1440;
+        c.short_circuit.query_window_days = 14;
     });
     deny_reason(&home.hook("pre-fetch", &main_search("toolu_2")));
 }
 
 #[test]
-fn a_subagent_gets_a_shadow_deny_unless_short_circuit_subagents() {
-    let sub = || fixture("PreToolUse-WebSearch-sub-cc-2.json");
-    let off = Home::new();
-    on(&off);
-    seed_repeat(&off);
-    assert_silent(&off.hook("pre-fetch", &sub()));
+fn a_subagent_query_is_denied_without_any_flag() {
+    let home = Home::new();
+    on(&home);
+    seed_repeat(&home);
+    deny_reason(&home.hook("pre-fetch", &fixture("PreToolUse-WebSearch-sub-cc-2.json")));
     assert_eq!(
-        off.text("SELECT mode || '/' || agent_id FROM injection"),
-        "shadow_deny/a0000000000000002"
-    );
-    assert_eq!(run_outcome(&off), "shadow");
-
-    let allowed = Home::new();
-    allowed.config(|c| {
-        c.short_circuit.query = ShortCircuitMode::On;
-        c.short_circuit.subagents = true;
-    });
-    seed_repeat(&allowed);
-    deny_reason(&allowed.hook("pre-fetch", &sub()));
-    assert_eq!(
-        allowed.text("SELECT mode || '/' || agent_id FROM injection"),
+        home.text("SELECT mode || '/' || agent_id FROM injection"),
         "deny/a0000000000000002"
     );
 }
@@ -1452,22 +1558,17 @@ fn a_sibling_subagent_is_named_in_the_reason() {
         120_000,
     );
     let reason = deny_reason(&home.hook("pre-fetch", &main_search("toolu_1")));
-    assert!(
-        reason.contains("already run 2 min ago in this session by a researcher subagent."),
-        "{reason}"
-    );
+    assert!(reason.contains("researcher"), "{reason}");
 }
 
 #[test]
-fn global_mode_shadow_downgrades_query_on() {
+fn a_legacy_shadow_query_setting_reads_as_off() {
     let home = Home::new();
-    home.config(|c| {
-        c.mode = Mode::Shadow;
-        c.short_circuit.query = ShortCircuitMode::On;
-    });
+    home.write_config("[short_circuit]\nquery = \"shadow\"\nsubagents = true\n");
     seed_repeat(&home);
     assert_silent(&home.hook("pre-fetch", &main_search("toolu_1")));
-    assert_eq!(home.text("SELECT mode FROM injection"), "shadow_deny");
+    assert_eq!(home.count("SELECT COUNT(*) FROM injection"), 0);
+    assert_eq!(run_outcome(&home), "no_match");
 }
 
 #[test]
@@ -1511,21 +1612,6 @@ fn a_domain_filtered_search_is_never_denied() {
 }
 
 #[test]
-fn a_short_query_is_never_denied() {
-    let home = Home::new();
-    on(&home);
-    home.seed(
-        &search_record("sess-old", None, "toolu_old", "sqlite fts5", "/work/other"),
-        60_000,
-    );
-    assert_silent(&home.hook(
-        "pre-fetch",
-        &with_query(main_search("toolu_1"), "fts5 sqlite"),
-    ));
-    assert_eq!(home.count("SELECT COUNT(*) FROM injection"), 0);
-}
-
-#[test]
 fn a_codex_webrun_repeat_of_a_claude_code_search_is_denied_with_the_same_json() {
     let home = Home::new();
     on(&home);
@@ -1535,14 +1621,8 @@ fn a_codex_webrun_repeat_of_a_claude_code_search_is_denied_with_the_same_json() 
         &fixture("codex-PreToolUse-webrun-main-codex-1.json"),
     );
     let reason = deny_reason(&out);
-    assert!(
-        reason.contains("in another project (Claude Code)."),
-        "{reason}"
-    );
-    assert!(
-        reason.contains(&format!("searched: {QD_QUERY}")),
-        "{reason}"
-    );
+    assert!(reason.contains(QD_QUERY), "{reason}");
+    assert!(reason.ends_with("run the same search again; it will not be blocked again."));
     assert_eq!(
         out.json(),
         json!({"hookSpecificOutput": {
@@ -1563,7 +1643,7 @@ fn a_codex_webrun_repeat_of_a_claude_code_search_is_denied_with_the_same_json() 
 }
 
 #[test]
-fn a_claude_code_repeat_of_a_codex_search_names_codex() {
+fn a_claude_code_repeat_of_a_codex_search_is_denied() {
     let home = Home::new();
     on(&home);
     let seed = patch(
@@ -1577,11 +1657,11 @@ fn a_claude_code_repeat_of_a_codex_search_names_codex() {
     home.seed(&seed, 3_600_000);
     let query = home.text("SELECT query FROM event");
     let reason = deny_reason(&home.hook("pre-fetch", &with_query(main_search("toolu_1"), &query)));
-    assert!(reason.contains("in another project (Codex)."), "{reason}");
+    assert!(reason.contains("call WebSearch again"), "{reason}");
 }
 
 #[test]
-fn the_fourth_key_of_one_agent_passes() {
+fn there_is_no_per_agent_cap_on_query_denies() {
     let home = Home::new();
     on(&home);
     let queries = [
@@ -1601,14 +1681,10 @@ fn the_fourth_key_of_one_agent_passes() {
             "pre-fetch",
             &with_query(main_search(&format!("toolu_{i}")), q),
         );
-        if i < 3 {
-            deny_reason(&out);
-        } else {
-            assert_silent(&out);
-            assert_eq!(run_outcome(&home), "skipped");
-        }
+        deny_reason(&out);
+        let _ = i;
     }
-    assert_eq!(query_rows(&home), 3);
+    assert_eq!(query_rows(&home), 4);
 }
 
 #[test]
@@ -1669,16 +1745,38 @@ fn the_query_trigger_text_is_redacted() {
     let key = "AKIAIOSFODNN7EXAMPLE";
     let query = format!("sqlite {key} credentials rotation guide");
     let home = Home::new();
+    on(&home);
     home.seed(
         &search_record("sess-old", None, "toolu_old", &query, "/work/other"),
         60_000,
     );
-    assert_silent(&home.hook("pre-fetch", &with_query(main_search("toolu_1"), &query)));
+    let reason = deny_reason(&home.hook("pre-fetch", &with_query(main_search("toolu_1"), &query)));
+    assert!(!reason.contains(key), "{reason}");
     let trigger = home.text("SELECT trigger_text FROM injection WHERE hook = 'PreToolUse'");
     assert!(
         trigger.contains("sqlite") && !trigger.contains(key),
         "{trigger}"
     );
+    assert_eq!(home.count("SELECT COUNT(*) FROM injection_item"), 1);
+}
+
+#[test]
+fn the_reason_holds_at_most_max_notes_notes() {
+    let home = Home::new();
+    home.config(|c| c.inject.max_notes = 1);
+    for i in 0..3 {
+        home.seed(
+            &search_record(
+                &format!("sess-old{i}"),
+                None,
+                &format!("toolu_old{i}"),
+                QD_QUERY,
+                "/work/other",
+            ),
+            3_600_000 + i * 1000,
+        );
+    }
+    deny_reason(&home.hook("pre-fetch", &main_search("toolu_1")));
     assert_eq!(home.count("SELECT COUNT(*) FROM injection_item"), 1);
 }
 

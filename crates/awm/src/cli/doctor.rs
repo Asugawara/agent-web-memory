@@ -122,8 +122,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             failed = true;
         }
     }
-    let cfg = config::load(&paths::config_path()?)?;
-    for w in &cfg.warnings {
+    let (cfg, legacy) = config::load_with_legacy(&paths::config_path()?)?;
+    for w in cfg.warnings.iter().chain(&legacy) {
         println!("[warn] {w}");
     }
     spool(&dir, &cfg)?;

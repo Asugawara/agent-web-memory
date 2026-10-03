@@ -170,7 +170,6 @@ fn by_agent_text(v: &Value) -> String {
 fn injections(conn: &Connection) -> anyhow::Result<Value> {
     let kind = "CASE WHEN agent_id IS NULL THEN 'main' ELSE 'subagent' END";
     let shown = "mode IN ('inject','deny')";
-    let would = "mode IN ('shadow','shadow_deny')";
     let mut day: BTreeMap<String, i64> = BTreeMap::new();
     let mut st = conn.prepare(&format!("SELECT created_at FROM injection WHERE {shown}"))?;
     for ms in st.query_map([], |r| r.get::<_, i64>(0))? {
@@ -224,8 +223,6 @@ fn injections(conn: &Connection) -> anyhow::Result<Value> {
         "shown_by_channel": grouped(conn, &format!("SELECT channel, COUNT(*) FROM injection WHERE {shown} GROUP BY channel ORDER BY channel"))?,
         "shown_by_agent_kind": grouped(conn, &format!("SELECT {kind}, COUNT(*) FROM injection WHERE {shown} GROUP BY 1 ORDER BY 1"))?,
         "shown_by_day": day,
-        "would_have_shown": count(conn, &format!("SELECT COUNT(*) FROM injection WHERE {would}"))?,
-        "would_have_shown_by_channel": grouped(conn, &format!("SELECT channel, COUNT(*) FROM injection WHERE {would} GROUP BY channel ORDER BY channel"))?,
         "accepted": with_label("'1','2'")?,
         "changed_next_step": with_label("'2'")?,
         "harmful": with_label("'h'")?,
@@ -265,7 +262,7 @@ const RETRY_WINDOW_MS: i64 = 120_000;
 type DenyRow = (String, Option<String>, i64, Option<String>, Option<String>);
 
 /// QD1 §5.4: the PreToolUse deny on repeated searches (`hook = 'PreToolUse'`, `channel = 'query'`).
-/// Counts cover shadow and real denies. `relation` is read from the earlier record against the
+/// `relation` is read from the earlier record against the
 /// caller: another coding agent first, then the same session (a sibling), then the caller's
 /// project (from any event of the caller's session; `other_session_project_unknown` when none
 /// was captured). The caller's coding agent is Codex when its transcript is under `/.codex/` or its
@@ -275,10 +272,6 @@ fn query_deny(conn: &Connection) -> anyhow::Result<Value> {
         JOIN event e ON e.id = ii.event_id \
         WHERE i.hook = 'PreToolUse' AND i.channel = 'query' AND ii.position = 1";
     let codex = "COALESCE(i.transcript_path LIKE '%/.codex/%' OR i.tool_use_id LIKE 'exec-%', 0)";
-    let shadow = count(
-        conn,
-        "SELECT COUNT(*) FROM injection WHERE hook = 'PreToolUse' AND channel = 'query' AND mode = 'shadow_deny'",
-    )?;
     let denied = count(
         conn,
         "SELECT COUNT(*) FROM injection WHERE hook = 'PreToolUse' AND channel = 'query' AND mode = 'deny'",
@@ -295,12 +288,13 @@ fn query_deny(conn: &Connection) -> anyhow::Result<Value> {
         m.extend(found);
     }
     let mut by_relation = json!({
-        "sibling": 0, "other_session_same_project": 0, "other_project": 0,
+        "same_agent": 0, "sibling": 0, "other_session_same_project": 0, "other_project": 0,
         "other_session_project_unknown": 0, "other_coding_agent": 0
     });
     let relation = format!(
         "SELECT CASE \
            WHEN (e.agent = 'codex') != {codex} THEN 'other_coding_agent' \
+           WHEN e.session_id = i.session_id AND e.agent_id IS i.agent_id THEN 'same_agent' \
            WHEN e.session_id = i.session_id THEN 'sibling' \
            WHEN NOT EXISTS (SELECT 1 FROM event c WHERE c.session_id = i.session_id) \
              THEN 'other_session_project_unknown' \
@@ -333,8 +327,7 @@ fn query_deny(conn: &Connection) -> anyhow::Result<Value> {
         conn,
         "SELECT COUNT(*) FROM event WHERE tool = 'WebSearch' AND origin = 'local'",
     )?;
-    let per_100 = (searches > 0)
-        .then(|| format!("{:.2}", (shadow + denied) as f64 * 100.0 / searches as f64));
+    let per_100 = (searches > 0).then(|| format!("{:.2}", denied as f64 * 100.0 / searches as f64));
 
     // Research after a deny: the same agent searches the same token set within 2 minutes.
     let mut st = conn.prepare(
@@ -365,7 +358,6 @@ fn query_deny(conn: &Connection) -> anyhow::Result<Value> {
     }
     let n = i64::try_from(denies.len()).unwrap_or(i64::MAX);
     Ok(json!({
-        "shadow": shadow,
         "denied": denied,
         "by_agent_kind": by_kind,
         "by_relation": by_relation,
@@ -630,44 +622,63 @@ fn team_text(v: &Value) -> String {
 }
 
 fn followups(conn: &Connection) -> anyhow::Result<Value> {
-    let mut out = Map::new();
-    for (name, modes) in [
-        ("shown", "'inject','deny'"),
-        ("would_have_shown", "'shadow','shadow_deny'"),
-    ] {
-        let total = count(
-            conn,
-            &format!("SELECT COUNT(*) FROM injection WHERE mode IN ({modes})"),
-        )?;
-        let followed = |window: &str| {
-            count(
-                conn,
-                &format!(
-                    "SELECT COUNT(*) FROM injection i WHERE i.mode IN ({modes}) AND EXISTS ( \
-                       SELECT 1 FROM injection_item ii JOIN event src ON src.id = ii.event_id \
-                       JOIN event e ON e.url_norm = src.url_norm \
-                         AND e.session_id = i.session_id AND e.agent_id IS i.agent_id \
-                         AND e.created_at > i.created_at {window} \
-                         AND (i.tool_use_id IS NULL OR e.tool_use_id != i.tool_use_id) \
-                       WHERE ii.injection_id = i.id AND src.url_norm IS NOT NULL)"
-                ),
-            )
+    let total = count(
+        conn,
+        "SELECT COUNT(*) FROM injection WHERE mode IN ('inject','deny')",
+    )?;
+    // One row per followed injection: the gap to the first follow-up fetch (same session and
+    // agent, same URL as a shown note) and who made the earlier fetch the note came from
+    // (0 the same agent, 1 a sibling, 2 another session; the nearest one when several notes).
+    let mut st = conn.prepare(
+        "SELECT MIN(e.created_at) - i.created_at, \
+                MIN(CASE WHEN src.session_id = i.session_id AND src.agent_id IS i.agent_id THEN 0 \
+                         WHEN src.session_id = i.session_id THEN 1 ELSE 2 END) \
+         FROM injection i \
+         JOIN injection_item ii ON ii.injection_id = i.id \
+         JOIN event src ON src.id = ii.event_id AND src.url_norm IS NOT NULL \
+         JOIN event e ON e.url_norm = src.url_norm \
+           AND e.session_id = i.session_id AND e.agent_id IS i.agent_id \
+           AND e.created_at > i.created_at \
+           AND (i.tool_use_id IS NULL OR e.tool_use_id != i.tool_use_id) \
+         WHERE i.mode IN ('inject','deny') GROUP BY i.id",
+    )?;
+    let rows: Vec<(i64, i64)> = st
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut by_age = [0_i64; 4];
+    let mut by_who = [0_i64; 3];
+    let mut in_2min = 0;
+    for (gap, who) in &rows {
+        let bucket = match *gap {
+            g if g <= FOLLOWUP_WINDOW_MS => 0,
+            g if g <= 1_800_000 => 1,
+            g if g <= 86_400_000 => 2,
+            _ => 3,
         };
-        let in_session = followed("")?;
-        let in_2min = followed(&format!(
-            "AND e.created_at <= i.created_at + {FOLLOWUP_WINDOW_MS}"
-        ))?;
-        out.insert(
-            name.into(),
-            json!({
-                "injections": total,
-                "followed_in_session": in_session,
-                "followed_within_2_min": in_2min,
-                "share_in_session": super::pct(in_session, total),
-            }),
-        );
+        by_age[bucket] += 1;
+        by_who[usize::try_from(*who).unwrap_or(2).min(2)] += 1;
+        in_2min += i64::from(bucket == 0);
     }
-    Ok(Value::Object(out))
+    let in_session = i64::try_from(rows.len()).unwrap_or(i64::MAX);
+    Ok(json!({
+        "shown": {
+            "injections": total,
+            "followed_in_session": in_session,
+            "followed_within_2_min": in_2min,
+            "share_in_session": super::pct(in_session, total),
+            "by_age": {
+                "within_2_min": by_age[0],
+                "within_30_min": by_age[1],
+                "within_24_h": by_age[2],
+                "later": by_age[3],
+            },
+            "by_who": {
+                "same_agent": by_who[0],
+                "sibling": by_who[1],
+                "other_session": by_who[2],
+            },
+        },
+    }))
 }
 
 /// id, created_at, session, agent, triggering tool_use_id, rendered_chars, mode, Codex.

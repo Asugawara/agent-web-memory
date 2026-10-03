@@ -181,7 +181,9 @@ fn deny_reason_is_short_and_framed() {
         &ctx(Channel::Url, 3),
         "subagent (general-purpose)",
     );
-    assert!(text.starts_with("agent-web-memory: this URL was already fetched 9 days ago in this session by subagent (general-purpose)."));
+    assert!(text.starts_with(
+        "agent-web-memory: this URL was already fetched 9 days ago by subagent (general-purpose)."
+    ));
     assert!(text.contains("asked: Summarize the content of this page in one sentence"));
     assert!(text.contains("found: This page explains"));
     assert!(text.chars().count() <= DENY_MAX);

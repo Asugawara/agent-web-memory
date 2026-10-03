@@ -175,10 +175,6 @@ fn query_on(home: &Home) {
     home.config(|c| c.short_circuit.query = ShortCircuitMode::On);
 }
 
-fn url_on(home: &Home) {
-    home.config(|c| c.short_circuit.mode = ShortCircuitMode::On);
-}
-
 fn reason(stdout: &str) -> String {
     let v: Value = serde_json::from_str(stdout).unwrap_or_else(|e| panic!("{e}: {stdout:?}"));
     assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
@@ -189,7 +185,7 @@ fn reason(stdout: &str) -> String {
 }
 
 fn deny_rows(home: &Home) -> i64 {
-    home.count("SELECT COUNT(*) FROM injection WHERE mode IN ('deny', 'shadow_deny')")
+    home.count("SELECT COUNT(*) FROM injection WHERE mode = 'deny'")
 }
 
 // ---- the query deny ----
@@ -204,7 +200,7 @@ fn a_teammates_search_never_triggers_the_query_deny() {
     let (code, out) = home.hook("pre-fetch", &pre_search("toolu_1"));
     assert_eq!(code, Some(0));
     assert_eq!(out, "");
-    assert_eq!(deny_rows(&home), 0, "not even a shadow deny");
+    assert_eq!(deny_rows(&home), 0);
 }
 
 #[test]
@@ -214,7 +210,10 @@ fn a_local_record_of_another_session_does_trigger_the_query_deny() {
     query_on(&home);
     home.seed(&search_record("s-old", "t1", QUERY, "/work/x"), HOUR_MS);
     let (_, out) = home.hook("pre-fetch", &pre_search("toolu_1"));
-    assert!(reason(&out).contains("already run"), "{out}");
+    assert!(
+        reason(&out).contains("earlier research matches this search"),
+        "{out}"
+    );
 }
 
 #[test]
@@ -226,27 +225,11 @@ fn a_record_of_the_callers_other_machine_triggers_the_query_deny() {
     home.make_team(id, OWN, None);
     let (_, out) = home.hook("pre-fetch", &pre_search("toolu_1"));
     let r = reason(&out);
-    assert!(r.contains("on your other machine"), "{r}");
+    assert!(r.contains("your other machine"), "{r}");
     assert_eq!(
         home.count("SELECT COUNT(*) FROM injection WHERE mode = 'deny'"),
         1
     );
-}
-
-#[test]
-fn a_team_row_is_still_skipped_when_the_newer_one_is_a_teammates() {
-    // The newest repeat is a teammate's; the older one is the caller's own: the deny names the own one.
-    let home = Home::new();
-    home.join_team();
-    query_on(&home);
-    home.seed(
-        &search_record("s-old", "t_own", QUERY, "/work/x"),
-        3 * HOUR_MS,
-    );
-    let id = home.seed(&search_record("s-new", "t_alf", QUERY, "/work/y"), HOUR_MS);
-    home.make_team(id, ALF, None);
-    let (_, out) = home.hook("pre-fetch", &pre_search("toolu_1"));
-    assert!(reason(&out).contains("3 h ago"), "{out}");
 }
 
 // ---- the URL deny ----
@@ -255,7 +238,6 @@ fn a_team_row_is_still_skipped_when_the_newer_one_is_a_teammates() {
 fn a_teammates_fetch_never_triggers_the_url_deny() {
     let home = Home::new();
     home.join_team();
-    url_on(&home);
     // The row even carries the caller's session and another agent: only `origin` can exclude it.
     let id = home.seed(
         &fetch_record("sess-pre", Some("agent-a"), "t1", "https://example.com"),
@@ -277,7 +259,6 @@ fn a_teammates_fetch_never_triggers_the_url_deny() {
 fn a_local_sibling_fetch_does_trigger_the_url_deny() {
     let home = Home::new();
     home.join_team();
-    url_on(&home);
     home.seed(
         &fetch_record("sess-pre", Some("agent-a"), "t1", "https://example.com"),
         MIN_MS,
@@ -287,22 +268,32 @@ fn a_local_sibling_fetch_does_trigger_the_url_deny() {
 }
 
 #[test]
-fn a_fetch_row_of_the_callers_other_machine_may_trigger_the_url_deny() {
+fn a_fetch_row_of_the_callers_other_machine_triggers_the_url_deny() {
     let home = Home::new();
     home.join_team();
-    url_on(&home);
     let id = home.seed(
-        &fetch_record("sess-pre", Some("agent-a"), "t1", "https://example.com"),
+        &fetch_record("sess-pre", None, "t1", "https://example.com"),
         MIN_MS,
     );
-    home.conn()
-        .execute(
-            "UPDATE event SET origin = 'team', member = ?2 WHERE id = ?1",
-            params![id, OWN],
-        )
-        .unwrap();
+    // As a pulled row: the other machine's session, never the caller's own.
+    home.make_team(id, OWN, None);
     let (_, out) = home.hook("pre-fetch", &pre_fetch("toolu_main"));
-    assert!(reason(&out).contains("already fetched"), "{out}");
+    let r = reason(&out);
+    assert!(r.contains("by your other machine"), "{r}");
+}
+
+#[test]
+fn a_teammates_pulled_fetch_row_never_denies() {
+    let home = Home::new();
+    home.join_team();
+    let id = home.seed(
+        &fetch_record("s-old", None, "t1", "https://example.com"),
+        MIN_MS,
+    );
+    home.make_team(id, ALF, None);
+    let (_, out) = home.hook("pre-fetch", &pre_fetch("toolu_main"));
+    assert_eq!(out, "");
+    assert_eq!(deny_rows(&home), 0);
 }
 
 // ---- relation, same_repo, mute and show ----

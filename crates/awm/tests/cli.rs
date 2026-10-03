@@ -295,7 +295,9 @@ fn stats_default_golden() {
     golden("stats.txt", env.awm(&["stats"]).ok());
     let v: Value = serde_json::from_str(env.awm(&["stats", "--json"]).ok()).unwrap();
     assert_eq!(v["injections"]["shown"], 1);
-    assert_eq!(v["injections"]["would_have_shown"], 1);
+    // A row of an older version (mode shadow) is not counted and nothing reports it.
+    assert!(v["injections"].get("would_have_shown").is_none());
+    assert!(v["injections"].get("would_have_shown_by_channel").is_none());
     assert_eq!(v["injections"]["changed_next_step"], 1);
 }
 
@@ -370,10 +372,25 @@ fn stats_followups_counts_a_later_call_to_the_same_url() {
     let mut e3 = ev(3, "WebFetch", "s3", BASE + 700_000);
     e3.url = Some("https://example.org/a");
     insert(&conn, &e3);
+    // The session of the earlier fetch itself fetches the URL again two hours later.
+    injection(&conn, 3, "inject", "url", "s1", BASE + 20_000, &[(1, 1.0)]);
+    let mut e4 = ev(4, "WebFetch", "s1", BASE + 2 * HOUR);
+    e4.url = Some("https://example.org/a");
+    insert(&conn, &e4);
     let v: Value = serde_json::from_str(env.awm(&["stats", "--followups", "--json"]).ok()).unwrap();
-    assert_eq!(v["followups"]["shown"]["injections"], 2);
-    assert_eq!(v["followups"]["shown"]["followed_in_session"], 2);
-    assert_eq!(v["followups"]["shown"]["followed_within_2_min"], 1);
+    let shown = &v["followups"]["shown"];
+    assert_eq!(shown["injections"], 3);
+    assert_eq!(shown["followed_in_session"], 3);
+    assert_eq!(shown["followed_within_2_min"], 1);
+    assert_eq!(
+        shown["by_age"],
+        json!({"within_2_min": 1, "within_30_min": 1, "within_24_h": 1, "later": 0})
+    );
+    assert_eq!(
+        shown["by_who"],
+        json!({"same_agent": 1, "sibling": 0, "other_session": 2})
+    );
+    assert!(v["followups"].get("would_have_shown").is_none());
 }
 
 /// Transcript with one injected call and what the agent did afterwards.
@@ -705,10 +722,28 @@ fn config_get_and_set_validate_the_keys() {
     let env = Env::new();
     assert_eq!(env.awm(&["config", "get", "mode"]).ok(), "inject\n");
     assert!(env
-        .awm(&["config", "set", "mode", "shadow"])
+        .awm(&["config", "set", "mode", "off"])
         .ok()
-        .contains("mode = shadow"));
-    assert_eq!(env.awm(&["config", "get", "mode"]).ok(), "shadow\n");
+        .contains("mode = off"));
+    assert_eq!(env.awm(&["config", "get", "mode"]).ok(), "off\n");
+    // Shadow mode and the keys of the per-agent cap and the subagent switch are gone.
+    let refused = env.awm(&["config", "set", "mode", "shadow"]);
+    assert_ne!(refused.code, Some(0));
+    assert!(
+        refused.stderr.contains("use inject or off"),
+        "{}",
+        refused.stderr
+    );
+    let refused = env.awm(&["config", "set", "short_circuit.subagents", "true"]);
+    assert_ne!(refused.code, Some(0));
+    assert!(refused.stderr.contains("was removed"), "{}", refused.stderr);
+    assert_ne!(
+        env.awm(&["config", "set", "inject.max_per_agent", "3"])
+            .code,
+        Some(0)
+    );
+    assert!(!env.awm(&["config", "list"]).ok().contains("max_per_agent"));
+    assert!(!env.awm(&["config", "list"]).ok().contains("subagents"));
     assert_ne!(env.awm(&["config", "set", "mode", "loud"]).code, Some(0));
     assert_ne!(
         env.awm(&["config", "set", "inject.max_notes", "9"]).code,
@@ -717,9 +752,35 @@ fn config_get_and_set_validate_the_keys() {
     assert_ne!(env.awm(&["config", "get", "nope"]).code, Some(0));
     assert_eq!(env.awm(&["config", "get", "inject.max_notes"]).ok(), "3\n");
     assert!(env
-        .awm(&["config", "set", "channels.prompt_bm25", "shadow"])
+        .awm(&["config", "set", "channels.prompt_bm25", "inject"])
         .ok()
         .contains("200 characters"));
+}
+
+#[test]
+fn doctor_names_each_legacy_config_value_and_removed_key() {
+    let env = Env::new();
+    std::fs::write(
+        env.awm_home().join("config.toml"),
+        "mode = \"shadow\"\n[short_circuit]\nsubagents = true\n[inject]\nmax_per_agent = 5\n",
+    )
+    .unwrap();
+    let out = env.awm(&["doctor"]);
+    let text = format!("{}{}", out.stdout, out.stderr);
+    assert!(
+        text.contains("config: mode = \"shadow\" is read as \"inject\"; set it to inject or off"),
+        "{text}"
+    );
+    assert!(
+        text.contains("config: short_circuit.subagents was removed"),
+        "{text}"
+    );
+    assert!(
+        text.contains("config: inject.max_per_agent was removed"),
+        "{text}"
+    );
+    // The hooks and `config list` keep working with the old file.
+    assert_eq!(env.awm(&["config", "get", "mode"]).ok(), "inject\n");
 }
 
 #[test]
@@ -1404,26 +1465,26 @@ fn stats_reports_query_deny_with_hand_computed_numbers() {
     seed_query_denies(&env);
     let v: Value = serde_json::from_str(env.awm(&["stats", "--json"]).ok()).unwrap();
     let q = &v["query_deny"];
-    assert_eq!(
-        (q["shadow"].as_i64(), q["denied"].as_i64()),
-        (Some(3), Some(3))
-    );
+    // Rows of an older version (mode shadow_deny) stay in the breakdowns below; only real denies
+    // are counted as denied.
+    assert!(q.get("shadow").is_none());
+    assert_eq!(q["denied"].as_i64(), Some(3));
     assert_eq!(q["by_agent_kind"], json!({"main": 5, "subagent": 1}));
     assert_eq!(
         q["by_relation"],
-        json!({"sibling": 1, "other_session_same_project": 1, "other_project": 2,
+        json!({"same_agent": 0, "sibling": 1, "other_session_same_project": 1, "other_project": 2,
                "other_session_project_unknown": 1, "other_coding_agent": 1})
     );
     assert_eq!(q["by_age"], json!({"within_30_min": 2, "within_24_h": 5}));
     assert_eq!(q["labels"], json!({"2": 2, "1": 1, "0": 0, "h": 1}));
-    assert_eq!(q["per_100_searches"], "120.00");
+    assert_eq!(q["per_100_searches"], "60.00");
     assert_eq!(
         q["research_after_deny"],
         json!({"denies": 3, "researched": 1, "share": "33.3%"})
     );
     let text = env.awm(&["stats"]).ok().to_string();
     assert!(
-        text.contains("query_deny:") && text.contains("per_100_searches: 120.00"),
+        text.contains("query_deny:") && text.contains("per_100_searches: 60.00"),
         "{text}"
     );
 }
@@ -1461,7 +1522,7 @@ fn refetch_after_deny_counts_url_denies_only() {
 }
 
 #[test]
-fn review_shows_a_query_shadow_deny_with_its_reason_and_accepts_a_label() {
+fn review_shows_a_query_deny_without_a_stored_reason_rebuilt_and_accepts_a_label() {
     let env = Env::new();
     let conn = env.conn();
     qd_search(&conn, 1, "s_old1", None, BASE, "sqlite fts5 bm25 weights");
@@ -1500,7 +1561,7 @@ fn review_shows_a_query_shadow_deny_with_its_reason_and_accepts_a_label() {
         "{text}"
     );
     assert!(
-        text.contains("query deny (shadow): in another project, 1 h ago"),
+        text.contains("query deny: in another project, 1 h ago"),
         "{text}"
     );
     assert!(

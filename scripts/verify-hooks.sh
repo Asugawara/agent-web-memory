@@ -141,14 +141,14 @@ if want VH6; then
   run vh6 "$P_SUBDENY" 1
   c="AWM-CANARY-PreToolUse-$nonce"
   if in_sub "$c"; then row VH6 "denied in subagent" "denied in subagent" info
-  else row VH6 "denied in subagent" "not denied in subagent (short_circuit.subagents stays false)" info; fi
+  else row VH6 "denied in subagent" "not denied in subagent (the deny applies in subagents; investigate)" info; fi
 fi
 
 if want VH6q; then
   run vh6q "$P_SUBDENYQ" 1
   c="AWM-CANARY-PreToolUse-$nonce"
   if in_sub "$c"; then row VH6q "denied in subagent" "denied in subagent" info
-  else row VH6q "denied in subagent" "not denied in subagent (short_circuit.subagents stays false)" info; fi
+  else row VH6q "denied in subagent" "not denied in subagent (the deny applies in subagents; investigate)" info; fi
 fi
 
 mtime_after="$(stat -f '%m' "$settings_file" 2>/dev/null || stat -c '%Y' "$settings_file" 2>/dev/null || echo none)"

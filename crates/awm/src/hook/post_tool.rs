@@ -3,7 +3,6 @@
 use rusqlite::Connection;
 
 use super::{deliver, elapsed_ms, Delivery, Env, HookArgs, Verdict};
-use crate::config::Mode;
 use crate::matching::{self, calibrate};
 use crate::normalize::norm_url;
 use crate::note::Channel;
@@ -19,7 +18,6 @@ pub fn run(_args: HookArgs) -> anyhow::Result<()> {
 fn handle(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
     let input = &env.input;
     let channels = &env.config.channels;
-    let inject = env.config.mode == Mode::Inject;
     let opts = env.match_opts(conn)?;
     let search_start = std::time::Instant::now();
     let (channel, hits, trigger, cutoff) = match input.tool_name.as_str() {
@@ -71,7 +69,6 @@ fn handle(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
         Delivery {
             event: EVENT,
             channel,
-            inject,
             hits,
             trigger_text: Some(env.trigger_text(&trigger)),
             cutoff,

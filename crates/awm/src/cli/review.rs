@@ -366,10 +366,9 @@ fn show(
 }
 
 /// A query deny: the relation and age of the earlier search, then the reason the agent got
-/// (stored for a deny, rebuilt for a shadow deny).
+/// (stored for a deny; rebuilt for a row of an older version that stored none).
 fn query_deny_text(conn: &Connection, it: &Item) -> anyhow::Result<Option<String>> {
     let note = item_note(conn, it)?;
-    let shadow = it.mode != "deny";
     let who = pre_search::where_text(
         &note,
         &earlier_agent(conn, it.event_id.unwrap_or_default()),
@@ -382,17 +381,12 @@ fn query_deny_text(conn: &Connection, it: &Item) -> anyhow::Result<Option<String
         ref_id: it.ref_id.clone(),
         max_notes: 1,
     };
-    let reason = match (&it.rendered, shadow) {
-        (Some(r), false) => plain_block(r),
-        _ => render::deny_reason_search(&note, &ctx, &who),
+    let reason = match &it.rendered {
+        Some(r) => plain_block(r),
+        None => render::deny_reason_search(&note, &ctx, &who),
     };
     Ok(Some(format!(
-        "{}: {who}, {}\n{reason}",
-        if shadow {
-            "query deny (shadow)"
-        } else {
-            "query deny"
-        },
+        "query deny: {who}, {}\n{reason}",
         render::age_string(note.created_at_ms, it.created_at),
     )))
 }

@@ -1,41 +1,29 @@
-//! PreToolUse WebSearch (Claude Code) and `webrun` (Codex): optional deny of a repeated
-//! search (QD1 §5.1).
+//! PreToolUse WebSearch (Claude Code) and `webrun` (Codex): an optional deny of a search that
+//! earlier research already answers (amendment 2 of DENY, 2026-10-03).
 //!
-//! `short_circuit.query = "shadow"` (the default) logs a `shadow_deny` row; `"on"` denies.
-//! A deny needs an earlier WebSearch record of any other agent (a sibling, another session
-//! or project, the other coding agent) within `query_window_minutes` whose query has the
-//! same token set, with status ok and a non-empty sanitised finding. The caller's own
-//! earlier search never counts. One deny per (session, agent, token set), three per agent.
+//! `short_circuit.query = "on"` (the default) runs the matching of the query channel
+//! (`matching::query_channel` at `calibrate::cutoff_query`) read-only on the search text. When
+//! earlier records score at or above the cutoff, the search is denied once with up to
+//! `inject.max_notes` of them in the reason, and the retry passes. Any earlier usable record
+//! counts: the caller's own agent, a sibling, another session or project, the owner's other
+//! device (a teammate's never), within `short_circuit.query_window_days`. One deny per
+//! (session, agent, trigger text). BM25 is a similarity match, not an equality: its measured
+//! precision is 0.52 strict at the median cutoff (MB T2).
 
 use rusqlite::{params, Connection};
 
 use super::{append_canary, canary_line, deny_json, Env, Injection, Verdict};
-use crate::config::{Mode, ShortCircuitMode};
-use crate::matching::{self, Hit};
-use crate::normalize::token_set;
+use crate::config::ShortCircuitMode;
+use crate::matching::{self, calibrate};
 use crate::note::{Channel, Note, Relation};
 use crate::record::codex_query;
 use crate::render::{self, plain_label};
 use crate::{redact, sanitize};
 
 const EVENT: &str = "PreToolUse";
-/// Fewer tokens than this never match (QD1 §5.1 step 3).
-const MIN_TOKENS: usize = 3;
-/// Denies (or shadow denies) per (session, agent).
-const MAX_PER_AGENT: i64 = 3;
-/// Rows scanned by [`find_repeat`], newest first.
-const SCAN_LIMIT: i64 = 2000;
 const AGENT_TYPE_CAP: usize = 24;
 const CANARY_REASON: &str =
     "agent-web-memory: canary deny. Run the same search again; it will not be blocked again.";
-
-/// What the configuration allows: global `mode = "shadow"` turns a deny into a shadow deny.
-fn effective_mode(env: &Env) -> ShortCircuitMode {
-    match (env.config.mode, env.config.short_circuit.query) {
-        (Mode::Shadow, ShortCircuitMode::On) => ShortCircuitMode::Shadow,
-        (_, m) => m,
-    }
-}
 
 fn is_filter(v: Option<&serde_json::Value>) -> bool {
     use serde_json::Value;
@@ -67,184 +55,126 @@ pub fn search_text(input: &super::HookInput) -> Option<String> {
     input.tool_input_str("query").map(str::to_string)
 }
 
-/// An earlier search with the same token set.
-#[derive(Debug, Clone)]
-pub struct Repeat {
-    pub hit: Hit,
-    /// `event.agent` of the earlier record: `claude` or `codex`.
-    pub agent: String,
+/// Earlier usable records that match `text` at or above the calibrated cutoff, best first, at
+/// most `inject.max_notes`, each with its score. Read-only use of the query channel.
+pub fn find_similar(env: &Env, conn: &Connection, text: &str) -> anyhow::Result<Vec<(Note, f64)>> {
+    let cutoff = calibrate::cutoff_query(conn)?;
+    let mut opts = env.match_opts(conn)?;
+    // The caller's own earlier research counts as well.
+    opts.exclude_same_agent = false;
+    let window_ms = i64::from(env.config.short_circuit.query_window_days) * 86_400_000;
+    let since = env.started_at_ms - window_ms;
+    let max = env.config.inject.max_notes as usize;
+    let mut found = Vec::new();
+    for hit in matching::query_channel(conn, text, cutoff, &opts)? {
+        let note = matching::to_note(conn, &hit, &opts)?;
+        let usable = note.created_at_ms >= since
+            && !matches!(note.relation, Relation::Teammate { .. })
+            && (note.tool != crate::note::Tool::WebFetch || note.http_code == Some(200))
+            && note
+                .summary
+                .as_deref()
+                .is_some_and(|s| !sanitize::excerpt(s, 200).text.is_empty());
+        if usable {
+            found.push((note, hit.score));
+            if found.len() >= max {
+                break;
+            }
+        }
+    }
+    Ok(found)
 }
 
 pub fn handle(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
     let input = &env.input;
     let forced = std::env::var("AWM_CANARY_DENY").is_ok_and(|v| v == "1");
-    let mode = effective_mode(env);
-    if mode == ShortCircuitMode::Off && !forced {
+    if env.config.short_circuit.query == ShortCircuitMode::Off && !forced {
         return Ok(Verdict::quiet("no_match"));
     }
     let text = search_text(input);
-    let (text, key) = match text {
-        Some(t) => {
-            let (clean, _) = redact::redact(&t, &env.config.capture.redact_terms);
-            let key = token_set(&clean);
-            (t, key)
-        }
-        None => (String::new(), Vec::new()),
-    };
-    let searchable = key.len() >= MIN_TOKENS;
-    if !searchable && !forced {
+    if text.is_none() && !forced {
         return Ok(Verdict::quiet("no_match"));
     }
-    // In a subagent a real deny also needs `short_circuit.subagents`; a forced canary deny does not.
-    let denies = forced
-        || (mode == ShortCircuitMode::On
-            && (!env.is_subagent() || env.config.short_circuit.subagents));
-    let log_mode = if denies { "deny" } else { "shadow_deny" };
+    let text = text.unwrap_or_default();
     let trigger = env.trigger_text(&text);
-    if already_denied(env, conn, log_mode, &key)?
-        || denies_for_agent(env, conn, log_mode)? >= MAX_PER_AGENT
-    {
+    if already_denied(env, conn, &trigger)? {
         return Ok(Verdict::quiet("skipped"));
     }
 
     let start = std::time::Instant::now();
-    let window_ms = i64::from(env.config.short_circuit.query_window_minutes) * 60_000;
-    let repeat = if searchable {
-        find_repeat(env, conn, &key, window_ms)?
+    let (clean, _) = redact::redact(&text, &env.config.capture.redact_terms);
+    let notes = if clean.trim().is_empty() {
+        Vec::new()
     } else {
-        None
+        find_similar(env, conn, &clean)?
     };
     let search_ms = super::elapsed_ms(start);
-    if repeat.is_none() && !forced {
-        return Ok(Verdict {
-            search_ms: Some(search_ms),
-            ..Verdict::quiet("no_match")
-        });
-    }
 
     let ref_id = env.new_ref();
-    let mut items = Vec::new();
-    let mut reason = match &repeat {
-        Some(r) => {
-            let opts = env.match_opts(conn)?;
-            let note = matching::to_note(conn, &r.hit, &opts)?;
-            items.push((r.hit.event_id, 1.0));
-            let caller_is_codex = input.tool_name == "webrun";
-            let where_ = where_text(&note, &r.agent, caller_is_codex);
-            render::deny_reason_search(&note, &env.render_ctx(Channel::Query, &ref_id), &where_)
-        }
-        None => CANARY_REASON.to_string(),
+    let retry = if input.tool_name == "webrun" {
+        "If this does not answer your question, run the same search again; it will not be blocked again."
+    } else {
+        "If this does not answer your question, call WebSearch again with the same query; it will not be blocked again."
     };
-    if let (true, Some(line)) = (denies, canary_line(EVENT)) {
+    let only: Vec<Note> = notes.iter().map(|(n, _)| n.clone()).collect();
+    let rendered = if only.is_empty() {
+        None
+    } else {
+        let ctx = env.render_ctx(Channel::Query, &ref_id);
+        render::deny_reason_matches(&only, &ctx, retry)
+    };
+    let (mut reason, items) = match rendered {
+        Some((reason, ids)) => {
+            let items = ids
+                .iter()
+                .map(|id| {
+                    let score = notes
+                        .iter()
+                        .find(|(n, _)| n.event_id == *id)
+                        .map_or(0.0, |(_, sc)| *sc);
+                    (*id, score)
+                })
+                .collect::<Vec<(i64, f64)>>();
+            (reason, items)
+        }
+        None if forced => (CANARY_REASON.to_string(), Vec::new()),
+        None => {
+            return Ok(Verdict {
+                search_ms: Some(search_ms),
+                ..Verdict::quiet("no_match")
+            })
+        }
+    };
+    if let Some(line) = canary_line(EVENT) {
         append_canary(&mut reason, &line);
     }
-    let shown = denies.then(|| reason.clone());
     Ok(Verdict {
-        output: shown.as_deref().map(deny_json),
-        outcome: if denies { "denied" } else { "shadow" },
+        output: Some(deny_json(&reason)),
+        outcome: "denied",
         search_ms: Some(search_ms),
         injection: Some(Injection {
             hook: EVENT,
             channel: Channel::Query,
-            mode: log_mode,
+            mode: "deny",
             tool_use_id: input.tool_use_id.clone(),
             trigger_text: Some(trigger),
             cutoff: None,
             rendered_chars: reason.chars().count(),
-            rendered: shown,
+            rendered: Some(reason),
             ref_id,
             items,
         }),
     })
 }
 
-/// The newest usable search of another agent within `window_ms` whose token set is `key`.
-pub fn find_repeat(
-    env: &Env,
-    conn: &Connection,
-    key: &[String],
-    window_ms: i64,
-) -> anyhow::Result<Option<Repeat>> {
-    let mut st = conn.prepare_cached(
-        "SELECT e.id, e.query, e.summary, e.agent FROM event e \
-         WHERE e.tool = 'WebSearch' AND e.created_at >= ?1 AND e.status = 'ok' \
-           AND e.quarantined = 0 AND e.summary IS NOT NULL \
-           AND (e.origin = 'local' OR e.member = ?6) \
-           AND NOT (e.session_id = ?2 AND e.agent_id IS ?3) \
-           AND (?4 IS NULL OR e.tool_use_id != ?4) \
-           AND NOT EXISTS (SELECT 1 FROM tombstone t \
-                           WHERE t.kind = 'tool_use_id' AND t.value = e.tool_use_id) \
-         ORDER BY e.created_at DESC, e.id DESC LIMIT ?5",
-    )?;
-    let mut rows = st.query(params![
-        env.started_at_ms - window_ms,
-        env.input.session_id,
-        env.input.agent_id,
-        env.input.tool_use_id,
-        SCAN_LIMIT,
-        matching::own_member_id()
-    ])?;
-    while let Some(r) = rows.next()? {
-        let query: Option<String> = r.get(1)?;
-        let Some(query) = query else { continue };
-        if token_set(&query) != key {
-            continue;
-        }
-        let summary: String = r.get(2)?;
-        if sanitize::excerpt(&summary, 200).text.is_empty()
-            || sanitize::line_text(&query, 120).text.is_empty()
-        {
-            continue;
-        }
-        return Ok(Some(Repeat {
-            hit: Hit {
-                event_id: r.get(0)?,
-                score: 1.0,
-                seen: 1,
-            },
-            agent: r.get(3)?,
-        }));
-    }
-    Ok(None)
-}
-
-/// The same (session, agent) already has a query row of this log mode whose token set is `key`
-/// (the full redacted query, not the 200-character trigger text). The token set of a row is
-/// that of the earlier search it denied (`event.query` of its item); a row without an item
-/// (a canary deny) falls back to its trigger text.
-pub fn already_denied(
-    env: &Env,
-    conn: &Connection,
-    mode: &str,
-    key: &[String],
-) -> anyhow::Result<bool> {
-    let mut st = conn.prepare_cached(
-        "SELECT COALESCE(e.query, i.trigger_text) FROM injection i \
-         LEFT JOIN injection_item ii ON ii.injection_id = i.id AND ii.position = 1 \
-         LEFT JOIN event e ON e.id = ii.event_id \
-         WHERE i.hook = 'PreToolUse' AND i.channel = 'query' \
-         AND i.mode = ?1 AND i.session_id = ?2 AND i.agent_id IS ?3",
-    )?;
-    let rows = st.query_map(
-        params![mode, env.input.session_id, env.input.agent_id],
-        |r| r.get::<_, Option<String>>(0),
-    )?;
-    for row in rows {
-        if row?.is_some_and(|t| token_set(&t) == key) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// Query rows of this log mode the (session, agent) already has.
-pub fn denies_for_agent(env: &Env, conn: &Connection, mode: &str) -> anyhow::Result<i64> {
-    Ok(conn.query_row(
-        "SELECT COUNT(*) FROM injection WHERE hook = 'PreToolUse' AND channel = 'query' \
-         AND mode = ?1 AND session_id = ?2 AND agent_id IS ?3",
-        params![mode, env.input.session_id, env.input.agent_id],
-        |r| r.get(0),
-    )?)
+/// The same (session, agent) already has a query deny for this trigger text.
+fn already_denied(env: &Env, conn: &Connection, trigger: &str) -> anyhow::Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT 1 FROM injection WHERE hook = 'PreToolUse' AND channel = 'query' \
+             AND mode = 'deny' AND session_id = ?1 AND agent_id IS ?2 AND trigger_text = ?3 LIMIT 1",
+        )?
+        .exists(params![env.input.session_id, env.input.agent_id, trigger])?)
 }
 
 /// `{where}` of the reason (QD1 §5.2): who ran the earlier search, and the other coding agent if it differs.

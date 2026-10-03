@@ -27,7 +27,7 @@ macro_rules! string_enum {
 
 string_enum!(
     /// `mode`.
-    Mode { Inject => "inject", Shadow => "shadow", Off => "off" }
+    Mode { Inject => "inject", Off => "off" }
 );
 string_enum!(
     /// `notify`.
@@ -35,12 +35,40 @@ string_enum!(
 );
 string_enum!(
     /// `channels.prompt_bm25`.
-    PromptBm25 { Off => "off", Shadow => "shadow", Inject => "inject" }
+    PromptBm25 { Off => "off", Inject => "inject" }
 );
 string_enum!(
-    /// `short_circuit.mode`.
-    ShortCircuitMode { Off => "off", Shadow => "shadow", On => "on" }
+    /// `short_circuit.mode` and `short_circuit.query`.
+    ShortCircuitMode { Off => "off", On => "on" }
 );
+
+/// What a legacy `shadow` value of each key is read as (there is no shadow mode any more):
+/// key, the value it is read as, the values to choose from now.
+const LEGACY_SHADOW: &[(&str, &str, &str)] = &[
+    ("mode", "inject", "inject or off"),
+    ("channels.prompt_bm25", "off", "inject or off"),
+    ("short_circuit.mode", "on", "on or off"),
+    ("short_circuit.query", "off", "on or off"),
+];
+/// Keys that no longer exist, with what replaces them.
+const REMOVED_KEYS: &[(&str, &str)] = &[
+    (
+        "short_circuit.query_window_minutes",
+        "the search deny window is set in days: use short_circuit.query_window_days (default 7)",
+    ),
+    (
+        "short_circuit.window_minutes",
+        "the URL deny window is set in days: use short_circuit.window_days (default 7)",
+    ),
+    (
+        "short_circuit.subagents",
+        "the URL deny applies in subagents; there is no switch",
+    ),
+    (
+        "inject.max_per_agent",
+        "there is no per-agent cap; inject.max_notes still limits one injection",
+    ),
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -56,12 +84,11 @@ pub struct Channels {
 pub struct ShortCircuit {
     pub mode: ShortCircuitMode,
     #[serde(deserialize_with = "de_u32")]
-    pub window_minutes: u32,
-    pub subagents: bool,
+    pub window_days: u32,
     /// The PreToolUse deny on repeated web searches (QD1 §5.3); separate from `mode` (URLs).
     pub query: ShortCircuitMode,
     #[serde(deserialize_with = "de_u32")]
-    pub query_window_minutes: u32,
+    pub query_window_days: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,8 +96,6 @@ pub struct ShortCircuit {
 pub struct Inject {
     #[serde(deserialize_with = "de_u32")]
     pub max_notes: u32,
-    #[serde(deserialize_with = "de_u32")]
-    pub max_per_agent: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,21 +246,17 @@ impl Default for Channels {
 impl Default for ShortCircuit {
     fn default() -> Self {
         ShortCircuit {
-            mode: ShortCircuitMode::Shadow,
-            window_minutes: 30,
-            subagents: false,
-            query: ShortCircuitMode::Shadow,
-            query_window_minutes: 1440,
+            mode: ShortCircuitMode::On,
+            window_days: 7,
+            query: ShortCircuitMode::On,
+            query_window_days: 7,
         }
     }
 }
 
 impl Default for Inject {
     fn default() -> Self {
-        Inject {
-            max_notes: 3,
-            max_per_agent: 10,
-        }
+        Inject { max_notes: 3 }
     }
 }
 
@@ -292,10 +313,9 @@ fn de_price<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
 /// Allowed range of a numeric key (plan-v2 §5.7).
 fn range(key: &str) -> Option<(u32, u32)> {
     Some(match key {
-        "short_circuit.window_minutes" => (1, 1440),
-        "short_circuit.query_window_minutes" => (1, 10080),
+        "short_circuit.window_days" => (1, 365),
+        "short_circuit.query_window_days" => (1, 365),
         "inject.max_notes" => (1, 3),
-        "inject.max_per_agent" => (0, 100),
         "hooks.deadline_ms" => (100, 2000),
         "review.daily_limit" => (1, 50),
         "quota.retention_days" => (7, 3650),
@@ -322,21 +342,16 @@ impl Config {
     fn clamp_all(&mut self) {
         let mut w = Vec::new();
         clamp(
-            "short_circuit.window_minutes",
-            &mut self.short_circuit.window_minutes,
+            "short_circuit.window_days",
+            &mut self.short_circuit.window_days,
             &mut w,
         );
         clamp(
-            "short_circuit.query_window_minutes",
-            &mut self.short_circuit.query_window_minutes,
+            "short_circuit.query_window_days",
+            &mut self.short_circuit.query_window_days,
             &mut w,
         );
         clamp("inject.max_notes", &mut self.inject.max_notes, &mut w);
-        clamp(
-            "inject.max_per_agent",
-            &mut self.inject.max_per_agent,
-            &mut w,
-        );
         clamp("hooks.deadline_ms", &mut self.hooks.deadline_ms, &mut w);
         clamp("review.daily_limit", &mut self.review.daily_limit, &mut w);
         clamp(
@@ -373,14 +388,10 @@ impl Config {
             "channels.prompt_url" => self.channels.prompt_url.to_string(),
             "channels.prompt_bm25" => self.channels.prompt_bm25.as_str().to_string(),
             "short_circuit.mode" => self.short_circuit.mode.as_str().to_string(),
-            "short_circuit.window_minutes" => self.short_circuit.window_minutes.to_string(),
-            "short_circuit.subagents" => self.short_circuit.subagents.to_string(),
+            "short_circuit.window_days" => self.short_circuit.window_days.to_string(),
             "short_circuit.query" => self.short_circuit.query.as_str().to_string(),
-            "short_circuit.query_window_minutes" => {
-                self.short_circuit.query_window_minutes.to_string()
-            }
+            "short_circuit.query_window_days" => self.short_circuit.query_window_days.to_string(),
             "inject.max_notes" => self.inject.max_notes.to_string(),
-            "inject.max_per_agent" => self.inject.max_per_agent.to_string(),
             "hooks.deadline_ms" => self.hooks.deadline_ms.to_string(),
             "capture.exclude_hosts" => self.capture.exclude_hosts.join(","),
             "capture.redact_terms" => self.capture.redact_terms.join(","),
@@ -491,8 +502,15 @@ impl Config {
             }
             Ok(out)
         }
+        if value == "shadow" {
+            if let Some((_, instead, choices)) = LEGACY_SHADOW.iter().find(|(k, ..)| *k == key) {
+                bail!(
+                    "{key}: shadow mode was removed (an old file reads it as {instead:?}); use {choices}"
+                );
+            }
+        }
         match key {
-            "mode" => self.mode = pick(key, value, Mode::parse(value), "inject, shadow, off")?,
+            "mode" => self.mode = pick(key, value, Mode::parse(value), "inject, off")?,
             "notify" => {
                 self.notify = pick(key, value, Notify::parse(value), "first, always, never")?
             }
@@ -501,33 +519,21 @@ impl Config {
             "channels.prompt_url" => self.channels.prompt_url = flag(key, value)?,
             "channels.prompt_bm25" => {
                 self.channels.prompt_bm25 =
-                    pick(key, value, PromptBm25::parse(value), "off, shadow, inject")?
+                    pick(key, value, PromptBm25::parse(value), "off, inject")?
             }
             "short_circuit.mode" => {
-                self.short_circuit.mode = pick(
-                    key,
-                    value,
-                    ShortCircuitMode::parse(value),
-                    "off, shadow, on",
-                )?
+                self.short_circuit.mode =
+                    pick(key, value, ShortCircuitMode::parse(value), "on, off")?
             }
-            "short_circuit.window_minutes" => {
-                self.short_circuit.window_minutes = number(key, value)?
-            }
-            "short_circuit.subagents" => self.short_circuit.subagents = flag(key, value)?,
+            "short_circuit.window_days" => self.short_circuit.window_days = number(key, value)?,
             "short_circuit.query" => {
-                self.short_circuit.query = pick(
-                    key,
-                    value,
-                    ShortCircuitMode::parse(value),
-                    "off, shadow, on",
-                )?
+                self.short_circuit.query =
+                    pick(key, value, ShortCircuitMode::parse(value), "on, off")?
             }
-            "short_circuit.query_window_minutes" => {
-                self.short_circuit.query_window_minutes = number(key, value)?
+            "short_circuit.query_window_days" => {
+                self.short_circuit.query_window_days = number(key, value)?
             }
             "inject.max_notes" => self.inject.max_notes = number(key, value)?,
-            "inject.max_per_agent" => self.inject.max_per_agent = number(key, value)?,
             "hooks.deadline_ms" => self.hooks.deadline_ms = number(key, value)?,
             "capture.exclude_hosts" => self.capture.exclude_hosts = list(value),
             "capture.redact_terms" => self.capture.redact_terms = list(value),
@@ -562,24 +568,74 @@ impl Config {
                     pick(key, value, AutoApprove::parse(value), "none, devices, all")?
             }
             "team.push_delay_s" => self.team.push_delay_s = number(key, value)?,
-            _ => bail!("unknown configuration key: {key}"),
+            _ => match REMOVED_KEYS.iter().find(|(k, _)| *k == key) {
+                Some((_, replacement)) => bail!("{key} was removed: {replacement}"),
+                None => bail!("unknown configuration key: {key}"),
+            },
         }
         Ok(())
     }
 }
 
-/// Loads the configuration. A missing file gives the defaults; unknown keys are
-/// ignored; out-of-range numbers are clamped and reported in [`Config::warnings`].
+/// Loads the configuration. A missing file gives the defaults; unknown keys (the removed
+/// `short_circuit.subagents` and `inject.max_per_agent` among them) are ignored; the legacy
+/// value `shadow` is read as in [`LEGACY_SHADOW`]; out-of-range numbers are clamped and reported
+/// in [`Config::warnings`].
 pub fn load(path: &Path) -> anyhow::Result<Config> {
+    Ok(load_with_legacy(path)?.0)
+}
+
+/// [`load`] plus one line per legacy value or removed key found in the file (`awm doctor`).
+pub fn load_with_legacy(path: &Path) -> anyhow::Result<(Config, Vec<String>)> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Config::default(), Vec::new()))
+        }
         Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
     };
-    let mut config: Config = toml::from_str(&text)
-        .with_context(|| format!("invalid configuration {}", path.display()))?;
+    let invalid = || format!("invalid configuration {}", path.display());
+    let mut table: toml::Table = toml::from_str(&text).with_context(invalid)?;
+    let legacy = rewrite_legacy(&mut table);
+    let mut config: Config = table.try_into().with_context(invalid)?;
     config.clamp_all();
-    Ok(config)
+    Ok((config, legacy))
+}
+
+/// Replaces `shadow` values and drops removed keys in place; returns a line for each.
+fn rewrite_legacy(table: &mut toml::Table) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (key, replacement, choices) in LEGACY_SHADOW {
+        let slot = match key.split_once('.') {
+            Some((section, name)) => table
+                .get_mut(section)
+                .and_then(toml::Value::as_table_mut)
+                .and_then(|t| t.get_mut(name)),
+            None => table.get_mut(*key),
+        };
+        let Some(slot) = slot else { continue };
+        if slot.as_str() == Some("shadow") {
+            *slot = toml::Value::String((*replacement).to_string());
+            lines.push(format!(
+                "config: {key} = \"shadow\" is read as \"{replacement}\"; set it to {choices}"
+            ));
+        }
+    }
+    for (key, replacement) in REMOVED_KEYS {
+        let Some((section, name)) = key.split_once('.') else {
+            continue;
+        };
+        let removed = table
+            .get_mut(section)
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|t| t.remove(name));
+        if removed.is_some() {
+            lines.push(format!(
+                "config: {key} was removed and is ignored: {replacement}"
+            ));
+        }
+    }
+    lines
 }
 
 /// Writes `text` to `path`; the file is 0600 on unix (`capture.redact_terms` may hold names).
