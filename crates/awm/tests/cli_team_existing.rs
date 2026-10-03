@@ -17,6 +17,9 @@ use awm_proto::wire::{Id, Key32};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
+mod support;
+use support::now_ms;
+
 const BASE: i64 = 1_790_000_000_000;
 const ALF: &str = "00000000-0000-4000-8000-0000000000a1";
 const TEAM_SESSION: &str = "team:00000000-0000-4000-8000-0000000000a1";
@@ -638,13 +641,6 @@ fn stats_team_sums_daily_records_only_when_three_members_reported() {
     // `--since` moves the window start.
     let v = env.json(&["stats", "--team", "--since", "2019-01-01", "--json"]);
     assert_eq!(v["team"]["totals"]["shown"], 1015);
-}
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
 }
 
 /// `YYYY-MM-DD` (UTC) of a time in milliseconds.

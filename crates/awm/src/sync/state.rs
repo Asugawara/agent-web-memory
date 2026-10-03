@@ -51,6 +51,24 @@ pub fn get(conn: &Connection, key: &str) -> Result<Option<String>> {
         .optional()?)
 }
 
+/// The head of the stream `(member, device, tag)` as this device stores it: the highest idx
+/// applied or queued, -1 when there is none.
+pub fn stream_head(
+    conn: &Connection,
+    member: impl std::fmt::Display,
+    device: impl std::fmt::Display,
+    tag: &str,
+) -> Result<i64> {
+    Ok(conn
+        .query_row(
+            "SELECT head_idx FROM sync_stream WHERE member_id = ?1 AND device_id = ?2 AND tag = ?3",
+            params![member.to_string(), device.to_string(), tag],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(-1))
+}
+
 /// Writes one value.
 pub fn set(conn: &Connection, key: &str, value: &str) -> Result<()> {
     conn.execute(
@@ -223,8 +241,7 @@ mod files {
     use awm_proto::wire::{Id, Key32};
     use serde::{Deserialize, Serialize};
 
-    pub const TEAM_TOML: &str = "team.toml";
-    pub const TEAM_KEY: &str = "team.key";
+    pub use crate::paths::{TEAM_KEY, TEAM_TOML};
 
     /// `team.toml`: where the server is and who this device is.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -309,11 +326,6 @@ mod files {
 
     pub fn team_key_path(dir: &Path) -> PathBuf {
         dir.join(TEAM_KEY)
-    }
-
-    /// True when both files exist (this machine is in a team).
-    pub fn configured(dir: &Path) -> bool {
-        team_toml_path(dir).is_file() && team_key_path(dir).is_file()
     }
 
     #[cfg(unix)]
@@ -437,6 +449,12 @@ mod files {
 
         pub fn device_keys(&self) -> DeviceKeys {
             self.key.device_keys()
+        }
+
+        /// A client for the team server under this device's token (and `team.ca_file`).
+        pub fn client(&self) -> Result<crate::sync::http::Client> {
+            let ca = self.team.ca_file.as_deref().map(Path::new);
+            crate::sync::http::Client::new(&self.team.server_url, Some(&self.key.device_token), ca)
         }
 
         pub fn save_key(&self, dir: &Path) -> Result<()> {

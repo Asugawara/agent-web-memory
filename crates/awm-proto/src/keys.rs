@@ -77,10 +77,7 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Checks a handle: 1-24 characters of `[a-z0-9_-]` (plan-v3-team §4.3.5).
 pub fn valid_handle(handle: &str) -> bool {
-    (1..=24).contains(&handle.len())
-        && handle
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+    crate::wire::Handle::parse(handle).is_ok()
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1129,16 +1126,17 @@ pub struct RosterBlob {
 }
 
 impl RosterBlob {
-    fn ad(&self, org: Uuid) -> RecordAd {
-        RecordAd {
+    /// The AD this record is sealed under (the writer's own `roster` stream).
+    pub fn ad(&self, org: Uuid) -> RecordAd {
+        RecordAd::new(
             org,
-            member: self.member,
-            device: self.device,
-            tag: ROSTER_TAG.to_string(),
-            idx: self.idx,
-            record_id: self.record_id,
-            epoch: self.epoch,
-        }
+            self.member,
+            self.device,
+            ROSTER_TAG,
+            self.idx,
+            self.record_id,
+            self.epoch,
+        )
     }
 }
 
@@ -1309,12 +1307,7 @@ impl Roster {
         // The same record served twice counts once.
         sorted.dedup();
         for b in sorted {
-            let reject = |reason| RosterRejection {
-                member: b.member,
-                device: b.device,
-                idx: b.idx,
-                reason,
-            };
+            let reject = |reason| rejection(b, reason);
             let plain = match open_record(ring, &b.ad(ring.org), &b.blob) {
                 Ok(p) => p,
                 Err(_) => {
@@ -1480,7 +1473,6 @@ impl Roster {
         let RosterEntry::Approve {
             member_id,
             handle,
-            role,
             kind,
             device_id,
             device_pub,
@@ -1521,7 +1513,6 @@ impl Roster {
                         Step::Reject("member id already in the roster")
                     };
                 }
-                let _ = role;
             }
             ApprovalKind::Device => {
                 let Some(m) = self.members.get(member_id) else {

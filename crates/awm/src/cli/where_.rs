@@ -4,10 +4,7 @@ use std::path::Path;
 
 use crate::paths;
 
-/// The team files in the data directory (also `sync::state::TEAM_TOML` and `TEAM_KEY`, which
-/// exist only with the `sync` feature).
-pub const TEAM_TOML: &str = "team.toml";
-pub const TEAM_KEY: &str = "team.key";
+use crate::paths::{TEAM_KEY, TEAM_TOML};
 
 #[derive(clap::Args, Debug, Default)]
 pub struct Args {}

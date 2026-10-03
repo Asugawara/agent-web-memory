@@ -96,15 +96,7 @@ pub fn read_stdin() -> Option<HookInput> {
 
 /// `systemMessage` for a database that does not match the binary (§5.4).
 pub fn version_notice(check: VersionCheck) -> Option<String> {
-    match check {
-        VersionCheck::Current => None,
-        VersionCheck::Older { .. } => {
-            Some("agent-web-memory: database needs an upgrade. Run: awm doctor".to_string())
-        }
-        VersionCheck::Newer { db, .. } => Some(format!(
-            "agent-web-memory: database is from a newer awm ({db}). Upgrade awm."
-        )),
-    }
+    crate::db::refusal(&check).map(|why| format!("agent-web-memory: {why}"))
 }
 
 /// `{"systemMessage": ...}` only.

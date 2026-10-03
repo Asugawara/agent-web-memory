@@ -25,7 +25,7 @@ use anyhow::{bail, Context};
 use rusqlite::Connection;
 use serde_json::Value;
 
-use crate::db::{self, Role, VersionCheck};
+use crate::db::{self, Role};
 use crate::paths;
 
 /// The scaffold commands of the team work (TM1): print a message and exit with status 2.
@@ -36,19 +36,19 @@ pub(crate) fn not_implemented(command: &str) -> ! {
 
 /// Opens the existing database for a CLI command. Refuses a missing, older or newer schema.
 pub(crate) fn open_db() -> anyhow::Result<Connection> {
-    let path = paths::db_path()?;
+    open_db_in(&paths::data_dir()?, Role::Cli)
+}
+
+/// [`open_db`] for the database in `dir`, opened as `role`.
+pub(crate) fn open_db_in(dir: &Path, role: Role) -> anyhow::Result<Connection> {
+    let path = dir.join(paths::DB_FILE);
     if !path.is_file() {
         bail!("no database at {}. Run: awm init", path.display());
     }
-    let conn = db::open(&path, Role::Cli)?;
-    match db::check_version(&conn)? {
-        VersionCheck::Current => Ok(conn),
-        VersionCheck::Older { .. } => {
-            bail!("database needs an upgrade. Run: awm doctor")
-        }
-        VersionCheck::Newer { db, .. } => {
-            bail!("database is from a newer awm ({db}). Upgrade awm.")
-        }
+    let conn = db::open(&path, role)?;
+    match db::refusal(&db::check_version(&conn)?) {
+        None => Ok(conn),
+        Some(why) => bail!("{why}"),
     }
 }
 

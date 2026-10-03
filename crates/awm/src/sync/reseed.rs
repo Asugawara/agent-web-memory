@@ -83,15 +83,10 @@ fn reader_reset(s: &mut Session<'_>, status: &StatusResponse) -> Result<()> {
         .collect::<std::result::Result<_, _>>()?;
     drop(st);
     for (member, device, tag, head) in rows {
-        let server = status
-            .streams
-            .iter()
-            .find(|h| {
-                h.member.to_string() == member
-                    && h.device.to_string() == device
-                    && h.tag.as_str() == tag
-            })
-            .map_or(-1, |h| h.head);
+        let server = match (Id::parse(&member), Id::parse(&device)) {
+            (Ok(m), Ok(d)) => push::head_of(status, m, d, &tag),
+            _ => -1,
+        };
         if server < head {
             s.conn.execute(
                 "UPDATE sync_stream SET head_idx = ?4 WHERE member_id = ?1 AND device_id = ?2 AND tag = ?3",
@@ -230,15 +225,7 @@ fn resend_tombstones(s: &mut Session<'_>, status: &StatusResponse) -> Result<()>
 }
 
 fn own_server_head(status: &StatusResponse, s: &Session<'_>, tag: &str) -> i64 {
-    status
-        .streams
-        .iter()
-        .find(|h| {
-            h.member == s.ident.team.member_id
-                && h.device == s.ident.team.device_id
-                && h.tag.as_str() == tag
-        })
-        .map_or(-1, |h| h.head)
+    push::head_of(status, s.ident.team.member_id, s.ident.team.device_id, tag)
 }
 
 /// Makes the stored item (tag, idx) ready to send under the current epoch: a record whose blob

@@ -28,9 +28,12 @@ use rusqlite::{params, Connection, TransactionBehavior};
 use crate::paths;
 use crate::sync::state;
 
-/// Rows per transaction for remote deletions, retention and the full reconcile (§3.6).
+/// Rows per transaction for pulled records, remote deletions, retention and the full reconcile
+/// (§3.6). See [`Pace`] for why the writes come in short transactions with gaps.
 pub const CHUNK_ROWS: usize = 25;
-/// The lock file `awm sync` holds (the engine's `LOCK_FILE`, which exists only with `sync`).
+/// A pulled-record transaction ends after this long even with fewer than [`CHUNK_ROWS`] rows.
+pub const CHUNK_TIME: Duration = Duration::from_millis(20);
+/// The lock file `awm sync` and the commands that delete hold, in the data directory.
 pub const SYNC_LOCK: &str = "sync.lock";
 /// How long the commands that delete wait for `sync.lock` before they refuse (§3.6).
 pub const LOCK_WAIT: Duration = Duration::from_secs(10);
@@ -49,12 +52,117 @@ pub const LOCAL_ONLY: &str = "local_only.";
 
 const DAY_MS: i64 = 86_400_000;
 
-fn tombstone(tx: &Connection, id: &str, now_ms: i64) -> Result<()> {
+/// The `tool_use_id` a pulled record of sync id `id` is stored under (and tombstoned as).
+pub fn team_key(id: impl std::fmt::Display) -> String {
+    format!("team:{id}")
+}
+
+/// Writes the `team:{id}` tombstone that keeps a deleted record out of every later pull.
+pub fn tombstone_team(tx: &Connection, id: &str, now_ms: i64) -> Result<()> {
     tx.execute(
         "INSERT OR IGNORE INTO tombstone (kind, value, created_at) VALUES ('tool_use_id', ?1, ?2)",
-        params![format!("team:{id}"), now_ms],
+        params![team_key(id), now_ms],
     )?;
     Ok(())
+}
+
+/// Turns the `sync_own` item of record `id` into a marker (a re-seed pushes a marker, never the
+/// blob); returns the rows changed (0 when the id is not in this device's `sync_own`).
+pub fn mark_own_deleted(tx: &Connection, id: &str) -> Result<usize> {
+    Ok(tx.execute(
+        "UPDATE sync_own SET deleted = 1, blob = NULL, epoch = NULL WHERE record_id = ?1",
+        [id],
+    )?)
+}
+
+/// How [`run_chunked`] leaves the write lock to the hooks.
+///
+/// SQLite's write lock is unfair, and a hook gives up after 50 ms (`Role::HookRead`'s
+/// `busy_timeout` in `db.rs`), polling at 1, 3, 8, 18 and 33 ms. So a long run of writes goes in
+/// transactions of at most [`CHUNK_ROWS`] rows (and, with a time limit, [`CHUNK_TIME`]), each
+/// followed by a gap longer than one poll, in which a waiting hook takes the lock.
+#[derive(Debug, Clone, Copy)]
+pub struct Pace {
+    /// The pause after a commit that leaves rows over.
+    pub gap: Gap,
+    /// End a transaction early after this long (it always takes at least one row).
+    pub time_limit: Option<Duration>,
+}
+
+/// The pause between two transactions of [`run_chunked`].
+#[derive(Debug, Clone, Copy)]
+pub enum Gap {
+    /// Three times the transaction just committed, between 15 and 40 ms.
+    Adaptive,
+    /// This long, whatever the transaction took.
+    Fixed(Duration),
+}
+
+impl Pace {
+    /// Pulled records: [`CHUNK_TIME`] and an adaptive gap.
+    pub const RECORDS: Pace = Pace {
+        gap: Gap::Adaptive,
+        time_limit: Some(CHUNK_TIME),
+    };
+    /// Deletion entries, retention and the reconcile: rows only, a fixed 15 ms gap.
+    pub const DELETIONS: Pace = Pace {
+        gap: Gap::Fixed(Duration::from_millis(15)),
+        time_limit: None,
+    };
+
+    fn pause(self, took: Duration) -> Duration {
+        match self.gap {
+            Gap::Adaptive => (took * 3).clamp(Duration::from_millis(15), Duration::from_millis(40)),
+            Gap::Fixed(d) => d,
+        }
+    }
+}
+
+/// One transaction of [`run_chunked`].
+#[derive(Debug, Clone, Copy)]
+pub struct Chunk {
+    /// Items the transaction held.
+    pub rows: usize,
+    /// From opening the transaction to its commit.
+    pub took: Duration,
+}
+
+/// Writes `items` in `Immediate` transactions of at most [`CHUNK_ROWS`] items paced by `pace`:
+/// `each` runs for every item, `after` once per transaction with the items it held (before the
+/// commit), and the next transaction waits for the gap while items are left. Returns one
+/// [`Chunk`] per transaction.
+pub fn run_chunked<T>(
+    conn: &mut Connection,
+    items: &[T],
+    pace: Pace,
+    mut each: impl FnMut(&rusqlite::Transaction<'_>, &T) -> Result<()>,
+    mut after: impl FnMut(&rusqlite::Transaction<'_>, &[T]) -> Result<()>,
+) -> Result<Vec<Chunk>> {
+    let mut chunks = Vec::new();
+    let mut i = 0;
+    while i < items.len() {
+        let started = Instant::now();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let from = i;
+        while i < items.len() && i - from < CHUNK_ROWS {
+            each(&tx, &items[i])?;
+            i += 1;
+            if pace.time_limit.is_some_and(|t| started.elapsed() >= t) {
+                break;
+            }
+        }
+        after(&tx, &items[from..i])?;
+        tx.commit()?;
+        let took = started.elapsed();
+        chunks.push(Chunk {
+            rows: i - from,
+            took,
+        });
+        if i < items.len() {
+            std::thread::sleep(pace.pause(took));
+        }
+    }
+    Ok(chunks)
 }
 
 /// The outgoing side of one record id of this member, in the caller's transaction: the
@@ -65,14 +173,11 @@ fn tombstone(tx: &Connection, id: &str, now_ms: i64) -> Result<()> {
 /// server never stored is pre-deleted (`docs/sync-v1.md` §10.3), so a batch still in flight
 /// gets 410.
 pub fn own_deletion(tx: &Connection, id: &str, now_ms: i64, queue: bool) -> Result<()> {
-    let own = tx.execute(
-        "UPDATE sync_own SET deleted = 1, blob = NULL, epoch = NULL WHERE record_id = ?1",
-        [id],
-    )?;
+    let own = mark_own_deleted(tx, id)?;
     if own == 0 {
         state::set(tx, &format!("{OWN_DELETED}{id}"), &now_ms.to_string())?;
     }
-    tombstone(tx, id, now_ms)?;
+    tombstone_team(tx, id, now_ms)?;
     if queue {
         tx.execute(
             "INSERT INTO sync_outbox (kind, ref, created_at) SELECT 'delete', ?1, ?2 \
@@ -114,11 +219,8 @@ pub struct Applied {
 pub fn deletions(tx: &Connection, ids: &[String], now_ms: i64) -> Result<Applied> {
     let mut a = Applied::default();
     for id in ids {
-        tombstone(tx, id, now_ms)?;
-        tx.execute(
-            "UPDATE sync_own SET deleted = 1, blob = NULL, epoch = NULL WHERE record_id = ?1",
-            [id],
-        )?;
+        tombstone_team(tx, id, now_ms)?;
+        mark_own_deleted(tx, id)?;
         let own = tx.execute(
             "UPDATE event SET shareable = 'never' WHERE sync_id = ?1 AND origin = 'local'",
             [id],
@@ -145,25 +247,22 @@ pub fn drop_team_rows(
     sizes: &mut Vec<usize>,
 ) -> Result<usize> {
     let before = before_ms.unwrap_or(i64::MAX);
+    let ids: Vec<i64> = conn
+        .prepare("SELECT id FROM event WHERE origin = 'team' AND created_at < ?1 ORDER BY id")?
+        .query_map([before], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
     let mut total = 0;
-    loop {
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let n = tx.execute(
-            "DELETE FROM event WHERE id IN \
-               (SELECT id FROM event WHERE origin = 'team' AND created_at < ?1 LIMIT ?2)",
-            params![before, CHUNK_ROWS as i64],
-        )?;
-        tx.commit()?;
-        if n == 0 {
-            break;
-        }
-        sizes.push(n);
-        total += n;
-        if n < CHUNK_ROWS {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(15));
-    }
+    let chunks = run_chunked(
+        conn,
+        &ids,
+        Pace::DELETIONS,
+        |tx, id| {
+            total += tx.execute("DELETE FROM event WHERE id = ?1", [id])?;
+            Ok(())
+        },
+        |_, _| Ok(()),
+    )?;
+    sizes.extend(chunks.iter().map(|c| c.rows));
     Ok(total)
 }
 
@@ -275,9 +374,8 @@ pub fn resend_ids(conn: &Connection, since_ms: i64, admin: bool) -> Result<Vec<S
     Ok(ids)
 }
 
-/// Takes `sync.lock` for a command that deletes, waiting up to [`LOCK_WAIT`] for a running
-/// `awm sync`, then refusing (§3.6). The lock is released when the file is dropped.
-pub fn lock_sync(data_dir: &Path) -> Result<std::fs::File> {
+/// Opens (creating it, mode 0600) `sync.lock` in `data_dir`, not yet locked.
+fn open_lock(data_dir: &Path) -> Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).truncate(false).write(true);
     #[cfg(unix)]
@@ -285,9 +383,25 @@ pub fn lock_sync(data_dir: &Path) -> Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let f = opts
-        .open(data_dir.join(SYNC_LOCK))
-        .context("cannot open sync.lock")?;
+    opts.open(data_dir.join(SYNC_LOCK))
+        .context("cannot open sync.lock")
+}
+
+/// Takes `sync.lock` for `awm sync` without waiting; `None` when another process holds it.
+#[cfg(feature = "sync")]
+pub fn take_lock(data_dir: &Path) -> Result<Option<std::fs::File>> {
+    let f = open_lock(data_dir)?;
+    match f.try_lock() {
+        Ok(()) => Ok(Some(f)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e).context("cannot take sync.lock"),
+    }
+}
+
+/// Takes `sync.lock` for a command that deletes, waiting up to [`LOCK_WAIT`] for a running
+/// `awm sync`, then refusing (§3.6). The lock is released when the file is dropped.
+pub fn lock_sync(data_dir: &Path) -> Result<std::fs::File> {
+    let f = open_lock(data_dir)?;
     let start = Instant::now();
     loop {
         match f.try_lock() {
@@ -311,36 +425,11 @@ pub fn lock_sync(data_dir: &Path) -> Result<std::fs::File> {
 #[cfg(feature = "sync")]
 pub fn send_queued(data_dir: &Path) -> Result<usize> {
     use crate::db::{self, Role};
-    use crate::sync::http::Client;
-    use crate::sync::state::Identity;
-    use crate::sync::{push, Env, Opts, Report, Session};
+    use crate::sync::{push, state::Identity};
 
-    let config = crate::config::load(&data_dir.join(paths::CONFIG_FILE))?;
-    let env = Env {
-        data_dir: data_dir.to_path_buf(),
-        config,
-        now_ms: None,
-    };
-    let opts = Opts::default();
-    let ident = Identity::load(data_dir)?;
-    let ring = ident.ring()?;
-    let ca = ident.team.ca_file.as_deref().map(Path::new);
-    let client = Client::new(&ident.team.server_url, Some(&ident.key.device_token), ca)?;
+    let client = Identity::load(data_dir)?.client()?;
     let conn = db::open(&data_dir.join(paths::DB_FILE), Role::Sync)?;
-    let mut s = Session {
-        env: &env,
-        opts: &opts,
-        device: ident.device_keys(),
-        conn,
-        ident,
-        ring,
-        client,
-        status: None,
-        roster: awm_proto::keys::Roster::default(),
-        keys_refreshed: false,
-        report: Report::default(),
-    };
-    push::deletions(&mut s)
+    push::deletions(&conn, &client)
 }
 
 #[cfg(test)]

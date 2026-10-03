@@ -6,7 +6,6 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use awm::capture::{self, CaptureOpts};
 use awm::config::{Config, ShortCircuitMode};
@@ -17,21 +16,14 @@ use awm::note::Relation;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
+mod support;
+use support::now_ms;
+
 const MIN_MS: i64 = 60_000;
 const HOUR_MS: i64 = 60 * MIN_MS;
 const OWN: &str = "11111111-1111-4111-8111-111111111111";
 const ALF: &str = "22222222-2222-4222-8222-222222222222";
 const QUERY: &str = "SQLite FTS5 bm25 column weights";
-
-fn now_ms() -> i64 {
-    i64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis(),
-    )
-    .unwrap()
-}
 
 fn fixture(name: &str) -> Value {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))

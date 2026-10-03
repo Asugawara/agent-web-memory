@@ -278,7 +278,7 @@ pub fn build(rec: &Record, ctx: &ShareCtx) -> Result<Payload> {
     let repo_key = ctx
         .repo_key
         .clone()
-        .filter(|k| full && k.len() == 32 && k.bytes().all(|b| b.is_ascii_hexdigit()));
+        .filter(|k| full && crate::team::is_repo_key(k));
 
     let mut p = RecPlaintext {
         schema: SCHEMA,

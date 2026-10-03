@@ -44,6 +44,7 @@ impl Role {
     /// `busy_timeout` for this role (assumptions, plan-v2 §5.4 and §6.1).
     pub fn busy_timeout(self) -> Duration {
         match self {
+            // The team writers pace their transactions against this: `Pace` in `apply.rs`.
             Role::HookRead => Duration::from_millis(50),
             Role::Capture | Role::Sync => Duration::from_millis(2_000),
             Role::Cli => Duration::from_millis(5_000),
@@ -72,6 +73,28 @@ pub enum VersionCheck {
     Current,
     Older { db: u32, bin: u32 },
     Newer { db: u32, bin: u32 },
+}
+
+/// Whether `tombstone` holds `(kind, value)`.
+pub fn is_tombstoned(conn: &Connection, kind: &str, value: &str) -> rusqlite::Result<bool> {
+    Ok(conn
+        .prepare_cached("SELECT 1 FROM tombstone WHERE kind = ?1 AND value = ?2")?
+        .query_row([kind, value], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
+/// The one-line refusal for a database that does not match the binary; `None` when current.
+pub fn refusal(check: &VersionCheck) -> Option<String> {
+    match check {
+        VersionCheck::Current => None,
+        VersionCheck::Older { .. } => {
+            Some("database needs an upgrade. Run: awm doctor".to_string())
+        }
+        VersionCheck::Newer { db, .. } => {
+            Some(format!("database is from a newer awm ({db}). Upgrade awm."))
+        }
+    }
 }
 
 /// Opens the database at `path` and sets the connection pragmas.

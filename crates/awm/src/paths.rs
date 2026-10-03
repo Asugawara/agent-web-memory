@@ -47,6 +47,22 @@ pub fn db_path() -> anyhow::Result<PathBuf> {
     Ok(data_dir()?.join(DB_FILE))
 }
 
+/// The team files in the data directory.
+pub const TEAM_TOML: &str = "team.toml";
+pub const TEAM_KEY: &str = "team.key";
+
+/// True when `team.toml` and `team.key` are both in `dir` (this machine is in a team).
+pub fn team_configured(dir: &Path) -> bool {
+    dir.join(TEAM_TOML).is_file() && dir.join(TEAM_KEY).is_file()
+}
+
+/// The member id in `team.toml`, read without the `sync` feature; `None` outside a team.
+pub fn team_member_id(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join(TEAM_TOML)).ok()?;
+    let table = text.parse::<toml::Table>().ok()?;
+    table.get("member_id")?.as_str().map(str::to_string)
+}
+
 /// `{data_dir}/config.toml`.
 pub fn config_path() -> anyhow::Result<PathBuf> {
     Ok(data_dir()?.join(CONFIG_FILE))

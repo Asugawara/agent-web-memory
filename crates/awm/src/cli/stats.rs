@@ -790,14 +790,6 @@ fn item_cost(p: &crate::config::Pricing, fetch: bool, bytes: i64, tokens: f64) -
     }
 }
 
-/// This machine's member id from `team.toml`; `None` outside a team.
-pub(crate) fn own_member_id() -> Option<String> {
-    let dir = crate::paths::data_dir().ok()?;
-    let text = std::fs::read_to_string(dir.join(super::where_::TEAM_TOML)).ok()?;
-    let v: toml::Value = toml::from_str(&text).ok()?;
-    v.get("member_id")?.as_str().map(str::to_string)
-}
-
 /// Item sums of one origin (or of everything): the fields of `stats --savings`.
 #[derive(Default, Clone)]
 struct Acc {
@@ -887,7 +879,7 @@ fn savings_core(
     since_ms: Option<i64>,
     until_ms: Option<i64>,
 ) -> anyhow::Result<SavingsCore> {
-    let own = own_member_id();
+    let own = crate::matching::own_member_id();
     let all = load_calls(conn)?;
     let by_id: HashMap<i64, &Call> = all.iter().map(|c| (c.id, c)).collect();
     let calls: Vec<&Call> = all.iter().filter(|c| c.local).collect();
@@ -1729,7 +1721,7 @@ pub fn queue_daily_record(env: &crate::sync::Env) -> anyhow::Result<usize> {
     use crate::sync::{push, state};
 
     let dir = &env.data_dir;
-    if !env.config.team.share_stats || !state::configured(dir) {
+    if !env.config.team.share_stats || !crate::paths::team_configured(dir) {
         return Ok(0);
     }
     let mut conn = db::open(&dir.join(crate::paths::DB_FILE), Role::Cli)?;

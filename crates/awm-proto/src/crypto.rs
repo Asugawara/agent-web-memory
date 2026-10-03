@@ -206,6 +206,28 @@ pub struct RecordAd {
 }
 
 impl RecordAd {
+    /// The AD of the record `record_id` at `idx` of the stream `(member, device, tag)` of
+    /// organisation `org`, sealed under `epoch`.
+    pub fn new(
+        org: Uuid,
+        member: Uuid,
+        device: Uuid,
+        tag: &str,
+        idx: u64,
+        record_id: Uuid,
+        epoch: u32,
+    ) -> RecordAd {
+        RecordAd {
+            org,
+            member,
+            device,
+            tag: tag.to_string(),
+            idx,
+            record_id,
+            epoch,
+        }
+    }
+
     /// The canonical AD bytes. Fixed-width fields and a length-prefixed tag make the
     /// encoding injective.
     pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {

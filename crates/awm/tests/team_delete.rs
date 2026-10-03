@@ -12,49 +12,17 @@
 
 #![cfg(all(feature = "sync", feature = "serve"))]
 
-use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use awm::db::{self, Role};
-use awm::record::sha256_hex;
-use awm::sync::http::own_version;
-use awm::sync::state::{self, Identity};
+use awm::sync::state;
 use awm::sync::{Env, Opts, Outcome, Report};
-use awm_server::auth;
-use awm_server::http::embedded::{self, Embedded};
-use awm_server::http::{AppState, LogSink, ServerConfig};
-use awm_server::store::sqlite::SqliteStore;
-use awm_server::store::Store;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, OptionalExtension};
+
+mod support;
+use support::{contains, now_ms, Node, Out, Srv};
 
 // ---------------------------------------------------------------------------------------------
-// The server
-
-#[derive(Default)]
-struct Capture(Mutex<Vec<String>>);
-
-impl LogSink for Capture {
-    fn line(&self, line: &str) {
-        self.0.lock().unwrap().push(line.to_string());
-    }
-}
-
-fn unix_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
-}
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
-}
+// The server and a machine: `support::Srv` and `support::Node`, plus what only this suite asks
 
 const DAY_MS: i64 = 86_400_000;
 
@@ -66,112 +34,7 @@ fn utc_date(ms: i64) -> String {
     format!("{:04}-{:02}-{:02}", d.year(), u8::from(d.month()), d.day())
 }
 
-fn server_config(records_per_day: u32) -> ServerConfig {
-    let v = own_version();
-    let mut c = ServerConfig::new(v.clone(), v);
-    c.limits.records_per_day = records_per_day;
-    c.limits.requests_per_minute = 1_000_000;
-    c.limits.request_burst = 1_000_000;
-    c.limits.anonymous_per_minute = 1_000_000;
-    c.limits.joins_per_hour = 1_000;
-    c
-}
-
-const QUOTA: u32 = 1_000_000;
-
-struct Srv {
-    store: Arc<SqliteStore>,
-    emb: Option<Embedded>,
-    addr: SocketAddr,
-    dir: tempfile::TempDir,
-    logs: Arc<Capture>,
-    snaps: usize,
-}
-
 impl Srv {
-    fn start() -> Srv {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(SqliteStore::open(&dir.path().join("data")).unwrap());
-        let logs = Arc::new(Capture::default());
-        let emb = embedded::spawn(Srv::state(&store, &logs, QUOTA)).unwrap();
-        Srv {
-            store,
-            addr: emb.addr(),
-            emb: Some(emb),
-            dir,
-            logs,
-            snaps: 0,
-        }
-    }
-
-    fn state(store: &Arc<SqliteStore>, logs: &Arc<Capture>, quota: u32) -> AppState {
-        AppState::new(store.clone() as Arc<dyn Store>, server_config(quota))
-            .with_log_sink(logs.clone())
-    }
-
-    fn url(&self) -> String {
-        format!("http://{}", self.addr)
-    }
-
-    fn stop(&mut self) {
-        if let Some(mut e) = self.emb.take() {
-            e.stop();
-        }
-    }
-
-    /// Starts the stopped server again on the same address, with a daily record quota. The
-    /// address can stay busy for a moment after `stop()` under load, so binding is retried up
-    /// to 20 times, 100 ms apart.
-    fn resume_with(&mut self, quota: u32) {
-        let mut attempt = 0;
-        let emb = loop {
-            attempt += 1;
-            match embedded::spawn_on(self.addr, Srv::state(&self.store, &self.logs, quota)) {
-                Ok(emb) => break emb,
-                Err(e) if attempt >= 20 => panic!("cannot bind {} again: {e}", self.addr),
-                Err(_) => std::thread::sleep(Duration::from_millis(100)),
-            }
-        };
-        self.emb = Some(emb);
-    }
-
-    fn resume(&mut self) {
-        self.resume_with(QUOTA);
-    }
-
-    fn snapshot(&mut self) -> PathBuf {
-        self.snaps += 1;
-        let dest = self.dir.path().join(format!("snap-{}.db", self.snaps));
-        embedded::block_on(self.store.snapshot(dest.clone())).unwrap();
-        dest
-    }
-
-    /// Replaces the server with the copy in `snap` under a new generation, as `awm serve
-    /// restore` does (sync-v1 §11).
-    fn restore(&mut self, snap: &Path) {
-        self.stop();
-        let data = self.dir.path().join("data");
-        for f in ["server.db", "server.db-wal", "server.db-shm"] {
-            let _ = std::fs::remove_file(data.join(f));
-        }
-        std::fs::copy(snap, data.join("server.db")).unwrap();
-        let store = Arc::new(SqliteStore::open(&data).unwrap());
-        embedded::block_on(store.renew_generation(unix_secs())).unwrap();
-        self.store = store;
-        self.resume();
-    }
-
-    fn bootstrap_token(&self) -> String {
-        embedded::block_on(auth::issue_bootstrap(&*self.store, unix_secs()))
-            .unwrap()
-            .as_str()
-            .to_string()
-    }
-
-    fn log_text(&self) -> String {
-        self.logs.0.lock().unwrap().join("\n")
-    }
-
     /// Requests to `POST /v1/delete` in the log.
     fn delete_requests(&self) -> usize {
         self.logs
@@ -181,36 +44,6 @@ impl Srv {
             .iter()
             .filter(|l| l.contains("method=POST path=/v1/delete "))
             .count()
-    }
-
-    fn db_path(&self) -> PathBuf {
-        self.dir.path().join("data").join("server.db")
-    }
-
-    fn db_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        for suffix in ["", "-wal", "-shm"] {
-            let p = PathBuf::from(format!("{}{suffix}", self.db_path().display()));
-            if let Ok(b) = std::fs::read(&p) {
-                out.extend(b);
-            }
-        }
-        out
-    }
-
-    fn raw(&self) -> Connection {
-        let c = Connection::open(self.db_path()).unwrap();
-        c.busy_timeout(Duration::from_secs(5)).unwrap();
-        c
-    }
-
-    fn deleted_ids(&self) -> Vec<String> {
-        embedded::block_on(self.store.deletions(0, 5_000))
-            .unwrap()
-            .entries
-            .iter()
-            .map(|e| e.record_id.to_string())
-            .collect()
     }
 
     /// Whether the server holds the blob of record `id` (not a marker, not unknown).
@@ -239,95 +72,7 @@ impl Srv {
     }
 }
 
-fn contains(hay: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
-}
-
-// ---------------------------------------------------------------------------------------------
-// A machine
-
-struct Out {
-    code: Option<i32>,
-    stdout: String,
-    stderr: String,
-}
-
-impl Out {
-    fn all(&self) -> String {
-        format!("{}\n{}", self.stdout, self.stderr)
-    }
-}
-
-struct Node {
-    dir: tempfile::TempDir,
-    home: tempfile::TempDir,
-}
-
 impl Node {
-    fn new() -> Node {
-        let dir = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let mut conn = db::open(&dir.path().join("awm.db"), Role::Cli).unwrap();
-        db::migrate(&mut conn).unwrap();
-        // The project lives outside the data directory, so `purge --all` finds only awm's files.
-        std::fs::create_dir_all(home.path().join("proj")).unwrap();
-        Node { dir, home }
-    }
-
-    /// A copy of `other`'s data directory taken now (the same device, as a process that read
-    /// its state earlier sees it).
-    fn copy_of(other: &Node) -> Node {
-        let dir = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        for e in std::fs::read_dir(other.path()).unwrap().flatten() {
-            if e.file_type().unwrap().is_file() {
-                std::fs::copy(e.path(), dir.path().join(e.file_name())).unwrap();
-            }
-        }
-        std::fs::create_dir_all(home.path().join("proj")).unwrap();
-        Node { dir, home }
-    }
-
-    fn path(&self) -> &Path {
-        self.dir.path()
-    }
-
-    fn project(&self) -> PathBuf {
-        std::fs::canonicalize(self.home.path().join("proj")).unwrap()
-    }
-
-    fn run(&self, args: &[&str]) -> Out {
-        let o = Command::new(env!("CARGO_BIN_EXE_awm"))
-            .args(args)
-            .env("AWM_HOME", self.path())
-            .env("HOME", self.home.path())
-            .env_remove("CODEX_HOME")
-            .env_remove("AWM_DEBUG")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .unwrap();
-        Out {
-            code: o.status.code(),
-            stdout: String::from_utf8(o.stdout).unwrap(),
-            stderr: String::from_utf8(o.stderr).unwrap(),
-        }
-    }
-
-    #[track_caller]
-    fn ok(&self, args: &[&str]) -> String {
-        let o = self.run(args);
-        assert_eq!(
-            o.code,
-            Some(0),
-            "awm {args:?} failed\nstdout: {}\nstderr: {}",
-            o.stdout,
-            o.stderr
-        );
-        o.stdout
-    }
-
     #[track_caller]
     fn refused(&self, args: &[&str]) -> Out {
         let o = self.run(args);
@@ -340,58 +85,12 @@ impl Node {
         o
     }
 
-    fn conn(&self) -> Connection {
-        db::open(&self.path().join("awm.db"), Role::Cli).unwrap()
-    }
-
-    fn ident(&self) -> Identity {
-        Identity::load(self.path()).unwrap()
-    }
-
     fn member(&self) -> String {
         self.ident().team.member_id.to_string()
     }
 
-    fn count(&self, sql: &str) -> i64 {
-        self.conn().query_row(sql, [], |r| r.get(0)).unwrap()
-    }
-
-    fn state(&self, key: &str) -> Option<String> {
-        state::get(&self.conn(), key).unwrap()
-    }
-
     fn set_state(&self, key: &str, value: &str) {
         state::set(&self.conn(), key, value).unwrap();
-    }
-
-    /// A local WebFetch row in this machine's project, captured now; returns its `event.id`.
-    fn capture(&self, n: u32, url: &str, summary: &str) -> i64 {
-        let conn = self.conn();
-        let norm = awm::normalize::norm_url(url).unwrap();
-        conn.execute(
-            "INSERT INTO event (tool_use_id, tool, session_id, cwd_hash, created_at, url, url_norm, \
-               fetch_prompt, status, summary, match_text, source) \
-             VALUES (?1, 'WebFetch', 'sess-private', ?2, ?3, ?4, ?5, 'what does it say', 'ok', ?6, ?7, 'hook')",
-            params![
-                format!("toolu_{}_{n}", self.path().display()),
-                sha256_hex(&self.project().to_string_lossy()),
-                now_ms(),
-                url,
-                norm,
-                summary,
-                format!("{url} {summary}"),
-            ],
-        )
-        .unwrap();
-        conn.last_insert_rowid()
-    }
-
-    fn sync_id(&self, event: i64) -> String {
-        self.conn()
-            .query_row("SELECT sync_id FROM event WHERE id = ?1", [event], |r| {
-                r.get(0)
-            })
-            .unwrap()
     }
 
     /// The local row of record id `id`, if any: (event id, origin).
@@ -457,7 +156,7 @@ impl Node {
 // Flows (the same commands a user types)
 
 fn create(srv: &Srv, handle: &str) -> Node {
-    let n = Node::new();
+    let n = Node::new_apart();
     let out = n.ok(&[
         "team",
         "create",
@@ -491,7 +190,7 @@ fn code_of(join_out: &str) -> String {
 /// A new member's machine, approved by `admin` with the code, synced once.
 fn member(srv: &Srv, admin: &Node, handle: &str) -> Node {
     let t = token_of(srv, &admin.ok(&["team", "invite", "--handle", handle]));
-    let n = Node::new();
+    let n = Node::new_apart();
     let out = n.ok(&["team", "join", &srv.url(), "--token", &t]);
     let code = code_of(&out);
     admin.ok(&["team", "approve", handle, "--code", &code]);
@@ -503,7 +202,7 @@ fn member(srv: &Srv, admin: &Node, handle: &str) -> Node {
 /// (`team.auto_approve = none`, the default since RVT2 m3).
 fn other_machine(srv: &Srv, owner: &Node) -> Node {
     let t = token_of(srv, &owner.ok(&["team", "add-device"]));
-    let n = Node::new();
+    let n = Node::new_apart();
     let out = n.ok(&["team", "join", &srv.url(), "--token", &t]);
     let handle = owner.ident().team.handle;
     owner.ok(&["team", "approve", &handle, "--code", &code_of(&out)]);

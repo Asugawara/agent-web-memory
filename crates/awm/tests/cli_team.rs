@@ -11,160 +11,29 @@
 
 #![cfg(all(feature = "sync", feature = "serve"))]
 
-use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
-
-use awm::db::{self, Role};
 use awm::record::sha256_hex;
 use awm::sync::http::{own_version, Client};
-use awm::sync::state::{self, Identity, PendingInvite, TeamKey, TeamToml};
+use awm::sync::state::{self, PendingInvite, TeamKey, TeamToml};
 use awm_proto::crypto::{open_record, seal_record, RecordAd, Secret32};
 use awm_proto::keys::{self, EpochKey, Invite, KeyRing, RepoKey, RosterEntry};
 use awm_proto::wire::{
     Handle, Id, InviteKind, Key32, PendingDevice, Role as WireRole, RosterPlaintext,
     SettingsUpdate, Tag, B64,
 };
-use awm_server::auth;
-use awm_server::http::embedded::{self, Embedded};
-use awm_server::http::{AppState, LogSink, ServerConfig};
-use awm_server::store::sqlite::SqliteStore;
+use awm_server::http::embedded;
 use awm_server::store::Store;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 
 mod support;
-use support::{bare, coded, Proxy};
+use support::{bare, coded, contains, now_ms, unix_secs, Node, Proxy, Srv};
 
 // ---------------------------------------------------------------------------------------------
-// The server
-
-#[derive(Default)]
-struct Capture(Mutex<Vec<String>>);
-
-impl LogSink for Capture {
-    fn line(&self, line: &str) {
-        self.0.lock().unwrap().push(line.to_string());
-    }
-}
-
-fn unix_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
-}
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
-}
-
-struct Srv {
-    store: Arc<SqliteStore>,
-    emb: Option<Embedded>,
-    addr: SocketAddr,
-    dir: tempfile::TempDir,
-    logs: Arc<Capture>,
-}
-
-fn server_config() -> ServerConfig {
-    let v = own_version();
-    let mut c = ServerConfig::new(v.clone(), v);
-    c.limits.records_per_day = 1_000_000;
-    c.limits.requests_per_minute = 1_000_000;
-    c.limits.request_burst = 1_000_000;
-    c.limits.anonymous_per_minute = 1_000_000;
-    c.limits.joins_per_hour = 1_000;
-    c
-}
+// The server and a machine: `support::Srv` and `support::Node`, plus what only this suite asks
 
 impl Srv {
-    fn start() -> Srv {
-        Srv::start_from(None)
-    }
-
-    /// A server, optionally on a copy of another server's canonical export (`team move`).
-    fn start_from(db: Option<&Path>) -> Srv {
-        let dir = tempfile::tempdir().unwrap();
-        let data = dir.path().join("data");
-        if let Some(src) = db {
-            std::fs::create_dir_all(&data).unwrap();
-            std::fs::copy(src, data.join("server.db")).unwrap();
-        }
-        let store = Arc::new(SqliteStore::open(&data).unwrap());
-        if db.is_some() {
-            embedded::block_on(store.renew_generation(unix_secs())).unwrap();
-        }
-        let logs = Arc::new(Capture::default());
-        let emb = embedded::spawn(Srv::state(&store, &logs)).unwrap();
-        Srv {
-            store,
-            addr: emb.addr(),
-            emb: Some(emb),
-            dir,
-            logs,
-        }
-    }
-
-    fn state(store: &Arc<SqliteStore>, logs: &Arc<Capture>) -> AppState {
-        AppState::new(store.clone() as Arc<dyn Store>, server_config()).with_log_sink(logs.clone())
-    }
-
-    fn url(&self) -> String {
-        format!("http://{}", self.addr)
-    }
-
-    fn stop(&mut self) {
-        if let Some(mut e) = self.emb.take() {
-            e.stop();
-        }
-    }
-
-    fn resume(&mut self) {
-        let emb = embedded::spawn_on(self.addr, Srv::state(&self.store, &self.logs)).unwrap();
-        self.emb = Some(emb);
-    }
-
-    fn bootstrap_token(&self) -> String {
-        embedded::block_on(auth::issue_bootstrap(&*self.store, unix_secs()))
-            .unwrap()
-            .as_str()
-            .to_string()
-    }
-
-    fn log_text(&self) -> String {
-        self.logs.0.lock().unwrap().join("\n")
-    }
-
     fn log_len(&self) -> usize {
         self.logs.0.lock().unwrap().len()
-    }
-
-    fn db_path(&self) -> PathBuf {
-        self.dir.path().join("data").join("server.db")
-    }
-
-    /// The bytes of the server database and its WAL and shared-memory files.
-    fn db_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        for suffix in ["", "-wal", "-shm"] {
-            let p = PathBuf::from(format!("{}{suffix}", self.db_path().display()));
-            if let Ok(b) = std::fs::read(&p) {
-                out.extend(b);
-            }
-        }
-        out
-    }
-
-    /// A direct connection to the server database (a compromised host).
-    fn raw(&self) -> Connection {
-        let c = Connection::open(self.db_path()).unwrap();
-        c.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
-        c
     }
 
     fn roster_head(&self, member: Id, device: Id) -> i64 {
@@ -173,15 +42,6 @@ impl Srv {
                 .stream_head(member, device, Tag::parse("roster").unwrap()),
         )
         .unwrap()
-    }
-
-    fn deleted_ids(&self) -> Vec<String> {
-        embedded::block_on(self.store.deletions(0, 5_000))
-            .unwrap()
-            .entries
-            .iter()
-            .map(|e| e.record_id.to_string())
-            .collect()
     }
 
     fn wrap_epochs(&self, device: Id) -> Vec<u32> {
@@ -204,103 +64,7 @@ impl Srv {
     }
 }
 
-fn contains(hay: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
-}
-
-// ---------------------------------------------------------------------------------------------
-// A machine
-
-struct Out {
-    code: Option<i32>,
-    stdout: String,
-    stderr: String,
-}
-
-struct Node {
-    dir: tempfile::TempDir,
-    home: tempfile::TempDir,
-}
-
 impl Node {
-    fn new() -> Node {
-        let dir = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let mut conn = db::open(&dir.path().join("awm.db"), Role::Cli).unwrap();
-        db::migrate(&mut conn).unwrap();
-        std::fs::create_dir_all(dir.path().join("proj")).unwrap();
-        Node { dir, home }
-    }
-
-    fn path(&self) -> &Path {
-        self.dir.path()
-    }
-
-    fn project(&self) -> PathBuf {
-        std::fs::canonicalize(self.path().join("proj")).unwrap()
-    }
-
-    fn run(&self, args: &[&str]) -> Out {
-        let o = Command::new(env!("CARGO_BIN_EXE_awm"))
-            .args(args)
-            .env("AWM_HOME", self.path())
-            .env("HOME", self.home.path())
-            .env_remove("CODEX_HOME")
-            .env_remove("AWM_DEBUG")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .unwrap();
-        Out {
-            code: o.status.code(),
-            stdout: String::from_utf8(o.stdout).unwrap(),
-            stderr: String::from_utf8(o.stderr).unwrap(),
-        }
-    }
-
-    /// Runs with `input` on stdin.
-    fn run_stdin(&self, args: &[&str], input: &str) -> Out {
-        use std::io::Write;
-        let mut child = Command::new(env!("CARGO_BIN_EXE_awm"))
-            .args(args)
-            .env("AWM_HOME", self.path())
-            .env("HOME", self.home.path())
-            .env_remove("CODEX_HOME")
-            .env_remove("AWM_DEBUG")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
-        let o = child.wait_with_output().unwrap();
-        Out {
-            code: o.status.code(),
-            stdout: String::from_utf8(o.stdout).unwrap(),
-            stderr: String::from_utf8(o.stderr).unwrap(),
-        }
-    }
-
-    /// Runs and requires exit 0; returns stdout.
-    #[track_caller]
-    fn ok(&self, args: &[&str]) -> String {
-        let o = self.run(args);
-        assert_eq!(
-            o.code,
-            Some(0),
-            "awm {args:?} failed\nstdout: {}\nstderr: {}",
-            o.stdout,
-            o.stderr
-        );
-        o.stdout
-    }
-
     /// Runs and requires a failure; returns stderr.
     #[track_caller]
     fn refused(&self, args: &[&str]) -> String {
@@ -318,58 +82,12 @@ impl Node {
         serde_json::from_str(&self.ok(args)).unwrap()
     }
 
-    fn conn(&self) -> Connection {
-        db::open(&self.path().join("awm.db"), Role::Cli).unwrap()
-    }
-
-    fn ident(&self) -> Identity {
-        Identity::load(self.path()).unwrap()
-    }
-
     fn member(&self) -> Id {
         self.ident().team.member_id
     }
 
     fn device(&self) -> Id {
         self.ident().team.device_id
-    }
-
-    fn count(&self, sql: &str) -> i64 {
-        self.conn().query_row(sql, [], |r| r.get(0)).unwrap()
-    }
-
-    fn state(&self, key: &str) -> Option<String> {
-        state::get(&self.conn(), key).unwrap()
-    }
-
-    /// A local WebFetch row in this machine's project, captured now; returns its `event.id`.
-    fn capture(&self, n: u32, url: &str, summary: &str) -> i64 {
-        let conn = self.conn();
-        let norm = awm::normalize::norm_url(url).unwrap();
-        conn.execute(
-            "INSERT INTO event (tool_use_id, tool, session_id, cwd_hash, created_at, url, url_norm, \
-               fetch_prompt, status, summary, match_text, source) \
-             VALUES (?1, 'WebFetch', 'sess-private', ?2, ?3, ?4, ?5, 'what does it say', 'ok', ?6, ?7, 'hook')",
-            params![
-                format!("toolu_{}_{n}", self.path().display()),
-                sha256_hex(&self.project().to_string_lossy()),
-                now_ms(),
-                url,
-                norm,
-                summary,
-                format!("{url} {summary}"),
-            ],
-        )
-        .unwrap();
-        conn.last_insert_rowid()
-    }
-
-    fn sync_id(&self, event: i64) -> String {
-        self.conn()
-            .query_row("SELECT sync_id FROM event WHERE id = ?1", [event], |r| {
-                r.get(0)
-            })
-            .unwrap()
     }
 
     fn mode(&self, file: &str) -> u32 {

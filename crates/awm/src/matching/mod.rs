@@ -246,7 +246,7 @@ pub fn to_note(conn: &Connection, hit: &Hit, opts: &MatchOpts) -> Result<Note> {
 }
 
 /// [`to_note`] where the caller's own member id is known: the `member` of `team.toml`, read
-/// only when the record is a team row and `own_member` is `None`.
+/// only when the record is a team row and `own_member` is `None`. The tests inject the id.
 pub fn to_note_as(
     conn: &Connection,
     hit: &Hit,
@@ -367,10 +367,7 @@ pub fn to_note_as(
 
 /// The caller's member id from `team.toml` (read without the `sync` feature); `None` outside a team.
 pub fn own_member_id() -> Option<String> {
-    let dir = crate::paths::data_dir().ok()?;
-    let text = std::fs::read_to_string(dir.join("team.toml")).ok()?;
-    let table = text.parse::<toml::Table>().ok()?;
-    table.get("member_id")?.as_str().map(str::to_string)
+    crate::paths::team_member_id(&crate::paths::data_dir().ok()?)
 }
 
 /// Relation of a team row (§3.5): the caller's other machine, or a teammate with the handle of
