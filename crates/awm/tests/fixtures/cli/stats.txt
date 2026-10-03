@@ -22,9 +22,6 @@ injections:
     url: 1
   shown_by_day:
     2026-09-21: 1
-  would_have_shown: 1
-  would_have_shown_by_channel:
-    query: 1
 query_deny:
   by_age:
     within_24_h: 0
@@ -37,6 +34,7 @@ query_deny:
     other_project: 0
     other_session_project_unknown: 0
     other_session_same_project: 0
+    same_agent: 0
     sibling: 0
   denied: 0
   labels:
@@ -49,4 +47,3 @@ query_deny:
     denies: 0
     researched: 0
     share: -
-  shadow: 0

@@ -7,14 +7,15 @@ fn defaults_match_the_plan() {
     assert_eq!(c.get("notify").unwrap(), "first");
     assert!(c.channels.url && c.channels.query && c.channels.prompt_url);
     assert_eq!(c.channels.prompt_bm25, PromptBm25::Off);
-    assert_eq!(c.short_circuit.mode, ShortCircuitMode::Shadow);
-    assert_eq!(c.short_circuit.window_minutes, 30);
-    assert!(!c.short_circuit.subagents);
-    assert_eq!(c.short_circuit.query, ShortCircuitMode::Shadow);
-    assert_eq!(c.short_circuit.query_window_minutes, 1440);
-    assert_eq!(c.get("short_circuit.query").unwrap(), "shadow");
-    assert_eq!(c.get("short_circuit.query_window_minutes").unwrap(), "1440");
-    assert_eq!((c.inject.max_notes, c.inject.max_per_agent), (3, 10));
+    assert_eq!(c.short_circuit.mode, ShortCircuitMode::On);
+    assert_eq!(c.short_circuit.window_days, 7);
+    assert_eq!(c.short_circuit.query, ShortCircuitMode::On);
+    assert_eq!(c.short_circuit.query_window_days, 7);
+    assert_eq!(c.get("short_circuit.mode").unwrap(), "on");
+    assert_eq!(c.get("short_circuit.query").unwrap(), "on");
+    assert_eq!(c.get("short_circuit.window_days").unwrap(), "7");
+    assert_eq!(c.get("short_circuit.query_window_days").unwrap(), "7");
+    assert_eq!(c.inject.max_notes, 3);
     assert_eq!(c.hooks.deadline_ms, 500);
     assert!(c.capture.exclude_hosts.is_empty() && c.capture.redact_terms.is_empty());
     assert_eq!(c.review.daily_limit, 10);
@@ -73,9 +74,9 @@ fn round_trip_through_save_and_load() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sub/config.toml");
     let mut c = Config::default();
-    c.set("mode", "shadow").unwrap();
-    c.set("channels.prompt_bm25", "shadow").unwrap();
-    c.set("short_circuit.subagents", "true").unwrap();
+    c.set("mode", "off").unwrap();
+    c.set("channels.prompt_bm25", "inject").unwrap();
+    c.set("short_circuit.mode", "off").unwrap();
     c.set("hooks.deadline_ms", "800").unwrap();
     c.set("capture.exclude_hosts", "*.corp.example, wiki.example")
         .unwrap();
@@ -95,17 +96,15 @@ fn out_of_range_values_are_clamped_with_warnings() {
     let path = dir.path().join("config.toml");
     std::fs::write(
         &path,
-        "[inject]\nmax_notes = 9\nmax_per_agent = -4\n[hooks]\ndeadline_ms = 50\n\
-         [short_circuit]\nwindow_minutes = 5000\n[review]\ndaily_limit = 0\n",
+        "[inject]\nmax_notes = 9\n[hooks]\ndeadline_ms = 50\n\
+         [short_circuit]\nwindow_days = 5000\n[review]\ndaily_limit = 0\n",
     )
     .unwrap();
     let c = config::load(&path).unwrap();
     assert_eq!(c.inject.max_notes, 3);
-    assert_eq!(c.inject.max_per_agent, 0);
     assert_eq!(c.hooks.deadline_ms, 100);
-    assert_eq!(c.short_circuit.window_minutes, 1440);
+    assert_eq!(c.short_circuit.window_days, 365);
     assert_eq!(c.review.daily_limit, 1);
-    // max_per_agent 0 is in range (0-100) after the negative becomes 0.
     assert_eq!(c.warnings.len(), 4, "{:?}", c.warnings);
     assert!(c.warnings.iter().any(|w| w.contains("hooks.deadline_ms")));
 }
@@ -155,19 +154,13 @@ fn save_writes_the_file_with_mode_0600() {
 fn the_query_deny_keys_set_validate_and_clamp() {
     let mut c = Config::default();
     c.set("short_circuit.query", "on").unwrap();
-    c.set("short_circuit.query_window_minutes", "10080")
-        .unwrap();
+    c.set("short_circuit.query_window_days", "365").unwrap();
     assert_eq!(c.short_circuit.query, ShortCircuitMode::On);
-    assert_eq!(
-        c.get("short_circuit.query_window_minutes").unwrap(),
-        "10080"
-    );
+    assert_eq!(c.get("short_circuit.query_window_days").unwrap(), "365");
     assert!(c.set("short_circuit.query", "maybe").is_err());
-    assert!(c.set("short_circuit.query_window_minutes", "0").is_err());
-    assert!(c
-        .set("short_circuit.query_window_minutes", "10081")
-        .is_err());
-    assert_eq!(c.short_circuit.query_window_minutes, 10080);
+    assert!(c.set("short_circuit.query_window_days", "0").is_err());
+    assert!(c.set("short_circuit.query_window_days", "366").is_err());
+    assert_eq!(c.short_circuit.query_window_days, 365);
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
@@ -175,12 +168,12 @@ fn the_query_deny_keys_set_validate_and_clamp() {
     assert_eq!(config::load(&path).unwrap(), c);
     std::fs::write(
         &path,
-        "[short_circuit]\nquery = \"off\"\nquery_window_minutes = 99999\n",
+        "[short_circuit]\nquery = \"off\"\nquery_window_days = 99999\n",
     )
     .unwrap();
     let loaded = config::load(&path).unwrap();
     assert_eq!(loaded.short_circuit.query, ShortCircuitMode::Off);
-    assert_eq!(loaded.short_circuit.query_window_minutes, 10080);
+    assert_eq!(loaded.short_circuit.query_window_days, 365);
     assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
 }
 
@@ -276,4 +269,83 @@ fn quota_defaults_ranges_and_set_errors() {
     assert_eq!(c.get("quota.capture").unwrap(), "false");
     // The file the failed sets would have written is untouched (`save` runs after `set`).
     assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+}
+
+#[test]
+fn legacy_shadow_values_load_with_the_mapping_and_removed_keys_are_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "mode = \"shadow\"\n[channels]\nprompt_bm25 = \"shadow\"\n\
+         [short_circuit]\nmode = \"shadow\"\nquery = \"shadow\"\nsubagents = true\nwindow_minutes = 30\nquery_window_minutes = 60\n\
+         [inject]\nmax_per_agent = 4\nmax_notes = 2\n",
+    )
+    .unwrap();
+    let (c, legacy) = config::load_with_legacy(&path).unwrap();
+    assert_eq!(c.mode, Mode::Inject);
+    assert_eq!(c.channels.prompt_bm25, PromptBm25::Off);
+    assert_eq!(c.short_circuit.mode, ShortCircuitMode::On);
+    assert_eq!(c.short_circuit.query, ShortCircuitMode::Off);
+    assert_eq!(c.inject.max_notes, 2);
+    assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+    // One line per legacy value or key, with the replacement.
+    assert_eq!(legacy.len(), 8, "{legacy:?}");
+    assert_eq!(c.short_circuit.query_window_days, 7);
+    assert!(legacy
+        .iter()
+        .any(|l| l.contains("query_window_minutes") && l.contains("query_window_days")));
+    assert_eq!(c.short_circuit.window_days, 7);
+    assert!(legacy
+        .iter()
+        .any(|l| l.contains("short_circuit.window_minutes")
+            && l.contains("short_circuit.window_days")));
+    assert!(legacy.contains(
+        &"config: mode = \"shadow\" is read as \"inject\"; set it to inject or off".to_string()
+    ));
+    assert!(legacy.iter().any(|l| l.contains("short_circuit.subagents")));
+    assert!(legacy.iter().any(|l| l.contains("inject.max_per_agent")));
+    // `load` reads the same and saving drops the removed keys.
+    assert_eq!(config::load(&path).unwrap(), c);
+    c.save(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !text.contains("shadow") && !text.contains("subagents"),
+        "{text}"
+    );
+    assert!(!text.contains("max_per_agent"), "{text}");
+    assert!(config::load_with_legacy(&path).unwrap().1.is_empty());
+}
+
+#[test]
+fn set_refuses_shadow_and_the_removed_keys_naming_the_replacement() {
+    let mut c = Config::default();
+    for (key, hint) in [
+        ("mode", "inject or off"),
+        ("channels.prompt_bm25", "inject or off"),
+        ("short_circuit.mode", "on or off"),
+        ("short_circuit.query", "on or off"),
+    ] {
+        let err = c.set(key, "shadow").unwrap_err().to_string();
+        assert!(err.contains("shadow mode was removed"), "{key}: {err}");
+        assert!(err.contains(hint), "{key}: {err}");
+    }
+    let err = c.set("short_circuit.subagents", "true").unwrap_err();
+    assert!(err.to_string().contains("was removed"), "{err}");
+    let err = c.set("short_circuit.window_minutes", "30").unwrap_err();
+    assert!(
+        err.to_string().contains("short_circuit.window_days"),
+        "{err}"
+    );
+    let err = c
+        .set("short_circuit.query_window_minutes", "60")
+        .unwrap_err();
+    assert!(err.to_string().contains("query_window_days"), "{err}");
+    let err = c.set("inject.max_per_agent", "5").unwrap_err();
+    assert!(err.to_string().contains("inject.max_notes"), "{err}");
+    assert_eq!(c.get("short_circuit.subagents"), None);
+    assert_eq!(c.get("inject.max_per_agent"), None);
+    assert_eq!(c, Config::default());
+    assert!(c.set("short_circuit.window_days", "366").is_err());
+    c.set("short_circuit.window_days", "365").unwrap();
 }

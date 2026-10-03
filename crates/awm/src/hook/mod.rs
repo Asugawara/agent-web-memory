@@ -245,7 +245,7 @@ pub struct Injection {
     /// `UserPromptSubmit`, `PreToolUse` or `PostToolUse`.
     pub hook: &'static str,
     pub channel: Channel,
-    /// `inject`, `shadow`, `deny` or `shadow_deny`.
+    /// `inject` or `deny` (rows of older versions may say `shadow` or `shadow_deny`).
     pub mode: &'static str,
     pub tool_use_id: Option<String>,
     pub trigger_text: Option<String>,
@@ -574,8 +574,6 @@ pub struct Delivery<'a> {
     /// `hookEventName` of the output.
     pub event: &'static str,
     pub channel: Channel,
-    /// False records the match as `shadow` and prints nothing.
-    pub inject: bool,
     pub hits: Vec<Hit>,
     pub trigger_text: Option<String>,
     pub cutoff: Option<f64>,
@@ -587,14 +585,6 @@ fn injections_in_session(env: &Env, conn: &Connection) -> Result<i64> {
     Ok(conn.query_row(
         "SELECT COUNT(*) FROM injection WHERE session_id = ?1 AND mode = 'inject'",
         [&env.input.session_id],
-        |r| r.get(0),
-    )?)
-}
-
-fn injections_for_agent(env: &Env, conn: &Connection) -> Result<i64> {
-    Ok(conn.query_row(
-        "SELECT COUNT(*) FROM injection WHERE session_id = ?1 AND agent_id IS ?2 AND mode = 'inject'",
-        params![env.input.session_id, env.input.agent_id],
         |r| r.get(0),
     )?)
 }
@@ -611,11 +601,7 @@ pub fn deliver(env: &Env, conn: &Connection, d: Delivery<'_>) -> Result<Verdict>
             ..Verdict::quiet("no_match")
         }
     };
-    let canary = if d.inject {
-        canary_line(hook_name)
-    } else {
-        None
-    };
+    let canary = canary_line(hook_name);
     let ref_id = env.new_ref();
     let canary_only = |reason_rows: bool| -> Verdict {
         let Some(line) = &canary else {
@@ -641,15 +627,6 @@ pub fn deliver(env: &Env, conn: &Connection, d: Delivery<'_>) -> Result<Verdict>
     };
     if d.hits.is_empty() {
         return Ok(canary_only(true));
-    }
-    if d.inject {
-        let cap = i64::from(env.config.inject.max_per_agent);
-        if injections_for_agent(env, conn)? >= cap {
-            return Ok(Verdict {
-                search_ms: Some(d.search_ms),
-                ..Verdict::quiet("skipped")
-            });
-        }
     }
     let mut notes = Vec::new();
     for hit in &d.hits {
@@ -679,26 +656,6 @@ pub fn deliver(env: &Env, conn: &Connection, d: Delivery<'_>) -> Result<Verdict>
     if let Some(line) = &canary {
         append_canary(&mut text, line);
     }
-    let mut inj = Injection {
-        hook: hook_name,
-        channel: d.channel,
-        mode: "shadow",
-        tool_use_id: env.input.tool_use_id.clone(),
-        trigger_text: d.trigger_text.clone(),
-        cutoff: d.cutoff,
-        rendered: None,
-        rendered_chars: rendered.chars,
-        ref_id: ref_id.clone(),
-        items,
-    };
-    if !d.inject {
-        return Ok(Verdict {
-            output: None,
-            outcome: "shadow",
-            search_ms: Some(d.search_ms),
-            injection: Some(inj),
-        });
-    }
     let first = injections_in_session(env, conn)? == 0;
     let system_message = match env.config.notify {
         Notify::Always => true,
@@ -713,14 +670,22 @@ pub fn deliver(env: &Env, conn: &Connection, d: Delivery<'_>) -> Result<Verdict>
             render::age_string(newest, env.started_at_ms)
         )
     });
-    inj.mode = "inject";
-    inj.rendered_chars = text.chars().count();
-    inj.rendered = Some(text.clone());
     Ok(Verdict {
         output: Some(context_json(hook_name, &text, system_message.as_deref())),
         outcome: "injected",
         search_ms: Some(d.search_ms),
-        injection: Some(inj),
+        injection: Some(Injection {
+            hook: hook_name,
+            channel: d.channel,
+            mode: "inject",
+            tool_use_id: env.input.tool_use_id.clone(),
+            trigger_text: d.trigger_text.clone(),
+            cutoff: d.cutoff,
+            rendered_chars: text.chars().count(),
+            rendered: Some(text),
+            ref_id,
+            items,
+        }),
     })
 }
 

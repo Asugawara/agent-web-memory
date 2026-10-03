@@ -96,10 +96,9 @@ fn query_channel_p95_is_within_50_ms_at_3000_records() {
 
 #[test]
 #[ignore]
-fn search_repeat_lookup_p95_is_within_50_ms_at_3000_searches_in_24_h() {
+fn similar_search_lookup_p95_is_within_50_ms_at_3000_searches_in_7_days() {
     use awm::config::Config;
     use awm::hook::{pre_search, Env, HookInput};
-    use awm::normalize::token_set;
 
     const SEARCHES: usize = 3_000;
     const DAY_MS: i64 = 86_400_000;
@@ -135,6 +134,11 @@ fn search_repeat_lookup_p95_is_within_50_ms_at_3000_searches_in_24_h() {
         }
     }
     tx.commit().unwrap();
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('cutoff.query', '0')",
+        [],
+    )
+    .unwrap();
 
     let env = Env {
         hook: "pre-fetch",
@@ -148,22 +152,20 @@ fn search_repeat_lookup_p95_is_within_50_ms_at_3000_searches_in_24_h() {
         started_at_ms: now,
         utc_offset_min: 0,
     };
-    // Mostly misses (the 2,000 newest rows are scanned), some hits among those rows.
-    let mut keys: Vec<Vec<String>> = (0..QUERIES)
-        .map(|_| token_set(&rng.words(6).join(" ")))
-        .collect();
-    for k in keys.iter_mut().step_by(5) {
-        *k = token_set(&queries[(rng.next() as usize) % 2_000]);
+    // Mostly unrelated words (misses), every fifth lookup repeats an earlier query.
+    let mut texts: Vec<String> = (0..QUERIES).map(|_| rng.words(6).join(" ")).collect();
+    for t in texts.iter_mut().step_by(5) {
+        *t = queries[(rng.next() as usize) % 2_000].clone();
     }
-    pre_search::find_repeat(&env, &conn, &keys[0], DAY_MS).unwrap();
+    pre_search::find_similar(&env, &conn, &texts[0]).unwrap();
     let mut ms: Vec<f64> = Vec::new();
     let mut found = 0;
-    for key in &keys {
+    for text in &texts {
         let t = Instant::now();
         found += usize::from(
-            pre_search::find_repeat(&env, &conn, key, DAY_MS)
+            !pre_search::find_similar(&env, &conn, text)
                 .unwrap()
-                .is_some(),
+                .is_empty(),
         );
         ms.push(t.elapsed().as_secs_f64() * 1000.0);
     }
@@ -171,7 +173,7 @@ fn search_repeat_lookup_p95_is_within_50_ms_at_3000_searches_in_24_h() {
     let p50 = ms[QUERIES / 2];
     let p95 = ms[QUERIES * 95 / 100];
     println!(
-        "find_repeat over {SEARCHES} searches in 24 h, {QUERIES} lookups ({found} hits): p50 {p50:.2} ms, p95 {p95:.2} ms"
+        "find_similar over {SEARCHES} searches, {QUERIES} lookups ({found} hits): p50 {p50:.2} ms, p95 {p95:.2} ms"
     );
     assert!(found >= QUERIES / 5 - 1, "hits {found}");
     assert!(p95 <= 50.0, "p95 {p95:.2} ms exceeds 50 ms");

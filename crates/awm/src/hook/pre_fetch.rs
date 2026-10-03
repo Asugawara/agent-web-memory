@@ -1,34 +1,29 @@
 //! PreToolUse entry point (`awm hook pre-fetch`), dispatching on `tool_name`.
 //!
-//! `WebFetch`: optional short-circuit (plan-v2 §4.6). `short_circuit.mode = "shadow"` logs a
-//! `shadow_deny` row; `"on"` denies. A deny needs a sibling fetch: another agent of the same
-//! session, same `url_norm`, status ok, code 200, within `window_minutes`. The caller's own
-//! fetch never counts.
+//! `WebFetch`: a per-URL cache (plan-v2 §4.6). With `short_circuit.mode = "on"` (the default) a
+//! fetch is denied when awm holds a usable earlier fetch of the same `url_norm` within
+//! `short_circuit.window_days`, whoever made it: the caller itself, a sibling agent, another
+//! session or project, the owner's other device. Usable means status ok, code 200, not
+//! quarantined, not tombstoned; a teammate's row never counts. The reason carries the earlier
+//! answer; the retry passes (once per session, agent and URL).
 //!
 //! `WebSearch` (Claude Code) and `webrun` (Codex) go to [`super::pre_search`].
 
 use rusqlite::{params, Connection, OptionalExtension};
 
 use super::{append_canary, canary_line, deny_json, Env, HookArgs, Injection, Verdict};
-use crate::config::{Mode, ShortCircuitMode};
+use crate::config::ShortCircuitMode;
 use crate::matching::{self, Hit};
 use crate::note::{Channel, Relation};
 use crate::record::redact_url;
-use crate::render;
+use crate::render::{self, plain_label};
 
 const EVENT: &str = "PreToolUse";
+const AGENT_TYPE_CAP: usize = 24;
 
 pub fn run(_args: HookArgs) -> anyhow::Result<()> {
     super::run_sync("pre-fetch", handle);
     Ok(())
-}
-
-/// What the configuration allows: global `mode = "shadow"` turns a deny into a shadow deny.
-fn effective_mode(env: &Env) -> ShortCircuitMode {
-    match (env.config.mode, env.config.short_circuit.mode) {
-        (Mode::Shadow, ShortCircuitMode::On) => ShortCircuitMode::Shadow,
-        (_, m) => m,
-    }
 }
 
 fn handle(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
@@ -42,8 +37,7 @@ fn handle(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
 fn handle_fetch(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
     let input = &env.input;
     let forced = std::env::var("AWM_CANARY_DENY").is_ok_and(|v| v == "1");
-    let mode = effective_mode(env);
-    if mode == ShortCircuitMode::Off && !forced {
+    if env.config.short_circuit.mode == ShortCircuitMode::Off && !forced {
         return Ok(Verdict::quiet("no_match"));
     }
     // The stored `url_norm` comes from the redacted URL; look up the same form.
@@ -55,25 +49,16 @@ fn handle_fetch(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
         return Ok(Verdict::quiet("no_match"));
     };
     let start = std::time::Instant::now();
-    let sibling = find_sibling(env, conn, &norm)?;
+    let cached = find_cached(env, conn, &norm)?;
     let search_ms = super::elapsed_ms(start);
-    if sibling.is_none() && !forced {
-        return Ok(Verdict {
-            search_ms: Some(search_ms),
-            ..Verdict::quiet("no_match")
-        });
-    }
-    // In a subagent a real deny also needs `short_circuit.subagents`; a forced canary deny does not.
-    let denies = mode == ShortCircuitMode::On || forced;
-    let log_mode = if denies { "deny" } else { "shadow_deny" };
-    if denies && env.is_subagent() && !env.config.short_circuit.subagents && !forced {
+    if cached.is_none() && !forced {
         return Ok(Verdict {
             search_ms: Some(search_ms),
             ..Verdict::quiet("no_match")
         });
     }
     let trigger = env.trigger_text(&norm);
-    if already_logged(env, conn, log_mode, &trigger)? {
+    if already_logged(env, conn, &trigger)? {
         return Ok(Verdict {
             search_ms: Some(search_ms),
             ..Verdict::quiet("no_match")
@@ -82,57 +67,87 @@ fn handle_fetch(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
 
     let ref_id = env.new_ref();
     let mut items = Vec::new();
-    let mut reason = match &sibling {
-        Some(hit) => {
+    let mut reason = match &cached {
+        Some(c) => {
             let opts = env.match_opts(conn)?;
-            let note = matching::to_note(conn, hit, &opts)?;
-            let who = match &note.relation {
-                Relation::OtherSubagent { agent_type } => format!("a {agent_type} subagent"),
-                _ => "the main agent".to_string(),
-            };
-            items.push((hit.event_id, hit.score));
+            let note = matching::to_note(conn, &c.hit, &opts)?;
+            let who = who_text(&note.relation, c.own);
+            items.push((c.hit.event_id, c.hit.score));
             render::deny_reason(&note, &env.render_ctx(Channel::Url, &ref_id), &who)
         }
         None => "agent-web-memory: canary deny. Call WebFetch again with the same URL; it will not be blocked again."
             .to_string(),
     };
-    if let (true, Some(line)) = (denies, canary_line(EVENT)) {
+    if let Some(line) = canary_line(EVENT) {
         append_canary(&mut reason, &line);
     }
-    let shown = denies.then(|| reason.clone());
     Ok(Verdict {
-        output: shown.as_deref().map(deny_json),
-        outcome: if denies { "denied" } else { "shadow" },
+        output: Some(deny_json(&reason)),
+        outcome: "denied",
         search_ms: Some(search_ms),
         injection: Some(Injection {
             hook: EVENT,
             channel: Channel::Url,
-            mode: log_mode,
+            mode: "deny",
             tool_use_id: input.tool_use_id.clone(),
             trigger_text: Some(trigger),
             cutoff: None,
             rendered_chars: reason.chars().count(),
-            rendered: shown,
+            rendered: Some(reason),
             ref_id,
             items,
         }),
     })
 }
 
-/// The newest fetch of `norm` by another agent of this session within the window.
-fn find_sibling(env: &Env, conn: &Connection, norm: &str) -> anyhow::Result<Option<Hit>> {
-    let window_ms = i64::from(env.config.short_circuit.window_minutes) * 60_000;
-    let id: Option<i64> = conn
-        .query_row(
-            "SELECT e.id FROM event e \
-             WHERE e.tool = 'WebFetch' AND e.url_norm = ?1 AND e.session_id = ?2 \
-               AND NOT (e.agent_id IS ?3) AND e.status = 'ok' AND e.http_code = 200 \
+/// `{who}` of the reason: who made the earlier fetch. `own` is the caller's own earlier fetch
+/// (same session and agent).
+fn who_text(relation: &Relation, own: bool) -> String {
+    if own {
+        return "you, earlier in this session".to_string();
+    }
+    match relation {
+        Relation::OtherSubagent { agent_type } => {
+            let t = plain_label(agent_type, AGENT_TYPE_CAP);
+            if t.is_empty() {
+                "a subagent".to_string()
+            } else {
+                format!("a {t} subagent")
+            }
+        }
+        Relation::MainAgent => "the main agent".to_string(),
+        Relation::SameProject => "another session of this project".to_string(),
+        Relation::OtherProject => "another session".to_string(),
+        Relation::OwnDevice => "your other machine".to_string(),
+        // A teammate's record never triggers a deny (`find_cached`); the text keeps the match total.
+        Relation::Teammate { .. } => "a teammate".to_string(),
+    }
+}
+
+/// The earlier fetch a deny hands over.
+struct Cached {
+    hit: Hit,
+    /// Made by the caller itself (same session and agent).
+    own: bool,
+}
+
+/// The newest usable fetch of `norm` within the window, by any agent of the owner (the same
+/// agent, a sibling, another session or project, the owner's other device).
+fn find_cached(env: &Env, conn: &Connection, norm: &str) -> anyhow::Result<Option<Cached>> {
+    let window_ms = i64::from(env.config.short_circuit.window_days) * 86_400_000;
+    let row: Option<(i64, bool)> = conn
+        .prepare_cached(
+            "SELECT e.id, (e.origin = 'local' AND e.session_id = ?2 AND e.agent_id IS ?3) FROM event e \
+             WHERE e.tool = 'WebFetch' AND e.url_norm = ?1 \
+               AND e.status = 'ok' AND e.http_code = 200 \
                AND e.created_at >= ?4 AND e.quarantined = 0 \
                AND (e.origin = 'local' OR e.member = ?6) \
                AND (?5 IS NULL OR e.tool_use_id != ?5) \
                AND NOT EXISTS (SELECT 1 FROM tombstone t \
                                WHERE t.kind = 'tool_use_id' AND t.value = e.tool_use_id) \
              ORDER BY e.created_at DESC, e.id DESC LIMIT 1",
+        )?
+        .query_row(
             params![
                 norm,
                 env.input.session_id,
@@ -141,23 +156,26 @@ fn find_sibling(env: &Env, conn: &Connection, norm: &str) -> anyhow::Result<Opti
                 env.input.tool_use_id,
                 matching::own_member_id()
             ],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    Ok(id.map(|event_id| Hit {
-        event_id,
-        score: 1.0,
-        seen: 1,
+    Ok(row.map(|(event_id, own)| Cached {
+        hit: Hit {
+            event_id,
+            score: 1.0,
+            seen: 1,
+        },
+        own,
     }))
 }
 
-/// This (session, agent) was already denied (or shadow-denied) this URL.
-fn already_logged(env: &Env, conn: &Connection, mode: &str, trigger: &str) -> anyhow::Result<bool> {
+/// This (session, agent) was already denied this URL.
+fn already_logged(env: &Env, conn: &Connection, trigger: &str) -> anyhow::Result<bool> {
     Ok(conn
         .query_row(
-            "SELECT 1 FROM injection WHERE hook = 'PreToolUse' AND mode = ?1 \
-             AND session_id = ?2 AND agent_id IS ?3 AND trigger_text = ?4 LIMIT 1",
-            params![mode, env.input.session_id, env.input.agent_id, trigger],
+            "SELECT 1 FROM injection WHERE hook = 'PreToolUse' AND mode = 'deny' \
+             AND channel = 'url' AND session_id = ?1 AND agent_id IS ?2 AND trigger_text = ?3 LIMIT 1",
+            params![env.input.session_id, env.input.agent_id, trigger],
             |_| Ok(()),
         )
         .optional()?

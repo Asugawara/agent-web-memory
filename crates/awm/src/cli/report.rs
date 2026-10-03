@@ -65,7 +65,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         "records_by_agent_kind": grouped(&conn, "SELECT CASE WHEN agent_id IS NULL THEN 'main' ELSE 'subagent' END, COUNT(*) FROM event WHERE origin = 'local' GROUP BY 1 ORDER BY 1")?,
         "quarantined": count(&conn, "SELECT COUNT(*) FROM event WHERE quarantined = 1 AND origin = 'local'")?,
         "injections_shown": count(&conn, "SELECT COUNT(*) FROM injection WHERE mode IN ('inject','deny')")?,
-        "injections_would_have_shown": count(&conn, "SELECT COUNT(*) FROM injection WHERE mode IN ('shadow','shadow_deny')")?,
         "labels": grouped(&conn, "SELECT label, COUNT(*) FROM outcome GROUP BY label ORDER BY label")?,
         "hook_ms": {
             "runs": lat.len(),
