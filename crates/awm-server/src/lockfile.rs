@@ -6,8 +6,10 @@
 //! when the process dies, so a crash never blocks the next start. The file itself stays; it
 //! holds nothing.
 
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
+
+use crate::fsutil::open_or_create_private_file;
 
 /// The lock file's name in the data directory.
 pub const LOCK_FILE: &str = "server.lock";
@@ -37,15 +39,7 @@ pub enum LockError {
 /// Locks `{dir}/server.lock` (created mode 0600 when missing) without waiting. `dir` must exist.
 pub fn try_lock(dir: &Path) -> Result<DataLock, LockError> {
     let path = dir.join(LOCK_FILE);
-    let mut o = OpenOptions::new();
-    o.create(true).truncate(false).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        o.mode(0o600);
-    }
-    let file = o
-        .open(&path)
+    let file = open_or_create_private_file(&path)
         .map_err(|e| LockError::Io(format!("cannot open {}: {}", path.display(), e.kind())))?;
     match file.try_lock() {
         Ok(()) => Ok(DataLock { _file: file, path }),

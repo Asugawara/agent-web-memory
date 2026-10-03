@@ -914,9 +914,206 @@ pub fn checksum(data: &[u8]) -> String {
         .collect()
 }
 
+// ---------------------------------------------------------------------------------------------
+// Helpers both stores share (the SQL text and the pure checks); the two implementations stay
+// separate, only what is character-for-character the same lives here.
+
+/// The canonical `meta` filter in SQLite SQL (the export and import files).
+#[cfg(feature = "sqlite")]
+pub(crate) const CANONICAL_META_SQL: &str = "key NOT LIKE 'schema\\_%' ESCAPE '\\' \
+     AND key NOT LIKE 'backup\\_%' ESCAPE '\\' AND key NOT LIKE 'bootstrap\\_%' ESCAPE '\\'";
+
+/// The row count of every table that holds organisation rows (the SQL of `store_holds_org`).
+#[cfg(feature = "sqlite")]
+pub(crate) const HOLDS_ORG_SQL: &str = "\
+SELECT (SELECT COUNT(*) FROM org) + (SELECT COUNT(*) FROM member) \
+     + (SELECT COUNT(*) FROM device) + (SELECT COUNT(*) FROM invite) \
+     + (SELECT COUNT(*) FROM record) + (SELECT COUNT(*) FROM deletion) \
+     + (SELECT COUNT(*) FROM wrap) + (SELECT COUNT(*) FROM audit)";
+
+#[cfg(feature = "sqlite")]
+pub(crate) fn role_str(role: Role, field: &str) -> StoreResult<&'static str> {
+    match role {
+        Role::Member => Ok("member"),
+        Role::Admin => Ok("admin"),
+        Role::Unknown => Err(StoreError::InvalidValue {
+            field: field.to_string(),
+        }),
+    }
+}
+
+#[cfg(feature = "sqlite")]
+pub(crate) fn i64_of(v: u64, field: impl FnOnce() -> String) -> StoreResult<i64> {
+    // Indexes stay below 2^53 (`docs/sync-v1.md` §1).
+    i64::try_from(v)
+        .ok()
+        .filter(|v| *v < (1_i64 << 53))
+        .ok_or_else(|| StoreError::InvalidValue { field: field() })
+}
+
+#[cfg(feature = "sqlite")]
+pub(crate) fn check_hash(hash: &str, field: &str) -> StoreResult<()> {
+    if valid_token_hash(hash) {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidValue {
+            field: field.to_string(),
+        })
+    }
+}
+
+#[cfg(feature = "sqlite")]
+pub(crate) fn broken(what: &str) -> StoreError {
+    StoreError::Backend(format!("broken invariant: {what}"))
+}
+
+/// The encoded JSON length of `v` plus one byte for the separator.
+#[cfg(feature = "sqlite")]
+pub(crate) fn json_len<T: serde::Serialize>(v: &T) -> usize {
+    serde_json::to_vec(v).map_or(0, |b| b.len()) + 1
+}
+
+/// [`json_len`] of a pulled item, without encoding its blob. A record is
+/// measured with an empty blob plus the length of the blob's unpadded base64url text, so the
+/// blob is neither copied nor encoded just to be counted.
+#[cfg(feature = "sqlite")]
+pub(crate) fn item_len(item: &awm_proto::wire::PulledItem) -> usize {
+    use awm_proto::wire::{PulledItem, PulledRecord, B64};
+    let (base, blob) = match item {
+        PulledItem::Record(r) => (
+            serde_json::to_vec(&PulledItem::Record(PulledRecord {
+                blob: B64(Vec::new()),
+                ..r.clone()
+            })),
+            r.blob.0.len(),
+        ),
+        deleted => (serde_json::to_vec(deleted), 0),
+    };
+    // 4 characters per 3 bytes, a final group of 1 or 2 bytes giving 2 or 3.
+    base.map_or(0, |b| b.len()) + (blob * 4).div_ceil(3) + 1
+}
+
+#[cfg(feature = "sqlite")]
+pub(crate) fn binary_version(migrations: &[(u32, &str, &str)]) -> u32 {
+    migrations.last().map_or(0, |(v, _, _)| *v)
+}
+
+#[cfg(feature = "sqlite")]
+pub(crate) fn validate_list(migrations: &[(u32, &str, &str)]) -> StoreResult<()> {
+    for (i, (version, name, _)) in migrations.iter().enumerate() {
+        if usize::try_from(*version).ok() != Some(i + 1) {
+            return Err(StoreError::Backend(format!(
+                "embedded migration {name} has version {version}, expected {}",
+                i + 1
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a database newer than the binary, a missing checksum or a checksum mismatch;
+/// returns `db`, the applied version. `stored(version)` reads the checksum the database
+/// recorded for a migration (in `table`, named in the error text).
+#[cfg(feature = "sqlite")]
+pub(crate) fn check_applied(
+    db: u32,
+    migrations: &[(u32, &str, &str)],
+    table: &str,
+    mut stored: impl FnMut(u32) -> StoreResult<Option<String>>,
+) -> StoreResult<u32> {
+    let bin = binary_version(migrations);
+    if db > bin {
+        return Err(StoreError::Backend(format!(
+            "server database is from a newer awm ({db}, this binary knows {bin}). Upgrade awm."
+        )));
+    }
+    for (version, name, sql) in migrations.iter().filter(|(v, _, _)| *v <= db) {
+        let stored = stored(*version)?.ok_or_else(|| {
+            StoreError::Backend(format!(
+                "migration {name} has no checksum in {table} (database at version {db})"
+            ))
+        })?;
+        let embedded = checksum(sql.as_bytes());
+        if stored != embedded {
+            return Err(StoreError::Backend(format!(
+                "checksum mismatch for migration {name}: the database records {stored}, \
+                 this awm embeds {embedded}; refusing to migrate"
+            )));
+        }
+    }
+    Ok(db)
+}
+
+/// The organisation row as stored (`pending_retention` not yet promoted).
+#[cfg(feature = "sqlite")]
+pub(crate) struct RawOrg {
+    pub(crate) id: Id,
+    pub(crate) created_at: i64,
+    pub(crate) current_epoch: u32,
+    pub(crate) rotation_needed: bool,
+    pub(crate) retention_days: u32,
+    pub(crate) min_client: Version,
+    pub(crate) max_members: u32,
+    pub(crate) pending: Option<(u32, i64)>,
+}
+
+#[cfg(feature = "sqlite")]
+impl RawOrg {
+    /// The settings as they apply at `now`: a pending decrease whose 7 days are over is in
+    /// force (it is also written back by the next settings change or retention run).
+    pub(crate) fn effective(&self, now: i64) -> OrgSettings {
+        match self.pending {
+            Some((days, at)) if at <= now => OrgSettings {
+                retention_days: days,
+                min_client: self.min_client.clone(),
+                max_members: self.max_members,
+                pending_retention: None,
+            },
+            pending => OrgSettings {
+                retention_days: self.retention_days,
+                min_client: self.min_client.clone(),
+                max_members: self.max_members,
+                pending_retention: pending.map(|(retention_days, effective_at)| {
+                    awm_proto::wire::PendingRetention {
+                        retention_days,
+                        effective_at,
+                    }
+                }),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn item_len_equals_the_encoded_length_plus_the_separator() {
+        use awm_proto::wire::{PulledDeleted, PulledItem, PulledRecord, B64};
+        let id = Id::new_v4();
+        for n in [0usize, 1, 2, 3, 100, 16_384] {
+            let item = PulledItem::Record(PulledRecord {
+                idx: 7,
+                id,
+                epoch: 3,
+                blob: B64((0..n).map(|i| (i * 31 % 251) as u8).collect()),
+                received_at: 1_700_000_000,
+            });
+            assert_eq!(
+                item_len(&item),
+                serde_json::to_vec(&item).unwrap().len() + 1,
+                "record with a {n}-byte blob"
+            );
+        }
+        let marker = PulledItem::Deleted(PulledDeleted { idx: 9, id });
+        assert_eq!(
+            item_len(&marker),
+            serde_json::to_vec(&marker).unwrap().len() + 1,
+            "deletion marker"
+        );
+    }
 
     #[test]
     fn checksum_matches_the_fips_180_4_vectors() {

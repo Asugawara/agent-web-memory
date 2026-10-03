@@ -21,11 +21,12 @@ use awm_proto::wire::Version;
 use axum::extract::Request;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
 
 use crate::limits::{Limits, RateLimiter};
+use crate::retention::Clock as _;
 use crate::store::{OrgDefaults, Store, StoreError};
 
 mod admin;
@@ -158,12 +159,7 @@ impl AppState {
         AppState {
             store,
             config: Arc::new(config),
-            clock: Arc::new(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0)
-            }),
+            clock: Arc::new(|| crate::retention::SystemClock.now()),
             log: Arc::new(StderrLog),
             limiter: Arc::new(RateLimiter::new()),
             retention_runner,
@@ -219,7 +215,7 @@ impl AppState {
                 .retention_last
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            if last.is_some_and(|t| now - t < 3_600) {
+            if last.is_some_and(|t| now - t < crate::retention::INTERVAL_S) {
                 return;
             }
             *last = Some(now);
@@ -405,9 +401,4 @@ pub(crate) fn json<T: serde::Serialize>(v: &T) -> Result<Response, ApiError> {
         HeaderValue::from_static("application/json"),
     );
     Ok(r)
-}
-
-/// Turns a handler's result into its response.
-pub(crate) fn reply(r: Result<Response, ApiError>) -> Response {
-    r.unwrap_or_else(ApiError::into_response)
 }

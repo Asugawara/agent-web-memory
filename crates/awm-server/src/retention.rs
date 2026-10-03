@@ -13,8 +13,9 @@
 //!
 //! Runs are at most one per hour per organisation, keyed on `last_retention`; a second run
 //! within the hour is a no-op. Two schedules:
-//! - [`hourly`]: a tokio task for a host (`awm serve`): runs at start if the last run is an
-//!   hour old, then every hour, until shutdown;
+//! - [`hourly`] / [`hourly_observed`]: a tokio task for a host (`awm serve`): runs at start if
+//!   the last run is an hour old, then every hour, until shutdown; an [`Observer`] logs and
+//!   does the work that rides on the schedule;
 //! - [`request_time`]: for Cloud Run, where CPU is not allocated between requests (§6.1): TM8
 //!   calls it from a request hook; it deletes at most [`BATCH_ROWS`] rows per call and runs at
 //!   most once an hour.
@@ -234,12 +235,51 @@ pub struct HourlyReport {
     pub deleted: u64,
 }
 
-/// The host schedule (`awm serve`, `tokio::spawn(retention::hourly(store, clock, shutdown))`):
-/// runs at once when `last_retention` is at least an hour old (or absent), then sleeps until
-/// the next run is due, every hour; a failed run is retried after [`RETRY_AFTER_ERROR_S`].
-/// Returns when `shutdown` completes (checked before every sleep and during it; a run in
-/// progress finishes first).
+/// What [`hourly`] reports to an [`Observer`] after a run attempt.
+#[derive(Debug)]
+pub enum RunEvent<'a> {
+    /// A run did its work.
+    Ran(&'a RetentionRun),
+    /// A run failed with a store error (retried after [`RETRY_AFTER_ERROR_S`]).
+    Failed(&'a StoreError),
+}
+
+/// A hook around each pass of [`hourly_observed`]; both methods default to doing nothing.
+pub trait Observer: Send {
+    /// Called before every run attempt (also when it turns out not to be due), at `now`.
+    fn before_run(&mut self, _now: i64) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+
+    /// Called after a run attempt that ran or failed (not after a no-op check).
+    fn after_run(&mut self, _event: RunEvent<'_>) {}
+}
+
+/// The [`Observer`] that observes nothing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoObserver;
+
+impl Observer for NoObserver {}
+
+/// The host schedule ([`hourly_observed`] without an observer).
 pub async fn hourly<F>(store: Arc<dyn Store>, clock: Arc<dyn Clock>, shutdown: F) -> HourlyReport
+where
+    F: Future<Output = ()> + Send,
+{
+    hourly_observed(store, clock, shutdown, NoObserver).await
+}
+
+/// The host schedule (`awm serve`, `tokio::spawn(retention::hourly_observed(store, clock,
+/// shutdown, observer))`): runs at once when `last_retention` is at least an hour old (or
+/// absent), then sleeps until the next run is due, every hour; a failed run, or a failure to
+/// read `last_retention`, is retried after [`RETRY_AFTER_ERROR_S`]. Returns when `shutdown`
+/// completes (checked before every sleep and during it; a run in progress finishes first).
+pub async fn hourly_observed<F>(
+    store: Arc<dyn Store>,
+    clock: Arc<dyn Clock>,
+    shutdown: F,
+    mut observer: impl Observer,
+) -> HourlyReport
 where
     F: Future<Output = ()> + Send,
 {
@@ -247,20 +287,23 @@ where
     let mut report = HourlyReport::default();
     loop {
         let now = clock.now();
+        observer.before_run(now).await;
         let wait = match run(&*store, now).await {
             Ok(Some(r)) => {
                 report.runs += 1;
                 report.deleted += r.deleted;
+                observer.after_run(RunEvent::Ran(&r));
                 INTERVAL_S as u64
             }
             Ok(None) => match last_retention(&*store).await {
-                Ok(Some(last)) if !due(Some(last), now) => (last + INTERVAL_S - now) as u64,
+                Ok(Some(last)) if !due(Some(last), now) => (last + INTERVAL_S - now).max(1) as u64,
                 // No organisation yet (or a run of it in progress elsewhere in the process).
                 Ok(_) => INTERVAL_S as u64,
                 Err(_) => RETRY_AFTER_ERROR_S,
             },
-            Err(_) => {
+            Err(e) => {
                 report.failures += 1;
+                observer.after_run(RunEvent::Failed(&e));
                 RETRY_AFTER_ERROR_S
             }
         };

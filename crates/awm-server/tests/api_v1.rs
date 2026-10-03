@@ -9,20 +9,27 @@
 
 #![cfg(feature = "sqlite")]
 
+#[path = "support/log.rs"]
+mod capture;
+#[path = "support/org.rs"]
+mod fixtures;
+
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use awm_proto::wire::{ErrorBody, ErrorCode, Id, Role, Version, B64};
+use awm_proto::wire::{ErrorBody, ErrorCode, Id, Role, Version};
 use awm_server::auth;
-use awm_server::http::{self, AppState, IpNet, LogSink, RetentionMode, ServerConfig};
+use awm_server::http::{self, AppState, IpNet, RetentionMode, ServerConfig};
 use awm_server::store::sqlite::{open_connection, SqliteStore, DB_FILE};
 use awm_server::store::{NewInvite, Store, StoreError};
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, Method, Request};
 use axum::Router;
+use capture::Capture;
+use fixtures::b64;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -55,15 +62,6 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-#[derive(Default)]
-struct Capture(Mutex<Vec<String>>);
-
-impl LogSink for Capture {
-    fn line(&self, line: &str) {
-        self.0.lock().unwrap().push(line.to_string());
     }
 }
 
@@ -497,10 +495,6 @@ impl Resp {
 }
 
 // --- wire helpers ---------------------------------------------------------------------------
-
-fn b64(bytes: &[u8]) -> String {
-    String::from(B64(bytes.to_vec()))
-}
 
 fn wraps(current: u32) -> Value {
     json!({"wraps": (0..=current).map(|e| json!({

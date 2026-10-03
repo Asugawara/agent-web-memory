@@ -522,6 +522,10 @@ impl Backup {
         let generation = st
             .generation
             .ok_or_else(|| BackupError::Io("no generation".into()))?;
+        // The head is one cheap read; a change set is a throwaway database file.
+        if self.store.backup_log_head().await? <= st.cursor {
+            return Ok(Step::Unchanged);
+        }
         let Some(p) = prepare_incremental(
             &*self.store,
             generation,

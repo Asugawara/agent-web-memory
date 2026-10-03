@@ -303,6 +303,24 @@ pub async fn authenticate(
     header: Option<&str>,
     now: i64,
 ) -> Result<Caller, AuthError> {
+    authenticate_with(store, header, now, || async {
+        Ok(store.org(now).await?.map(|o| o.org_id))
+    })
+    .await
+}
+
+/// [`authenticate`] with the organisation id supplied by `org_id` (called only when a token is
+/// presented and parses), so a request that reads the organisation anyway reads it once.
+pub async fn authenticate_with<F, Fut>(
+    store: &dyn Store,
+    header: Option<&str>,
+    now: i64,
+    org_id: F,
+) -> Result<Caller, AuthError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Id>, StoreError>>,
+{
     let Some(header) = header else {
         return Ok(Caller::Anonymous);
     };
@@ -310,15 +328,15 @@ pub async fn authenticate(
     if presented.kind != TokenKind::Device {
         return Err(Refusal::Unauthenticated.into());
     }
-    let org = store.org(now).await?.ok_or(Refusal::Unauthenticated)?;
-    if presented.org != Some(org.org_id) {
+    let org_id = org_id().await?.ok_or(Refusal::Unauthenticated)?;
+    if presented.org != Some(org_id) {
         return Err(Refusal::Unauthenticated.into());
     }
     let dev = store
         .auth_device(presented.hash)
         .await?
         .ok_or(Refusal::Unauthenticated)?;
-    if dev.device_revoked || dev.member_revoked || dev.org_id != org.org_id {
+    if dev.device_revoked || dev.member_revoked || dev.org_id != org_id {
         return Err(Refusal::Unauthenticated.into());
     }
     store

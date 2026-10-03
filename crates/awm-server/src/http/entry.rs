@@ -12,17 +12,13 @@ use serde_json::Value;
 
 use super::ctx::{Cap, Class, Client, Cx};
 use super::error::ApiError;
-use super::{json, reply, AppState};
+use super::{json, AppState};
 use crate::auth::{self, Caller};
 use crate::authz::{self, Action};
 
 /// `GET /v1/info`: anyone; cacheable for an hour.
-pub(super) async fn info(State(app): State<AppState>, req: Request) -> Response {
-    reply(info_inner(&app, req).await)
-}
-
-async fn info_inner(app: &AppState, req: Request) -> Result<Response, ApiError> {
-    let _cx = Cx::open(app, req, Client::Optional, Class::Anonymous, Cap::Body)?;
+pub(super) async fn info(State(app): State<AppState>, req: Request) -> Result<Response, ApiError> {
+    let _cx = Cx::open(&app, req, Client::Optional, Class::Anonymous, Cap::Body)?;
     authz::require(&Caller::Anonymous, Action::Info)?;
     let state = app.store.restore_state().await?;
     let body = InfoResponse {
@@ -60,19 +56,12 @@ pub(super) fn check_handle(body: &[u8]) -> Result<(), ApiError> {
 }
 
 /// `POST /v1/bootstrap`: the bootstrap token in the body authenticates; no `Authorization`.
-pub(super) async fn bootstrap(State(app): State<AppState>, req: Request) -> Response {
-    reply(bootstrap_inner(&app, req).await)
-}
-
-async fn bootstrap_inner(app: &AppState, req: Request) -> Result<Response, ApiError> {
-    let mut cx = Cx::open(
-        &app.clone(),
-        req,
-        Client::Required,
-        Class::Anonymous,
-        Cap::Body,
-    )?;
-    let bytes = cx.bytes(Cap::Body).await?;
+pub(super) async fn bootstrap(
+    State(app): State<AppState>,
+    req: Request,
+) -> Result<Response, ApiError> {
+    let mut cx = Cx::open(&app, req, Client::Required, Class::Anonymous, Cap::Body)?;
+    let bytes = cx.bytes().await?;
     check_handle(&bytes)?;
     let body: BootstrapRequest = super::error::parse_json(&bytes)?;
     authz::require(&Caller::Anonymous, Action::Bootstrap)?;
@@ -83,13 +72,9 @@ async fn bootstrap_inner(app: &AppState, req: Request) -> Result<Response, ApiEr
 }
 
 /// `POST /v1/join`: the invite token in the body authenticates; no `Authorization`.
-pub(super) async fn join(State(app): State<AppState>, req: Request) -> Response {
-    reply(join_inner(&app, req).await)
-}
-
-async fn join_inner(app: &AppState, req: Request) -> Result<Response, ApiError> {
-    let mut cx = Cx::open(app, req, Client::Required, Class::Join, Cap::Body)?;
-    let bytes = cx.bytes(Cap::Body).await?;
+pub(super) async fn join(State(app): State<AppState>, req: Request) -> Result<Response, ApiError> {
+    let mut cx = Cx::open(&app, req, Client::Required, Class::Join, Cap::Body)?;
+    let bytes = cx.bytes().await?;
     check_handle(&bytes)?;
     let body: JoinRequest = super::error::parse_json(&bytes)?;
     authz::require(&Caller::Anonymous, Action::Join)?;
@@ -102,12 +87,11 @@ async fn join_inner(app: &AppState, req: Request) -> Result<Response, ApiError> 
 }
 
 /// `GET /v1/status`: the calling device's view; a pending device may read it.
-pub(super) async fn status(State(app): State<AppState>, req: Request) -> Response {
-    reply(status_inner(&app, req).await)
-}
-
-async fn status_inner(app: &AppState, req: Request) -> Result<Response, ApiError> {
-    let mut cx = Cx::open(app, req, Client::Required, Class::Token, Cap::Body)?;
+pub(super) async fn status(
+    State(app): State<AppState>,
+    req: Request,
+) -> Result<Response, ApiError> {
+    let mut cx = Cx::token(&app, req)?;
     let caller = cx.authenticate().await?;
     cx.authorise(&caller, Action::Status).await?;
     let device = caller

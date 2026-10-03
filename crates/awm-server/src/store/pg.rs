@@ -45,9 +45,9 @@ use std::time::Duration;
 use awm_proto::wire::{
     limits, AuditResponse, AuditRow, Cursor, DeleteRequest, DeleteResponse, DeletionEntry,
     DeletionHeads, DeletionsResponse, DeviceInfo, DeviceWrap, EpochWrap, Handle, Id, InviteKind,
-    Key32, KeysResponse, MemberInfo, OrgSettings, OwnHead, PendingDevice, PendingRetention,
-    PullResponse, PulledDeleted, PulledItem, PulledRecord, PushItem, PushResponse, Role,
-    SettingsUpdate, StatusResponse, StoredWrap, StreamHead, StreamRecords, Tag, Version, B64,
+    Key32, KeysResponse, MemberInfo, OrgSettings, OwnHead, PendingDevice, PullResponse,
+    PulledDeleted, PulledItem, PulledRecord, PushItem, PushResponse, Role, SettingsUpdate,
+    StatusResponse, StoredWrap, StreamHead, StreamRecords, Tag, Version, B64,
 };
 use deadpool_postgres::{
     Manager, ManagerConfig, Object, Pool, PoolError, RecyclingMethod, Runtime,
@@ -57,10 +57,11 @@ use tokio_postgres::types::{FromSql, ToSql, Type};
 use tokio_postgres::{Config, IsolationLevel, NoTls, Row};
 
 use super::{
-    canonical_meta_key, hour, meta_keys, valid_token_hash, Actor, AuditEntry, AuthDevice,
+    binary_version, broken, canonical_meta_key, check_applied, check_hash, hour, i64_of, item_len,
+    json_len, meta_keys, role_str, valid_token_hash, validate_list, Actor, AuditEntry, AuthDevice,
     DeviceRow, DumpValue, InviteRow, Joined, LogicalDump, MemberRow, NewBootstrap, NewInvite,
-    NewJoin, OrgRow, PushBatch, RestoreState, Store, StoreError, StoreFuture, StoreResult,
-    TableCounts, CANONICAL_TABLES,
+    NewJoin, OrgRow, PushBatch, RawOrg, RestoreState, Store, StoreError, StoreFuture, StoreResult,
+    TableCounts, CANONICAL_META_SQL, CANONICAL_TABLES, HOLDS_ORG_SQL,
 };
 
 /// Embedded migrations: (version, name, SQL). Versions start at 1 and increase by one; there
@@ -90,11 +91,6 @@ pub const ORG_TABLES: &[&str] = &[
 
 /// The `claim` name of retention runs (TM9 P2).
 pub const RETENTION_CLAIM: &str = "retention";
-
-/// The canonical `meta` filter in SQLite SQL (the export and import files).
-#[cfg(feature = "sqlite")]
-const CANONICAL_META_SQL: &str = "key NOT LIKE 'schema\\_%' ESCAPE '\\' \
-     AND key NOT LIKE 'backup\\_%' ESCAPE '\\' AND key NOT LIKE 'bootstrap\\_%' ESCAPE '\\'";
 
 /// The version table, created by the runner under its lock before any migration file runs.
 /// Readable by every role (the policy admits every row), writable only by its owner.
@@ -153,10 +149,6 @@ fn pool_err(e: PoolError) -> StoreError {
         PoolError::Backend(e) => StoreError::Backend(format!("postgres pool: {}", pg_text(&e))),
         other => StoreError::Backend(format!("postgres pool: {other}")),
     }
-}
-
-fn broken(what: &str) -> StoreError {
-    StoreError::Backend(format!("broken invariant: {what}"))
 }
 
 fn is_unique_violation(e: &tokio_postgres::Error, constraint: &str) -> bool {
@@ -305,22 +297,6 @@ pub struct MigrateOutcome {
     pub to: u32,
 }
 
-fn binary_version(migrations: &[(u32, &str, &str)]) -> u32 {
-    migrations.last().map_or(0, |(v, _, _)| *v)
-}
-
-fn validate_list(migrations: &[(u32, &str, &str)]) -> StoreResult<()> {
-    for (i, (version, name, _)) in migrations.iter().enumerate() {
-        if usize::try_from(*version).ok() != Some(i + 1) {
-            return Err(StoreError::Backend(format!(
-                "embedded migration {name} has version {version}, expected {}",
-                i + 1
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// Applies the embedded [`MIGRATIONS`] over a connection as the owner role (`owner`), granting
 /// data access to `app_role` (the user of the application URL).
 pub async fn migrate(owner: &Config, app_role: &str) -> StoreResult<MigrateOutcome> {
@@ -439,27 +415,9 @@ fn check_versions(
     migrations: &[(u32, &str, &str)],
 ) -> StoreResult<u32> {
     let db = applied.keys().next_back().copied().unwrap_or(0);
-    let bin = binary_version(migrations);
-    if db > bin {
-        return Err(StoreError::Backend(format!(
-            "server database is from a newer awm ({db}, this binary knows {bin}). Upgrade awm."
-        )));
-    }
-    for (version, name, sql) in migrations.iter().filter(|(v, _, _)| *v <= db) {
-        let stored = applied.get(version).ok_or_else(|| {
-            StoreError::Backend(format!(
-                "migration {name} has no checksum in schema_migrations (database at version {db})"
-            ))
-        })?;
-        let embedded = super::checksum(sql.as_bytes());
-        if *stored != embedded {
-            return Err(StoreError::Backend(format!(
-                "checksum mismatch for migration {name}: the database records {stored}, \
-                 this awm embeds {embedded}; refusing to migrate"
-            )));
-        }
-    }
-    Ok(db)
+    check_applied(db, migrations, "schema_migrations", |v| {
+        Ok(applied.get(&v).cloned())
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -951,34 +909,6 @@ fn flag_at(r: &Row, i: usize) -> StoreResult<bool> {
     Ok(col::<i64>(r, i)? == 1)
 }
 
-fn role_str(role: Role, field: &str) -> StoreResult<&'static str> {
-    match role {
-        Role::Member => Ok("member"),
-        Role::Admin => Ok("admin"),
-        Role::Unknown => Err(StoreError::InvalidValue {
-            field: field.to_string(),
-        }),
-    }
-}
-
-fn i64_of(v: u64, field: impl FnOnce() -> String) -> StoreResult<i64> {
-    // Indexes stay below 2^53 (`docs/sync-v1.md` §1).
-    i64::try_from(v)
-        .ok()
-        .filter(|v| *v < (1_i64 << 53))
-        .ok_or_else(|| StoreError::InvalidValue { field: field() })
-}
-
-fn check_hash(hash: &str, field: &str) -> StoreResult<()> {
-    if valid_token_hash(hash) {
-        Ok(())
-    } else {
-        Err(StoreError::InvalidValue {
-            field: field.to_string(),
-        })
-    }
-}
-
 fn dump_value(r: &Row, i: usize) -> StoreResult<DumpValue> {
     let ty = r.columns().get(i).map(|c| c.type_().clone());
     Ok(match ty {
@@ -1063,41 +993,6 @@ async fn audit_tx(
         )
         .await?;
     col(&r, 0)
-}
-
-/// The organisation row as stored (`pending_retention` not yet promoted).
-struct RawOrg {
-    id: Id,
-    created_at: i64,
-    current_epoch: u32,
-    rotation_needed: bool,
-    retention_days: u32,
-    min_client: Version,
-    max_members: u32,
-    pending: Option<(u32, i64)>,
-}
-
-impl RawOrg {
-    /// The settings as they apply at `now` (as `SqliteStore`).
-    fn effective(&self, now: i64) -> OrgSettings {
-        match self.pending {
-            Some((days, at)) if at <= now => OrgSettings {
-                retention_days: days,
-                min_client: self.min_client.clone(),
-                max_members: self.max_members,
-                pending_retention: None,
-            },
-            pending => OrgSettings {
-                retention_days: self.retention_days,
-                min_client: self.min_client.clone(),
-                max_members: self.max_members,
-                pending_retention: pending.map(|(retention_days, effective_at)| PendingRetention {
-                    retention_days,
-                    effective_at,
-                }),
-            },
-        }
-    }
 }
 
 async fn load_org(tx: &Tx<'_>) -> StoreResult<Option<RawOrg>> {
@@ -1281,11 +1176,6 @@ fn pulled_item(r: &Row) -> StoreResult<PulledItem> {
     }
 }
 
-/// The encoded JSON length of `v` plus one byte for the separator.
-fn json_len<T: serde::Serialize>(v: &T) -> usize {
-    serde_json::to_vec(v).map_or(0, |b| b.len()) + 1
-}
-
 /// Reads a stream from `from` into `out`, at most `limit` items, while `budget` bytes last.
 /// Returns true when the byte budget cut the read.
 async fn read_stream(
@@ -1311,7 +1201,7 @@ async fn read_stream(
         .await?;
     for r in &rows {
         let item = pulled_item(r)?;
-        let len = json_len(&item);
+        let len = item_len(&item);
         if len > *budget {
             return Ok(true);
         }
@@ -1323,15 +1213,7 @@ async fn read_stream(
 
 #[cfg(feature = "sqlite")]
 async fn store_holds_org(tx: &Tx<'_>) -> StoreResult<bool> {
-    let r = tx
-        .one(
-            "SELECT (SELECT COUNT(*) FROM org) + (SELECT COUNT(*) FROM member) \
-                  + (SELECT COUNT(*) FROM device) + (SELECT COUNT(*) FROM invite) \
-                  + (SELECT COUNT(*) FROM record) + (SELECT COUNT(*) FROM deletion) \
-                  + (SELECT COUNT(*) FROM wrap) + (SELECT COUNT(*) FROM audit)",
-            &[],
-        )
-        .await?;
+    let r = tx.one(HOLDS_ORG_SQL, &[]).await?;
     Ok(col::<i64>(&r, 0)? > 0)
 }
 
@@ -3465,14 +3347,16 @@ mod canonical {
     use std::collections::BTreeMap;
     use std::path::Path;
 
-    use rusqlite::types::{Value, ValueRef};
-    use rusqlite::{params_from_iter, Connection, OpenFlags, OptionalExtension};
+    use rusqlite::types::Value;
+    use rusqlite::{params_from_iter, Connection, OpenFlags};
     use tokio::sync::mpsc::{Receiver, Sender};
 
     use super::CANONICAL_META_SQL;
-    use crate::store::sqlite::{migrate, MIGRATIONS};
+    use crate::store::sqlite::{
+        check_attached_schema, columns_of, dump_value, finish_copy, migrate, with_new_file,
+    };
     use crate::store::CANONICAL_TABLES;
-    use crate::store::{checksum, meta_keys, DumpValue, StoreError, StoreResult, TableCounts};
+    use crate::store::{DumpValue, StoreError, StoreResult, TableCounts};
 
     const PAGE: usize = 500;
 
@@ -3481,29 +3365,6 @@ mod canonical {
     pub(super) enum Msg {
         Rows(&'static str, Vec<Vec<DumpValue>>),
         Done,
-    }
-
-    fn io_err(what: &str, path: &Path, e: std::io::Error) -> StoreError {
-        StoreError::Backend(format!("{what} {}: {e}", path.display()))
-    }
-
-    fn create_new_private_file(path: &Path) -> StoreResult<()> {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        opts.open(path)
-            .map_err(|e| io_err("cannot create", path, e))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| io_err("cannot set mode 0600 on", path, e))?;
-        }
-        Ok(())
     }
 
     fn value(v: DumpValue) -> Value {
@@ -3515,27 +3376,13 @@ mod canonical {
         }
     }
 
-    fn columns_of(table: &str) -> StoreResult<&'static [&'static str]> {
-        CANONICAL_TABLES
-            .iter()
-            .find(|(t, _)| *t == table)
-            .map(|(_, c)| *c)
-            .ok_or_else(|| StoreError::Backend("broken invariant: unknown table".into()))
-    }
-
     /// Writes a canonical file at `dest` (which must not exist; 0600, rollback journal) from
     /// the rows `recv` delivers: the 0001 schema with its triggers, no `backup_log` rows, only
     /// the canonical `meta` keys plus the schema version and checksum. Removes the file when
     /// anything fails after it was created.
     pub(super) fn write(dest: &Path, mut recv: Receiver<Msg>) -> StoreResult<TableCounts> {
-        create_new_private_file(dest)?;
-        let result = (|| {
-            let mut conn = Connection::open_with_flags(
-                dest,
-                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )?;
-            conn.query_row("PRAGMA journal_mode=DELETE", [], |r| r.get::<_, String>(0))?;
-            conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA secure_delete=ON;")?;
+        with_new_file(dest, || {
+            let mut conn = finish_copy(dest)?;
             migrate(&mut conn)?;
             let tx = conn.transaction()?;
             // The seeded generation and restore state give way to the organisation's.
@@ -3575,31 +3422,13 @@ mod canonical {
             tx.commit()?;
             conn.execute_batch("VACUUM")?;
             drop(conn);
-            std::fs::File::open(dest)
-                .and_then(|f| f.sync_all())
-                .map_err(|e| io_err("cannot sync", dest, e))?;
             Ok(TableCounts(
                 CANONICAL_TABLES
                     .iter()
                     .map(|(t, _)| (*t, counts.get(t).copied().unwrap_or(0)))
                     .collect(),
             ))
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(dest);
-            let _ = std::fs::remove_file(format!("{}-journal", dest.display()));
-        }
-        result
-    }
-
-    fn dump_value(v: ValueRef<'_>) -> DumpValue {
-        match v {
-            ValueRef::Null => DumpValue::Null,
-            ValueRef::Integer(i) => DumpValue::Int(i),
-            ValueRef::Real(f) => DumpValue::Text(format!("real:{f:?}")),
-            ValueRef::Text(t) => DumpValue::Text(String::from_utf8_lossy(t).into_owned()),
-            ValueRef::Blob(b) => DumpValue::Blob(b.to_vec()),
-        }
+        })
     }
 
     /// Reads a canonical file for an import: refuses a missing file and one whose schema
@@ -3622,27 +3451,7 @@ mod canonical {
             src,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        let get = |key: &str| -> StoreResult<Option<String>> {
-            Ok(conn
-                .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
-                .optional()?)
-        };
-        let bin = MIGRATIONS.last().map_or(0, |(v, _, _)| *v);
-        let version = get(meta_keys::SCHEMA_VERSION)?;
-        if version.as_deref() != Some(bin.to_string().as_str()) {
-            return Err(StoreError::Backend(format!(
-                "the file is not in this binary's canonical format (schema {}, expected {bin})",
-                version.as_deref().unwrap_or("none")
-            )));
-        }
-        for (v, name, sql) in MIGRATIONS {
-            let key = format!("{}checksum.{v}", meta_keys::SCHEMA_PREFIX);
-            if get(&key)? != Some(checksum(sql.as_bytes())) {
-                return Err(StoreError::Backend(format!(
-                    "the file's checksum for migration {name} differs from this binary's"
-                )));
-            }
-        }
+        check_attached_schema(&conn, "main")?;
         let stopped = || StoreError::Backend("import writer stopped".into());
         for (table, cols) in CANONICAL_TABLES {
             let filter = if *table == "meta" {

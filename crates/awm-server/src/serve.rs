@@ -15,6 +15,7 @@ use std::future::Future;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,6 +31,7 @@ use crate::backup::run::{Backup, RunOptions};
 use crate::backup::{Clock, SystemClock, Target};
 use crate::check::{self, CheckInput, External, Health, HostFacts};
 use crate::config::{self, ConfigError, Flags, Resolved, StoreChoice};
+use crate::fsutil;
 use crate::http::{self, AppState, LogSink, StderrLog};
 use crate::lockfile::{self, DataLock, LockError};
 use crate::retention;
@@ -190,7 +192,7 @@ pub struct Server {
     /// There was no organisation at start.
     pub no_admin: bool,
     shutdown: watch::Sender<bool>,
-    tasks: Vec<(&'static str, JoinHandle<()>)>,
+    tasks: Vec<JoinHandle<()>>,
     /// `{data}/server.lock` (`SqliteStore`), released when the server is stopped or dropped.
     lock: Option<DataLock>,
 }
@@ -200,10 +202,16 @@ impl Server {
     /// the data directory's lock is released last.
     pub async fn stop(self, grace: Duration) {
         let _ = self.shutdown.send(true);
-        for (_, t) in self.tasks {
+        for t in self.tasks {
             let _ = tokio::time::timeout(grace + Duration::from_secs(5), t).await;
         }
         drop(self.lock);
+    }
+
+    /// Stops the tasks started so far, then fails the start with `e`.
+    async fn fail<T>(self, e: StartError) -> Result<T, StartError> {
+        self.stop(Duration::from_secs(1)).await;
+        Err(e)
     }
 
     /// The future the tasks wait on.
@@ -245,11 +253,11 @@ async fn bind_all(addrs: &[SocketAddr]) -> Result<Vec<TcpListener>, StartError> 
     Ok(bound)
 }
 
-fn spawn_named<F>(tasks: &mut Vec<(&'static str, JoinHandle<()>)>, name: &'static str, f: F)
+fn spawn_task<F>(tasks: &mut Vec<JoinHandle<()>>, f: F)
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    tasks.push((name, tokio::spawn(f)));
+    tasks.push(tokio::spawn(f));
 }
 
 /// The scratch directory for exports and verification when there is no `--data` (`PgStore`):
@@ -269,14 +277,7 @@ fn private_scratch(tag: &str) -> Result<PathBuf, StartError> {
 
 /// Creates `dir` with mode 0700; an existing path (a directory, a file or a link) is an error.
 fn create_new_private_dir(dir: &Path) -> Result<(), StartError> {
-    let mut b = std::fs::DirBuilder::new();
-    b.recursive(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        b.mode(0o700);
-    }
-    b.create(dir)
+    fsutil::create_new_private_dir(dir)
         .map_err(|e| start_err(1, format!("cannot create {}: {}", dir.display(), e.kind())))
 }
 
@@ -407,35 +408,24 @@ pub async fn start(r: &Resolved, s: &Settings) -> Result<Server, StartError> {
         lock,
     };
 
-    match serve_listeners(r, s, &mut server, router).await {
-        Ok(()) => {}
-        Err(e) => {
-            server.stop(Duration::from_secs(1)).await;
-            return Err(e);
-        }
+    if let Err(e) = serve_listeners(r, s, &mut server, router).await {
+        return server.fail(e).await;
     }
 
     // --- retention, backup ------------------------------------------------------------------
     if !r.request_time_retention {
-        let (st, sc, log, rx) = (
-            store.clone(),
-            s.clock.clone(),
-            s.clone(),
-            server.shutdown.subscribe(),
-        );
-        let data = r.data_dir().map(Path::to_path_buf);
-        spawn_named(
-            &mut server.tasks,
-            "retention",
-            retention_loop(st, sc, log, data, wait(rx)),
-        );
+        let observer = RetentionLog {
+            store: store.clone(),
+            s: s.clone(),
+            data: r.data_dir().map(Path::to_path_buf),
+        };
+        let (st, sc, rx) = (store.clone(), s.clock.clone(), server.shutdown.subscribe());
+        spawn_task(&mut server.tasks, async move {
+            retention::hourly_observed(st, sc, wait(rx), observer).await;
+        });
     }
     if let Err(e) = start_backup(r, s, &mut server).await {
-        server.stop(Duration::from_secs(1)).await;
-        return Err(e);
-    }
-    if no_admin && !bootstrap_installed {
-        // The caller decides whether a terminal gets a token; a log line otherwise.
+        return server.fail(e).await;
     }
     Ok(server)
 }
@@ -457,7 +447,7 @@ async fn serve_listeners(
             let fut = wait(server.shutdown.subscribe());
             let router = router.clone();
             let log = s.clone();
-            spawn_named(&mut server.tasks, "http", async move {
+            spawn_task(&mut server.tasks, async move {
                 if let Err(e) = http::serve_with_grace(l, router, fut, grace).await {
                     log.log(&format!("listener stopped: {}", e.kind()));
                 }
@@ -525,7 +515,7 @@ async fn serve_tls_listeners(
     let grace = s.grace;
     let fut = wait(server.shutdown.subscribe());
     let log = s.clone();
-    spawn_named(&mut server.tasks, "https", async move {
+    spawn_task(&mut server.tasks, async move {
         if let Err(e) = serve_tls(tls_listener, router, fut, grace).await {
             log.log(&format!("tls listener stopped: {}", e.kind()));
         }
@@ -539,7 +529,7 @@ async fn serve_tls_listeners(
         server.http01_addr = l.local_addr().ok();
         let app = http01_router(tokens.clone(), domain.clone());
         let fut = wait(server.shutdown.subscribe());
-        spawn_named(&mut server.tasks, "http-01", async move {
+        spawn_task(&mut server.tasks, async move {
             let _ = axum::serve(l, app).with_graceful_shutdown(fut).await;
         });
     }
@@ -574,7 +564,7 @@ async fn serve_tls_listeners(
         }
     }
     let (a, rx) = (acme.clone(), server.shutdown.subscribe());
-    spawn_named(&mut server.tasks, "acme", async move {
+    spawn_task(&mut server.tasks, async move {
         a.run(wait(rx)).await;
     });
     server.acme = Some(acme);
@@ -582,54 +572,37 @@ async fn serve_tls_listeners(
     Ok(())
 }
 
-/// The hourly retention task of a host. Unlike `retention::hourly` it logs each run and each
-/// failure (TM9 P3), and with `SqliteStore` it removes the local copies of the database that
-/// are older than the backups' window, with or without `--backup` (RVT2 B2).
-async fn retention_loop<F>(
+/// The hourly retention task of a host is [`retention::hourly_observed`] with this observer: it
+/// logs each run and each failure (TM9 P3), and with `SqliteStore` removes the local copies of
+/// the database that are older than the backups' window, with or without `--backup` (RVT2 B2).
+struct RetentionLog {
     store: Arc<dyn Store>,
-    clock: Arc<dyn Clock>,
     s: Settings,
     data: Option<PathBuf>,
-    shutdown: F,
-) where
-    F: Future<Output = ()> + Send,
-{
-    let mut shutdown = std::pin::pin!(shutdown);
-    loop {
-        let now = clock.now();
-        if let Some(dir) = &data {
-            match crate::backup::local::sweep(&*store, dir, now).await {
-                Ok(removed) if !removed.is_empty() => s.log(&format!(
+}
+
+impl retention::Observer for RetentionLog {
+    fn before_run(&mut self, now: i64) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let Some(dir) = &self.data else { return };
+            match crate::backup::local::sweep(&*self.store, dir, now).await {
+                Ok(removed) if !removed.is_empty() => self.s.log(&format!(
                     "retention: {} local database copy file(s) older than the backups' window removed",
                     removed.len()
                 )),
                 Ok(_) => {}
-                Err(e) => s.log(&format!("retention: local copies: {e}")),
+                Err(e) => self.s.log(&format!("retention: local copies: {e}")),
             }
-        }
-        let wait_s = match retention::run(&*store, now).await {
-            Ok(Some(r)) => {
-                s.log(&format!(
-                    "retention removed={} batches={}",
-                    r.deleted, r.batches
-                ));
-                retention::INTERVAL_S as u64
-            }
-            Ok(None) => match retention::last_retention(&*store).await {
-                Ok(Some(last)) if !retention::due(Some(last), now) => {
-                    (last + retention::INTERVAL_S - now).max(1) as u64
-                }
-                _ => retention::INTERVAL_S as u64,
-            },
-            Err(e) => {
-                s.log(&format!("retention failed: {e}"));
-                retention::RETRY_AFTER_ERROR_S
-            }
-        };
-        tokio::select! {
-            biased;
-            _ = &mut shutdown => break,
-            _ = clock.sleep(wait_s) => {}
+        })
+    }
+
+    fn after_run(&mut self, event: retention::RunEvent<'_>) {
+        match event {
+            retention::RunEvent::Ran(r) => self.s.log(&format!(
+                "retention removed={} batches={}",
+                r.deleted, r.batches
+            )),
+            retention::RunEvent::Failed(e) => self.s.log(&format!("retention failed: {e}")),
         }
     }
 }
@@ -643,7 +616,7 @@ async fn start_backup(r: &Resolved, s: &Settings, server: &mut Server) -> Result
         // No target: a warning now and every day.
         s.log(NO_BACKUP_WARNING);
         let (clock, log, rx) = (s.clock.clone(), s.clone(), server.shutdown.subscribe());
-        spawn_named(&mut server.tasks, "backup-warning", async move {
+        spawn_task(&mut server.tasks, async move {
             let shutdown = wait(rx);
             let mut shutdown = std::pin::pin!(shutdown);
             loop {
@@ -667,7 +640,7 @@ async fn start_backup(r: &Resolved, s: &Settings, server: &mut Server) -> Result
             opts.on_event = Some(Arc::new(move |e| log.log(&e.to_string())));
             let backup = Backup::new(server.store.clone(), bucket, s.clock.clone(), opts);
             let (b, rx) = (backup.clone(), server.shutdown.subscribe());
-            spawn_named(&mut server.tasks, "backup", async move {
+            spawn_task(&mut server.tasks, async move {
                 let _ = b.run(wait(rx)).await;
             });
             server.backup = Some(backup);
@@ -681,7 +654,7 @@ async fn start_backup(r: &Resolved, s: &Settings, server: &mut Server) -> Result
                 s.clone(),
                 server.shutdown.subscribe(),
             );
-            spawn_named(&mut server.tasks, "backup", async move {
+            spawn_task(&mut server.tasks, async move {
                 let shutdown = wait(rx);
                 let mut shutdown = std::pin::pin!(shutdown);
                 loop {
@@ -943,7 +916,7 @@ async fn cmd_promote(flags: &Flags, handle: &str, s: &Settings, io: &mut Io<'_>)
 
 async fn local_health(r: &Resolved) -> Health {
     let url = health_url(r);
-    match http_get(&url, r).await {
+    match http_get(&url, ca_file_of(r)).await {
         Ok(status) => Health::Status(status),
         Err(e) => Health::Unreachable(e),
     }
@@ -987,24 +960,8 @@ async fn cmd_healthcheck(
         Some(r) => health_url(r),
         None => "http://127.0.0.1:8787/healthz".to_string(),
     });
-    let dummy = Resolved {
-        store: StoreChoice::Sqlite {
-            data: PathBuf::new(),
-        },
-        domain: None,
-        listen: Vec::new(),
-        http01_listen: None,
-        acme: None,
-        behind_tls_proxy: false,
-        trusted_proxies: Vec::new(),
-        cloud_run: false,
-        request_time_retention: false,
-        backup: None,
-        config_file: None,
-        overrides: config::Overrides::default(),
-        internal_token_hash: None,
-    };
-    match http_get(&url, resolved.as_ref().unwrap_or(&dummy)).await {
+    let ca_file = resolved.as_ref().and_then(ca_file_of);
+    match http_get(&url, ca_file).await {
         Ok(200) => {
             let _ = writeln!(io.out, "ok");
             Ok(0)
@@ -1020,9 +977,14 @@ async fn cmd_healthcheck(
     }
 }
 
+/// The ACME directory's CA file, which an `https://` health check trusts.
+fn ca_file_of(r: &Resolved) -> Option<&Path> {
+    r.acme.as_ref().and_then(|a| a.ca_file.as_deref())
+}
+
 /// `GET url`, the status code. `http://` always; `https://` needs the `acme` build and, on a
 /// loopback address, skips certificate verification (the listener is this host's own).
-async fn http_get(url: &str, r: &Resolved) -> Result<u16, String> {
+async fn http_get(url: &str, ca_file: Option<&Path>) -> Result<u16, String> {
     let (https, rest) = if let Some(rest) = url.strip_prefix("https://") {
         (true, rest)
     } else if let Some(rest) = url.strip_prefix("http://") {
@@ -1056,7 +1018,7 @@ async fn http_get(url: &str, r: &Resolved) -> Result<u16, String> {
             {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut raw = Vec::new();
-                let mut tls = tls_connect(tcp, host, r).await?;
+                let mut tls = tls_connect(tcp, host, ca_file).await?;
                 tls.write_all(request.as_bytes())
                     .await
                     .map_err(|e| format!("write: {}", e.kind()))?;
@@ -1065,12 +1027,11 @@ async fn http_get(url: &str, r: &Resolved) -> Result<u16, String> {
             }
             #[cfg(not(feature = "acme"))]
             {
-                let _ = (tcp, r);
+                let _ = (tcp, ca_file);
                 return Err("this build has no TLS client".to_string());
             }
         } else {
             use std::io::{Read, Write};
-            let _ = r;
             // Plain HTTP over a blocking std stream: the `sqlite`-only build has no tokio io-util.
             let mut tcp = tcp
                 .into_std()
@@ -1105,7 +1066,7 @@ async fn http_get(url: &str, r: &Resolved) -> Result<u16, String> {
 async fn tls_connect(
     tcp: tokio::net::TcpStream,
     host: &str,
-    r: &Resolved,
+    ca_file: Option<&Path>,
 ) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, String> {
     use rustls::pki_types::ServerName;
     let loopback = host == "localhost"
@@ -1123,9 +1084,8 @@ async fn tls_connect(
             .with_custom_certificate_verifier(Arc::new(LoopbackOnly))
             .with_no_client_auth()
     } else {
-        let ca = r.acme.as_ref().and_then(|a| a.ca_file.as_deref());
         builder
-            .with_root_certificates(crate::tls::acme::root_store(ca))
+            .with_root_certificates(crate::tls::acme::root_store(ca_file))
             .with_no_client_auth()
     };
     let name = ServerName::try_from(host.to_string()).map_err(|_| "bad host name".to_string())?;

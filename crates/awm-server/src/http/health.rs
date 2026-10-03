@@ -9,7 +9,7 @@ use serde_json::json as value;
 
 use super::ctx::{Cap, Class, Client, Cx};
 use super::error::ApiError;
-use super::{json, reply, AppState};
+use super::{json, AppState};
 use crate::auth;
 use awm_proto::wire::ErrorCode;
 
@@ -47,22 +47,21 @@ pub(super) async fn healthz(State(app): State<AppState>) -> Response {
     r
 }
 
-/// `POST /internal/retention`: Cloud Scheduler's hourly call (plan-v3-team §6.1). It carries a
-/// bearer token whose SHA-256 is `ServerConfig::internal_token_hash`; without that setting the
-/// route does not exist. It runs TM9's retention runner once and nothing else.
-pub(super) async fn internal_retention(State(app): State<AppState>, req: Request) -> Response {
-    reply(retention_inner(&app, req).await)
-}
-
 fn same(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
 }
 
-async fn retention_inner(app: &AppState, req: Request) -> Result<Response, ApiError> {
+/// `POST /internal/retention`: Cloud Scheduler's hourly call (plan-v3-team §6.1). It carries a
+/// bearer token whose SHA-256 is `ServerConfig::internal_token_hash`; without that setting the
+/// route does not exist. It runs TM9's retention runner once and nothing else.
+pub(super) async fn internal_retention(
+    State(app): State<AppState>,
+    req: Request,
+) -> Result<Response, ApiError> {
     let Some(expected) = app.config.internal_token_hash.as_deref() else {
         return Err(ApiError::not_found("no such endpoint"));
     };
-    let mut cx = Cx::open(app, req, Client::Optional, Class::Anonymous, Cap::Body)?;
+    let mut cx = Cx::open(&app, req, Client::Optional, Class::Anonymous, Cap::Body)?;
     let presented = cx
         .header(header::AUTHORIZATION.as_str())
         .and_then(|h| h.split_once(' '))
@@ -74,7 +73,7 @@ async fn retention_inner(app: &AppState, req: Request) -> Result<Response, ApiEr
             "unknown or missing token",
         ));
     }
-    let _ = cx.bytes(Cap::Body).await?;
+    let _ = cx.bytes().await?;
     let removed = app.run_retention(cx.now).await?.unwrap_or(0);
     json(&value!({ "removed": removed }))
 }
