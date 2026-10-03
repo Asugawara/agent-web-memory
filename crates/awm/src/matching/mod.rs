@@ -8,6 +8,8 @@
 
 pub mod calibrate;
 pub mod fts;
+#[cfg(test)]
+mod perf;
 pub mod url;
 
 use std::collections::HashMap;
@@ -168,40 +170,48 @@ pub fn query_channel(
     let Some(expr) = fts::match_expr(text) else {
         return Ok(Vec::new());
     };
-    let sql = format!(
-        "SELECT e.id, e.tool, e.query, e.url_norm, e.created_at, -bm25(event_fts) AS score \
-         FROM event_fts JOIN event e ON e.id = event_fts.rowid \
-         WHERE event_fts MATCH ?6 AND e.status = 'ok' AND {RULES_SQL} \
-         ORDER BY bm25(event_fts) LIMIT ?7"
-    );
-    let mut st = conn.prepare_cached(&sql)?;
-    let rows = st.query_map(
-        params![
-            opts.caller_tool_use_id,
-            opts.caller_session,
-            opts.caller_agent,
-            opts.exclude_same_agent,
-            opts.before_ms,
-            expr,
-            CANDIDATES
-        ],
-        |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, Option<String>>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, f64>(5)?,
-            ))
-        },
+    // BM25 ranks the whole index without a join (scoring ~3,900 of 5,200 rows costs ~4 ms;
+    // joining each to its wide `event` row costs as much again). The rows come best first, so the
+    // rules, which only remove rows, are checked per row until `CANDIDATES` rows passed or the
+    // score falls below the cutoff: the same rows as `ORDER BY bm25 LIMIT` over the joined
+    // and filtered set, cut at the cutoff.
+    let mut rank = conn.prepare_cached(
+        "SELECT rowid, bm25(event_fts) AS b FROM event_fts WHERE event_fts MATCH ?1 ORDER BY b",
     )?;
+    let mut rows = rank.query([expr])?;
+    let mut row_sql = conn.prepare_cached(&format!(
+        "SELECT e.tool, e.query, e.url_norm, e.created_at FROM event e \
+         WHERE e.id = ?6 AND e.status = 'ok' AND {RULES_SQL}"
+    ))?;
     let mut cands = Vec::new();
-    for row in rows {
-        let (id, tool, query, url_norm, created_at, score) = row?;
-        if score < cutoff {
-            continue;
+    while let Some(row) = rows.next()? {
+        let (id, score): (i64, f64) = (row.get(0)?, -row.get::<_, f64>(1)?);
+        if score < cutoff || cands.len() >= CANDIDATES as usize {
+            break;
         }
+        let Some((tool, query, url_norm, created_at)) = row_sql
+            .query_row(
+                params![
+                    opts.caller_tool_use_id,
+                    opts.caller_session,
+                    opts.caller_agent,
+                    opts.exclude_same_agent,
+                    opts.before_ms,
+                    id
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+        else {
+            continue;
+        };
         let group = match tool.as_str() {
             "WebFetch" => format!("u:{}", url_norm.as_deref().unwrap_or("")),
             _ => format!("q:{}", norm_query(query.as_deref().unwrap_or(""))),
