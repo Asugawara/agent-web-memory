@@ -828,7 +828,7 @@ fn the_earlier_answer_closest_to_the_prompt_is_handed_over() {
     );
     assert!(reason.contains("asked: List the pricing tiers"), "{reason}");
     assert!(!reason.contains("Answer about installation"), "{reason}");
-    // One answer is handed over, and its row is the one recorded, scored by the overlap.
+    // One answer is handed over, and its row is the one recorded, scored by BM25.
     assert_eq!(home.count("SELECT COUNT(*) FROM injection_item"), 1);
     assert_eq!(
         home.text("SELECT e.tool_use_id FROM injection_item i JOIN event e ON e.id = i.event_id"),
@@ -854,6 +854,75 @@ fn without_a_matching_or_any_prompt_the_newest_answer_is_handed_over() {
         );
         assert!(
             reason.contains("closest of 2 earlier answers"),
+            "{prompt:?}: {reason}"
+        );
+    }
+}
+
+#[test]
+fn a_prompt_matching_the_stored_answer_text_picks_that_answer() {
+    let home = Home::new();
+    home.seed(
+        &answered_fetch(
+            "toolu_old",
+            "Summarise the page",
+            "The warranty covers parts for twelve months",
+        ),
+        120_000,
+    );
+    home.seed(
+        &answered_fetch("toolu_new", "Summarise the page", "Shipping takes a week"),
+        60_000,
+    );
+    // Both stored prompts are the same; only the answer text of the older row matches.
+    let request = pre_fetch_asking("toolu_main_1", Some("warranty parts months"));
+    let reason = deny_reason(&home.hook("pre-fetch", &request));
+    assert!(reason.contains("closest of 2 earlier answers"), "{reason}");
+    assert!(reason.contains("The warranty covers parts"), "{reason}");
+    assert!(!reason.contains("Shipping takes"), "{reason}");
+}
+
+#[test]
+fn a_candidate_without_an_fts_row_falls_back_to_the_newest_without_an_error() {
+    let home = Home::new();
+    seed_two_answers(&home);
+    // The external-content index has no row for either candidate.
+    home.conn()
+        .execute("INSERT INTO event_fts(event_fts) VALUES('delete-all')", [])
+        .unwrap();
+    let request = pre_fetch_asking("toolu_main_1", Some("What are the pricing tiers and cost?"));
+    let reason = deny_reason(&home.hook("pre-fetch", &request));
+    assert!(
+        reason.contains("\nfound: Answer about installation\n"),
+        "{reason}"
+    );
+    // Only the newest row lacks its FTS row: the older, indexed one is the only one scored.
+    let home = Home::new();
+    seed_two_answers(&home);
+    home.conn()
+        .execute(
+            "INSERT INTO event_fts(event_fts, rowid, match_text) \
+             SELECT 'delete', id, match_text FROM event WHERE tool_use_id = 'toolu_new'",
+            [],
+        )
+        .unwrap();
+    let request = pre_fetch_asking("toolu_main_1", Some("Describe the installation steps"));
+    let reason = deny_reason(&home.hook("pre-fetch", &request));
+    assert!(
+        reason.contains("\nfound: Answer about pricing tiers\n"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn a_prompt_of_punctuation_or_single_characters_falls_back_to_the_newest() {
+    for prompt in ["?!... --", "a b c 1 2"] {
+        let home = Home::new();
+        seed_two_answers(&home);
+        let reason =
+            deny_reason(&home.hook("pre-fetch", &pre_fetch_asking("toolu_main_1", Some(prompt))));
+        assert!(
+            reason.contains("\nfound: Answer about installation\n"),
             "{prompt:?}: {reason}"
         );
     }

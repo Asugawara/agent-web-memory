@@ -8,7 +8,6 @@
 
 pub mod calibrate;
 pub mod fts;
-pub mod overlap;
 #[cfg(test)]
 mod perf;
 pub mod url;
