@@ -10,17 +10,22 @@
 
 #![cfg(feature = "sqlite")]
 
+#[path = "support/log.rs"]
+mod capture;
+#[path = "support/org.rs"]
+mod fixtures;
+
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use awm_proto::wire::{Id, Version, B64};
+use awm_proto::wire::{Id, Version};
 use awm_server::backup::keys as bk;
 use awm_server::check::{self, CheckInput, Health, HostFacts, Level, Report};
 use awm_server::config::{self, Flags, Resolved};
-use awm_server::http::{self, LogSink};
+use awm_server::http;
 use awm_server::retention::{Clock, SystemClock};
 use awm_server::serve::{self, Command, Invocation, Io, Settings};
 use awm_server::store::Store;
@@ -28,6 +33,8 @@ use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::Request;
 use axum::Router;
+use capture::Capture;
+use fixtures::b64;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -60,15 +67,6 @@ fn chmod(path: &Path, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
-#[derive(Default)]
-struct Capture(Mutex<Vec<String>>);
-
-impl LogSink for Capture {
-    fn line(&self, line: &str) {
-        self.0.lock().unwrap().push(line.to_string());
-    }
-}
-
 fn settings() -> Settings {
     Settings {
         version: Version::new(0, 2, 0),
@@ -89,10 +87,6 @@ fn data_flags(data: &Path) -> Flags {
 
 fn resolve(flags: &Flags) -> Resolved {
     config::resolve(flags, &|_| None).expect("a valid configuration")
-}
-
-fn b64(bytes: &[u8]) -> String {
-    String::from(B64(bytes.to_vec()))
 }
 
 async fn send(

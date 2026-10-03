@@ -24,12 +24,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use crate::fsutil::{self, create_new_private_file, ensure_private_dir};
 use awm_proto::wire::{
     limits, AuditResponse, AuditRow, Cursor, DeleteRequest, DeleteResponse, DeletionEntry,
     DeletionHeads, DeletionsResponse, DeviceInfo, DeviceWrap, EpochWrap, Handle, Id, InviteKind,
-    Key32, KeysResponse, MemberInfo, OrgSettings, OwnHead, PendingDevice, PendingRetention,
-    PullResponse, PulledDeleted, PulledItem, PulledRecord, PushItem, PushResponse, Role,
-    SettingsUpdate, StatusResponse, StoredWrap, StreamHead, StreamRecords, Tag, Version, B64,
+    Key32, KeysResponse, MemberInfo, OrgSettings, OwnHead, PendingDevice, PullResponse,
+    PulledDeleted, PulledItem, PulledRecord, PushItem, PushResponse, Role, SettingsUpdate,
+    StatusResponse, StoredWrap, StreamHead, StreamRecords, Tag, Version, B64,
 };
 use rusqlite::types::{Type, ValueRef};
 use rusqlite::{
@@ -37,10 +38,12 @@ use rusqlite::{
 };
 
 use super::{
-    canonical_meta_key, checksum, hour, meta_keys, valid_token_hash, Actor, AuditEntry, AuthDevice,
-    BackupLogRow, ChangeSet, DeviceRow, DumpValue, InviteRow, Joined, LogicalDump, MemberRow,
-    NewBootstrap, NewInvite, NewJoin, OrgRow, PushBatch, RestoreState, Store, StoreError,
-    StoreFuture, StoreResult, TableCounts, CANONICAL_TABLES,
+    binary_version, broken, canonical_meta_key, check_applied, check_hash, checksum, hour, i64_of,
+    item_len, json_len, meta_keys, role_str, valid_token_hash, validate_list, Actor, AuditEntry,
+    AuthDevice, BackupLogRow, ChangeSet, DeviceRow, DumpValue, InviteRow, Joined, LogicalDump,
+    MemberRow, NewBootstrap, NewInvite, NewJoin, OrgRow, PushBatch, RawOrg, RestoreState, Store,
+    StoreError, StoreFuture, StoreResult, TableCounts, CANONICAL_META_SQL, CANONICAL_TABLES,
+    HOLDS_ORG_SQL,
 };
 
 /// Embedded migrations: (version, name, SQL). Versions start at 1 and increase by one; there
@@ -77,55 +80,12 @@ impl From<rusqlite::Error> for StoreError {
     }
 }
 
-fn io_err(what: &str, path: &Path, e: std::io::Error) -> StoreError {
+pub(crate) fn io_err(what: &str, path: &Path, e: std::io::Error) -> StoreError {
     StoreError::Backend(format!("{what} {}: {e}", path.display()))
 }
 
 // ---------------------------------------------------------------------------------------------
 // Files, connections and migrations
-
-/// Creates `dir` (and missing parents) with mode 0700 when it does not exist.
-fn ensure_private_dir(dir: &Path) -> StoreResult<()> {
-    if dir.is_dir() {
-        return Ok(());
-    }
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder
-        .create(dir)
-        .map_err(|e| io_err("cannot create directory", dir, e))?;
-    // The umask can only remove bits; set the mode explicitly so it is exactly 0700.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| io_err("cannot set mode 0700 on", dir, e))?;
-    }
-    Ok(())
-}
-
-/// Creates an empty file with mode 0600; fails if `path` already exists.
-fn create_new_private_file(path: &Path) -> std::io::Result<()> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    opts.open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
-}
 
 fn path_str(path: &Path) -> StoreResult<&str> {
     path.to_str()
@@ -137,7 +97,7 @@ fn path_str(path: &Path) -> StoreResult<&str> {
 /// `secure_delete = ON`, `busy_timeout` 5 s. Does not migrate.
 pub fn open_connection(path: &Path) -> StoreResult<Connection> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        ensure_private_dir(parent)?;
+        ensure_private_dir(parent).map_err(|e| io_err("cannot create directory", parent, e))?;
     }
     match create_new_private_file(path) {
         Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
@@ -191,12 +151,18 @@ fn set_wal(conn: &Connection, path: &Path) -> StoreResult<()> {
     }
 }
 
-fn open_reader(path: &Path) -> StoreResult<Connection> {
+/// Opens an existing database read-write without creating it, with the busy timeout.
+fn open_rw(path: &Path) -> StoreResult<Connection> {
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
+    Ok(conn)
+}
+
+fn open_reader(path: &Path) -> StoreResult<Connection> {
+    let conn = open_rw(path)?;
     conn.execute_batch("PRAGMA query_only=ON;")?;
     Ok(conn)
 }
@@ -363,46 +329,12 @@ fn foreign_key_check(conn: &Connection, schema: &str) -> StoreResult<()> {
     Ok(())
 }
 
-fn binary_version(migrations: &[(u32, &str, &str)]) -> u32 {
-    migrations.last().map_or(0, |(v, _, _)| *v)
-}
-
-fn validate_list(migrations: &[(u32, &str, &str)]) -> StoreResult<()> {
-    for (i, (version, name, _)) in migrations.iter().enumerate() {
-        if usize::try_from(*version).ok() != Some(i + 1) {
-            return Err(StoreError::Backend(format!(
-                "embedded migration {name} has version {version}, expected {}",
-                i + 1
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// Refuses a newer database, a missing checksum or a checksum mismatch; returns the version.
 fn verify_applied(conn: &Connection, migrations: &[(u32, &str, &str)]) -> StoreResult<u32> {
     let db = schema_version(conn)?;
-    let bin = binary_version(migrations);
-    if db > bin {
-        return Err(StoreError::Backend(format!(
-            "server database is from a newer awm ({db}, this binary knows {bin}). Upgrade awm."
-        )));
-    }
-    for (version, name, sql) in migrations.iter().filter(|(v, _, _)| *v <= db) {
-        let stored = meta_value(conn, &checksum_key(*version))?.ok_or_else(|| {
-            StoreError::Backend(format!(
-                "migration {name} has no checksum in meta (database at version {db})"
-            ))
-        })?;
-        let embedded = checksum(sql.as_bytes());
-        if stored != embedded {
-            return Err(StoreError::Backend(format!(
-                "checksum mismatch for migration {name}: the database records {stored}, \
-                 this awm embeds {embedded}; refusing to migrate"
-            )));
-        }
-    }
-    Ok(db)
+    check_applied(db, migrations, "meta", |v| {
+        meta_value(conn, &checksum_key(v))
+    })
 }
 
 fn unique_suffix() -> String {
@@ -454,14 +386,10 @@ fn sync_file(path: &Path) -> StoreResult<()> {
 }
 
 fn sync_dir(path: &Path) -> StoreResult<()> {
-    #[cfg(unix)]
-    if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::File::open(dir)
-            .and_then(|f| f.sync_all())
-            .map_err(|e| io_err("cannot sync directory", dir, e))?;
+    match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(dir) => fsutil::sync_dir(dir).map_err(|e| io_err("cannot sync directory", dir, e)),
+        None => Ok(()),
     }
-    let _ = path;
-    Ok(())
 }
 
 /// Runs after `COMMIT`: a failure means the migration is already applied.
@@ -574,38 +502,6 @@ fn u64_at(r: &Row<'_>, i: usize) -> rusqlite::Result<u64> {
     u64::try_from(v).map_err(|_| bad(i, "u64"))
 }
 
-fn role_str(role: Role, field: &str) -> StoreResult<&'static str> {
-    match role {
-        Role::Member => Ok("member"),
-        Role::Admin => Ok("admin"),
-        Role::Unknown => Err(StoreError::InvalidValue {
-            field: field.to_string(),
-        }),
-    }
-}
-
-fn i64_of(v: u64, field: impl FnOnce() -> String) -> StoreResult<i64> {
-    // Indexes stay below 2^53 (`docs/sync-v1.md` §1).
-    i64::try_from(v)
-        .ok()
-        .filter(|v| *v < (1_i64 << 53))
-        .ok_or_else(|| StoreError::InvalidValue { field: field() })
-}
-
-fn check_hash(hash: &str, field: &str) -> StoreResult<()> {
-    if valid_token_hash(hash) {
-        Ok(())
-    } else {
-        Err(StoreError::InvalidValue {
-            field: field.to_string(),
-        })
-    }
-}
-
-fn broken(what: &str) -> StoreError {
-    StoreError::Backend(format!("broken invariant: {what}"))
-}
-
 // ---------------------------------------------------------------------------------------------
 // Statements shared by several operations
 
@@ -632,42 +528,6 @@ fn audit_tx(
         params![at, actor.map(|a| a.to_string()), action, target, detail],
     )?;
     Ok(conn.query_row("SELECT MAX(idx) FROM audit", [], |r| r.get(0))?)
-}
-
-/// The organisation row as stored (`pending_retention` not yet promoted).
-struct RawOrg {
-    id: Id,
-    created_at: i64,
-    current_epoch: u32,
-    rotation_needed: bool,
-    retention_days: u32,
-    min_client: Version,
-    max_members: u32,
-    pending: Option<(u32, i64)>,
-}
-
-impl RawOrg {
-    /// The settings as they apply at `now`: a pending decrease whose 7 days are over is in
-    /// force (it is also written back by the next settings change or retention run).
-    fn effective(&self, now: i64) -> OrgSettings {
-        match self.pending {
-            Some((days, at)) if at <= now => OrgSettings {
-                retention_days: days,
-                min_client: self.min_client.clone(),
-                max_members: self.max_members,
-                pending_retention: None,
-            },
-            pending => OrgSettings {
-                retention_days: self.retention_days,
-                min_client: self.min_client.clone(),
-                max_members: self.max_members,
-                pending_retention: pending.map(|(retention_days, effective_at)| PendingRetention {
-                    retention_days,
-                    effective_at,
-                }),
-            },
-        }
-    }
 }
 
 fn load_org(conn: &Connection) -> StoreResult<Option<RawOrg>> {
@@ -823,11 +683,6 @@ fn pulled_item(r: &Row<'_>) -> rusqlite::Result<PulledItem> {
     }
 }
 
-/// The encoded JSON length of `v` plus one byte for the separator.
-fn json_len<T: serde::Serialize>(v: &T) -> usize {
-    serde_json::to_vec(v).map_or(0, |b| b.len()) + 1
-}
-
 /// Reads a stream from `from` into `out`, at most `limit` items, while `budget` bytes last.
 /// Returns true when the byte budget cut the read.
 fn read_stream(
@@ -851,7 +706,7 @@ fn read_stream(
     ])?;
     while let Some(r) = rows.next()? {
         let item = pulled_item(r)?;
-        let len = json_len(&item);
+        let len = item_len(&item);
         if len > *budget {
             return Ok(true);
         }
@@ -861,7 +716,7 @@ fn read_stream(
     Ok(false)
 }
 
-fn dump_value(v: ValueRef<'_>) -> DumpValue {
+pub(crate) fn dump_value(v: ValueRef<'_>) -> DumpValue {
     match v {
         ValueRef::Null => DumpValue::Null,
         ValueRef::Integer(i) => DumpValue::Int(i),
@@ -899,20 +754,9 @@ fn dump_tx(conn: &Connection, schema: &str) -> StoreResult<LogicalDump> {
 }
 
 fn store_holds_org(conn: &Connection) -> StoreResult<bool> {
-    let n: i64 = conn.query_row(
-        "SELECT (SELECT COUNT(*) FROM org) + (SELECT COUNT(*) FROM member) \
-              + (SELECT COUNT(*) FROM device) + (SELECT COUNT(*) FROM invite) \
-              + (SELECT COUNT(*) FROM record) + (SELECT COUNT(*) FROM deletion) \
-              + (SELECT COUNT(*) FROM wrap) + (SELECT COUNT(*) FROM audit)",
-        [],
-        |r| r.get(0),
-    )?;
+    let n: i64 = conn.query_row(HOLDS_ORG_SQL, [], |r| r.get(0))?;
     Ok(n > 0)
 }
-
-/// The canonical meta filter in SQL (for `meta` rows of an attached file).
-const CANONICAL_META_SQL: &str = "key NOT LIKE 'schema\\_%' ESCAPE '\\' \
-     AND key NOT LIKE 'backup\\_%' ESCAPE '\\' AND key NOT LIKE 'bootstrap\\_%' ESCAPE '\\'";
 
 fn canonical_counts(conn: &Connection, schema: &str) -> StoreResult<TableCounts> {
     let mut out = Vec::new();
@@ -934,7 +778,7 @@ fn canonical_counts(conn: &Connection, schema: &str) -> StoreResult<TableCounts>
 
 /// The schema of an attached file must be this binary's (the canonical format is versioned
 /// with the migrations).
-fn check_attached_schema(conn: &Connection, schema: &str) -> StoreResult<()> {
+pub(crate) fn check_attached_schema(conn: &Connection, schema: &str) -> StoreResult<()> {
     let get = |key: &str| -> StoreResult<Option<String>> {
         Ok(conn
             .query_row(
@@ -1026,12 +870,8 @@ fn attach_existing(conn: &Connection, path: &Path, schema: &str) -> StoreResult<
 }
 
 /// Opens a finished copy (`VACUUM INTO` output) as a standalone file in rollback mode.
-fn finish_copy(path: &Path) -> StoreResult<Connection> {
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    conn.busy_timeout(BUSY_TIMEOUT)?;
+pub(crate) fn finish_copy(path: &Path) -> StoreResult<Connection> {
+    let conn = open_rw(path)?;
     conn.query_row("PRAGMA journal_mode=DELETE", [], |r| r.get::<_, String>(0))?;
     conn.execute_batch("PRAGMA secure_delete=ON; PRAGMA foreign_keys=OFF;")?;
     Ok(conn)
@@ -1049,7 +889,7 @@ fn backup_log_head_tx(conn: &Connection, schema: &str) -> StoreResult<i64> {
 }
 
 /// Runs `f` with a new file at `dest` (0600); removes it when `f` fails.
-fn with_new_file<T>(dest: &Path, f: impl FnOnce() -> StoreResult<T>) -> StoreResult<T> {
+pub(crate) fn with_new_file<T>(dest: &Path, f: impl FnOnce() -> StoreResult<T>) -> StoreResult<T> {
     create_new_private_file(dest).map_err(|e| io_err("cannot create", dest, e))?;
     let result = f().and_then(|v| sync_file(dest).map(|()| v));
     if result.is_err() {
@@ -1104,12 +944,7 @@ impl Inner {
 
     /// A connection of its own for `VACUUM INTO` and change sets, so the writer is not held.
     fn side_connection(&self) -> StoreResult<Connection> {
-        let conn = Connection::open_with_flags(
-            &self.path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        conn.busy_timeout(BUSY_TIMEOUT)?;
-        Ok(conn)
+        open_rw(&self.path)
     }
 }
 
@@ -1615,7 +1450,7 @@ fn changes_info(conn: &Connection, schema: &str, after: i64) -> StoreResult<Chan
     })
 }
 
-fn columns_of(table: &str) -> StoreResult<&'static [&'static str]> {
+pub(crate) fn columns_of(table: &str) -> StoreResult<&'static [&'static str]> {
     CANONICAL_TABLES
         .iter()
         .find(|(t, _)| *t == table)
@@ -2835,13 +2670,7 @@ impl Store for SqliteStore {
         self.run(move |inner| {
             let live = inner.path.clone();
             with_new_file(&dest, || {
-                let mut out = Connection::open_with_flags(
-                    &dest,
-                    OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-                )?;
-                out.busy_timeout(BUSY_TIMEOUT)?;
-                out.query_row("PRAGMA journal_mode=DELETE", [], |r| r.get::<_, String>(0))?;
-                out.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA secure_delete=ON;")?;
+                let mut out = finish_copy(&dest)?;
                 migrate(&mut out)?;
                 let triggers: Vec<String> = out
                     .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger'")?

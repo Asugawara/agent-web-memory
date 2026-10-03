@@ -21,6 +21,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use super::manifest::{Kind, Manifest, Origin};
 use super::target::{Bucket, TargetError};
 use super::{keys, parse_lineage, BackupError, Clock, FULL_INTERVAL_S};
+use crate::fsutil::{create_new_private_file, ensure_private_dir};
 use crate::store::{Store, StoreError, CANONICAL_TABLES};
 
 // ---------------------------------------------------------------------------------------------
@@ -86,31 +87,13 @@ pub(crate) fn io(what: &str, path: &Path, e: impl std::fmt::Display) -> BackupEr
 
 /// Creates `dir` (and missing parents) with mode 0700 when it does not exist.
 pub(crate) fn mkdir_private(dir: &Path) -> Result<(), BackupError> {
-    if dir.is_dir() {
-        return Ok(());
-    }
-    let mut b = std::fs::DirBuilder::new();
-    b.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        b.mode(0o700);
-    }
-    b.create(dir)
-        .map_err(|e| io("cannot create directory", dir, e))
+    ensure_private_dir(dir).map_err(|e| io("cannot create directory", dir, e))
 }
 
 /// Writes `bytes` to a new file (0600) at `path` and syncs it; fails when `path` exists.
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<(), BackupError> {
     use std::io::Write as _;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(path).map_err(|e| io("cannot create", path, e))?;
+    let mut f = create_new_private_file(path).map_err(|e| io("cannot create", path, e))?;
     f.write_all(bytes)
         .and_then(|()| f.sync_all())
         .map_err(|e| io("cannot write", path, e))

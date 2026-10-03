@@ -7,7 +7,7 @@
 
 use awm_proto::wire::Id;
 
-use crate::store::{Store, StoreError};
+use crate::store::{RestoreState, Store, StoreError};
 
 const DAY_S: i64 = 86_400;
 
@@ -34,7 +34,19 @@ pub async fn check(
         return Ok(Quota::Within);
     }
     let state = store.restore_state().await?;
-    if state.restored_at.is_some_and(|t| now - t < DAY_S) {
+    check_state(store, &state, member, adding, per_day, now).await
+}
+
+/// [`check`] with the restore state the caller already read (one read per request).
+pub async fn check_state(
+    store: &dyn Store,
+    state: &RestoreState,
+    member: Id,
+    adding: u64,
+    per_day: u32,
+    now: i64,
+) -> Result<Quota, StoreError> {
+    if adding == 0 || state.restored_at.is_some_and(|t| now - t < DAY_S) {
         return Ok(Quota::Within);
     }
     let day_start = now - now.rem_euclid(DAY_S);

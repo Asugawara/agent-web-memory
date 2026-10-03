@@ -12,42 +12,30 @@
 #[path = "support/pebble.rs"]
 mod pebble;
 
+#[path = "support/log.rs"]
+mod capture;
+
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use awm_proto::wire::Version;
 use awm_server::config::{self, Challenge, Domain, Flags};
-use awm_server::http::LogSink;
 use awm_server::retention::{Clock, SystemClock};
 use awm_server::serve::{self, Command, Invocation, Io, Server, Settings};
 use awm_server::tls::acme::{self, Acme, AcmeParams, Http01Tokens, Tick, BACKOFF_S};
 use awm_server::tls::alpn::{challenge_cert, CertSlot};
 use awm_server::tls::cache::{AcmeCache, ACCOUNT_FILE, CERT_FILE, KEY_FILE, STATE_FILE};
 use awm_server::tls::der::{pem_blocks, CertInfo};
+use capture::Capture;
 use pebble::Pebble;
 use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // ---------------------------------------------------------------------------------------------
 // Helpers
-
-#[derive(Default)]
-struct Capture(Mutex<Vec<String>>);
-
-impl LogSink for Capture {
-    fn line(&self, line: &str) {
-        self.0.lock().unwrap().push(line.to_string());
-    }
-}
-
-impl Capture {
-    fn text(&self) -> String {
-        self.0.lock().unwrap().join("\n")
-    }
-}
 
 /// A clock the tests move; `sleep` never returns on its own.
 struct TestClock(AtomicI64);

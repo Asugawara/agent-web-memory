@@ -31,6 +31,8 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::fsutil::{create_new_private_file, ensure_private_dir, sync_dir};
+
 /// The future every [`Bucket`] method returns.
 pub type BucketFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, TargetError>> + Send + 'a>>;
 
@@ -377,31 +379,10 @@ pub struct FileBucket {
 
 static TMP_N: AtomicU64 = AtomicU64::new(0);
 
-fn mkdir_private(dir: &Path) -> std::io::Result<()> {
-    if dir.is_dir() {
-        return Ok(());
-    }
-    let mut b = std::fs::DirBuilder::new();
-    b.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        b.mode(0o700);
-    }
-    b.create(dir)
-}
-
-fn sync_dir(dir: &Path) {
-    // Durability of the new name; a failure here (some filesystems refuse) is not an error.
-    if let Ok(d) = std::fs::File::open(dir) {
-        let _ = d.sync_all();
-    }
-}
-
 impl FileBucket {
     /// Opens (creating 0700 when missing) the directory `root`.
     pub fn open(root: &Path) -> Result<FileBucket, TargetError> {
-        mkdir_private(root).map_err(|e| io_error("create directory", "", e))?;
+        ensure_private_dir(root).map_err(|e| io_error("create directory", "", e))?;
         if !root.is_dir() {
             return Err(invalid("file:// target is not a directory"));
         }
@@ -413,21 +394,14 @@ impl FileBucket {
     fn put_blocking(root: &Path, key: &str, bytes: &[u8]) -> Result<(), TargetError> {
         let dest = root.join(key);
         let parent = dest.parent().unwrap_or(root);
-        mkdir_private(parent).map_err(|e| io_error("create directory for", key, e))?;
+        ensure_private_dir(parent).map_err(|e| io_error("create directory for", key, e))?;
         let tmp = parent.join(format!(
             ".tmp-{}-{}",
             std::process::id(),
             TMP_N.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
         let result = (|| {
-            let mut f = opts.open(&tmp).map_err(|e| io_error("upload", key, e))?;
+            let mut f = create_new_private_file(&tmp).map_err(|e| io_error("upload", key, e))?;
             f.write_all(bytes).map_err(|e| io_error("upload", key, e))?;
             f.sync_all().map_err(|e| io_error("upload", key, e))?;
             match std::fs::hard_link(&tmp, &dest) {
@@ -447,7 +421,8 @@ impl FileBucket {
         })();
         let _ = std::fs::remove_file(&tmp);
         if result.is_ok() {
-            sync_dir(parent);
+            // Durability of the new name; a failure here (some filesystems refuse) is not an error.
+            let _ = sync_dir(parent);
         }
         result
     }

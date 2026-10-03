@@ -10,13 +10,14 @@
 
 #![cfg(feature = "sqlite")]
 
+#[path = "support/org.rs"]
+mod fixtures;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use awm_proto::wire::{
-    DeleteRequest, Handle, Id, InviteKind, Key32, PushItem, PushRecord, Tag, Version, B64,
-};
+use awm_proto::wire::{DeleteRequest, Id, InviteKind, PushItem, PushRecord, Tag, B64};
 use awm_server::backup::full::{pg_daily_export, snapshot_now};
 use awm_server::backup::restore::{
     self, assemble, select_chain, verify, RestoreDest, RestoreReport, RestoreRequest, RestoreSource,
@@ -28,15 +29,11 @@ use awm_server::backup::{
     TargetError, FULL_INTERVAL_S, KEEP_FULL_S, NO_TARGET,
 };
 use awm_server::store::sqlite::{SqliteStore, DB_FILE};
-use awm_server::store::{
-    checksum, Actor, LogicalDump, NewBootstrap, NewInvite, NewJoin, OrgDefaults, PushBatch, Store,
-};
+use awm_server::store::{checksum, Actor, LogicalDump, PushBatch, Store};
+use fixtures::{bootstrap, device_token_hash, join, Org, DAY, T0};
 
 // ---------------------------------------------------------------------------------------------
 // Fixtures
-
-const T0: i64 = 1_790_000_000;
-const DAY: i64 = 86_400;
 
 /// A directory under the target's temporary directory, mode 0700, removed on drop.
 struct TempDir(PathBuf);
@@ -102,10 +99,6 @@ impl Clock for FakeClock {
     }
 }
 
-fn h(s: &str) -> String {
-    checksum(s.as_bytes())
-}
-
 /// An envelope-shaped blob (`0x01` and 41 + 256·k bytes) whose content is unique to `seed`.
 fn blob(seed: &str, k: usize) -> B64 {
     let len = 41 + 256 * k;
@@ -124,67 +117,9 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
 }
 
-struct Org {
-    admin: Actor,
-}
-
-async fn bootstrap(s: &dyn Store) -> Org {
-    s.set_bootstrap(h("bootstrap"), T0 + DAY).await.unwrap();
-    let device = Id::new_v4();
-    let member = s
-        .bootstrap(NewBootstrap {
-            bootstrap_token_hash: h("bootstrap"),
-            org_id: Id::new_v4(),
-            handle: Handle::parse("alf").unwrap(),
-            device_id: device,
-            device_pubkey: Key32([1; 32]),
-            device_token_hash: h(&format!("device-{device}")),
-            defaults: OrgDefaults {
-                retention_days: 365,
-                min_client: Version::new(0, 2, 0),
-                max_members: 100,
-            },
-            now: T0,
-        })
-        .await
-        .unwrap();
-    Org {
-        admin: Actor {
-            member_id: member,
-            device_id: device,
-            admin: true,
-        },
-    }
-}
-
 /// Invites and joins a member (pending device): rows in invite, member, device, audit.
 async fn add_member(s: &dyn Store, org: &Org, name: &str) {
-    let invite_id = Id::new_v4();
-    s.create_invite(NewInvite {
-        invite_id,
-        token_hash: h(&format!("invite-{invite_id}")),
-        kind: InviteKind::Member,
-        handle: Handle::parse(name).unwrap(),
-        role: None,
-        expires_at: T0 + 7 * DAY,
-        by: org.admin,
-        now: T0,
-    })
-    .await
-    .unwrap();
-    let device = Id::new_v4();
-    s.join(NewJoin {
-        invite_id,
-        invite_token_hash: h(&format!("invite-{invite_id}")),
-        handle: Handle::parse(name).unwrap(),
-        device_id: device,
-        device_pubkey: Key32([9; 32]),
-        join_mac: Key32([8; 32]),
-        device_token_hash: h(&format!("device-{device}")),
-        now: T0 + 60,
-    })
-    .await
-    .unwrap();
+    join(s, org.admin, InviteKind::Member, name, 9).await;
 }
 
 /// Pushes `n` records to the admin's `rec` stream; returns their ids.
@@ -1832,7 +1767,7 @@ async fn manifests_and_errors_hold_no_content() {
     s.clock.advance(60);
     s.backup.tick().await.unwrap();
     let needle = blob(&ids[0].to_string(), 1).0[1..49].to_vec();
-    let token_hash = h(&format!("device-{}", org.admin.device_id));
+    let token_hash = device_token_hash(org.admin.device_id);
     for key in all_keys(&*bucket).await {
         let bytes = bucket.get(key.clone()).await.unwrap().unwrap();
         if key.ends_with(".json") {

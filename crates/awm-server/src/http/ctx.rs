@@ -9,12 +9,14 @@ use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, Query, Request};
 use axum::http::request::Parts;
 use axum::http::HeaderMap;
+use tokio::sync::OnceCell;
 
 use super::error::{parse_json, query_error, ApiError};
 use super::AppState;
 use crate::auth::{self, AuthError, Caller};
 use crate::authz::{self, Action, Refusal};
 use crate::limits::{bucket_addr, RateKey};
+use crate::store::{OrgRow, RestoreState, StoreError};
 
 /// What the request log learns about a request while a handler runs.
 #[derive(Debug, Default, Clone)]
@@ -79,6 +81,11 @@ pub struct Cx {
     /// In a `Mutex` only so that `&Cx` is `Sync` (an axum `Body` is not).
     body: Mutex<Option<Body>>,
     auth_header: Option<String>,
+    /// The body size limit this route reads under.
+    cap: Cap,
+    /// Read at most once per request: the gate, the quota and `min_client` share them.
+    restore: OnceCell<RestoreState>,
+    org: OnceCell<Option<OrgRow>>,
 }
 
 fn header_str<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -86,6 +93,17 @@ fn header_str<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
 }
 
 impl Cx {
+    /// [`Cx::open`] for the routes that carry a device token: `Awm-Client` required, limited per
+    /// device, bodies up to 2 MiB.
+    pub fn token(app: &AppState, req: Request) -> Result<Cx, ApiError> {
+        Cx::open(app, req, Client::Required, Class::Token, Cap::Body)
+    }
+
+    /// [`Cx::token`] for `POST /v1/records`: bodies up to 1.5 MiB.
+    pub fn token_batch(app: &AppState, req: Request) -> Result<Cx, ApiError> {
+        Cx::open(app, req, Client::Required, Class::Token, Cap::Batch)
+    }
+
     /// Checks everything that needs no body and no store: `Content-Encoding`, the declared body
     /// size, `Awm-Client`, and the per-address rate limit.
     pub fn open(
@@ -205,6 +223,9 @@ impl Cx {
             parts,
             body: Mutex::new(Some(body)),
             auth_header,
+            cap,
+            restore: OnceCell::new(),
+            org: OnceCell::new(),
         })
     }
 
@@ -217,7 +238,8 @@ impl Cx {
     }
 
     /// The request body, read to at most 2 MiB (and 1.5 MiB for a batch).
-    pub async fn bytes(&mut self, cap: Cap) -> Result<Bytes, ApiError> {
+    pub async fn bytes(&mut self) -> Result<Bytes, ApiError> {
+        let cap = self.cap;
         let limits = &self.app.config.limits;
         let body = self
             .body
@@ -239,14 +261,14 @@ impl Cx {
     }
 
     /// A JSON body of type `T`.
-    pub async fn json<T: serde::de::DeserializeOwned>(&mut self, cap: Cap) -> Result<T, ApiError> {
-        let bytes = self.bytes(cap).await?;
+    pub async fn json<T: serde::de::DeserializeOwned>(&mut self) -> Result<T, ApiError> {
+        let bytes = self.bytes().await?;
         parse_json(&bytes)
     }
 
     /// A JSON body, or `{}` when there is none (requests whose fields are all optional).
     pub async fn json_or_empty<T: serde::de::DeserializeOwned>(&mut self) -> Result<T, ApiError> {
-        let bytes = self.bytes(Cap::Body).await?;
+        let bytes = self.bytes().await?;
         if bytes.is_empty() {
             return parse_json(b"{}");
         }
@@ -281,7 +303,12 @@ impl Cx {
             ),
             None => None,
         };
-        match auth::authenticate(&*self.app.store, header.as_deref(), self.now).await {
+        let authenticated =
+            auth::authenticate_with(&*self.app.store, header.as_deref(), self.now, || async {
+                Ok(self.org().await?.as_ref().map(|o| o.org_id))
+            })
+            .await;
+        match authenticated {
             Ok(caller) => {
                 if charged == Some(Ok(())) {
                     self.app.limiter.refund(failed_key, self.now);
@@ -327,10 +354,24 @@ impl Cx {
 
     /// The organisation's `min_client`, or the release floor before there is an organisation.
     pub async fn min_client(&self) -> Result<Version, ApiError> {
-        Ok(match self.app.store.org(self.now).await? {
-            Some(org) => org.settings.min_client,
+        Ok(match self.org().await? {
+            Some(org) => org.settings.min_client.clone(),
             None => self.app.config.release_floor.clone(),
         })
+    }
+
+    /// The organisation row, read once per request.
+    pub async fn org(&self) -> Result<&Option<OrgRow>, StoreError> {
+        self.org
+            .get_or_try_init(|| self.app.store.org(self.now))
+            .await
+    }
+
+    /// The restore state, read once per request.
+    pub async fn restore_state(&self) -> Result<&RestoreState, StoreError> {
+        self.restore
+            .get_or_try_init(|| self.app.store.restore_state())
+            .await
     }
 
     /// The restore gate for an authenticated caller (`docs/sync-v1.md` §11): it binds approved
@@ -346,7 +387,7 @@ impl Cx {
 
     /// 503 `restore_pending` while a restore is pending.
     pub async fn restore_gate(&self) -> Result<(), ApiError> {
-        let state = self.app.store.restore_state().await?;
+        let state = self.restore_state().await?;
         if state.restore_pending {
             return Err(ApiError::restore_pending(
                 state.generation,

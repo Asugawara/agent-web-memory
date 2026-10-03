@@ -12,6 +12,9 @@
 
 #![cfg(any(feature = "sqlite", feature = "pg"))]
 
+#[path = "support/org.rs"]
+mod fixtures;
+
 use std::any::Any;
 use std::collections::HashSet;
 use std::future::Future;
@@ -21,13 +24,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use awm_proto::wire::{
-    limits, Cursor, DeleteRequest, DeviceWrap, EpochWrap, ErrorCode, Handle, Id, InviteKind, Key32,
+    limits, Cursor, DeleteRequest, DeviceWrap, EpochWrap, ErrorCode, Id, InviteKind, Key32,
     PulledItem, PushDeleted, PushItem, PushRecord, PushResponse, Role, SettingsUpdate, Tag,
     Version, B64,
 };
 use awm_server::store::{
-    checksum, Actor, AuditEntry, NewBootstrap, NewInvite, NewJoin, OrgDefaults, PushBatch, Store,
-    StoreError, StoreResult,
+    checksum, Actor, AuditEntry, NewBootstrap, NewInvite, PushBatch, Store, StoreError, StoreResult,
+};
+use fixtures::{
+    bootstrap, defaults, device_token_hash, h, handle, invite, invite_token_hash, join_req,
+    wraps_for, Org, DAY, T0,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -152,28 +158,10 @@ async fn pg_fixture() -> Option<Fixture> {
 // ---------------------------------------------------------------------------------------------
 // Helpers shared by the cases
 
-const T0: i64 = 1_790_000_000;
-const DAY: i64 = 86_400;
 const BIG: usize = limits::PULL_RESPONSE_BYTES;
-
-fn h(s: &str) -> String {
-    checksum(s.as_bytes())
-}
-
-fn handle(s: &str) -> Handle {
-    Handle::parse(s).unwrap()
-}
 
 fn tag(s: &str) -> Tag {
     Tag::parse(s).unwrap()
-}
-
-fn device_token_hash(device: Id) -> String {
-    h(&format!("device-token-{device}"))
-}
-
-fn invite_token_hash(invite: Id) -> String {
-    h(&format!("invite-token-{invite}"))
 }
 
 /// An envelope-shaped blob (`0x01` and 41 + 256·k bytes) whose content is unique to `seed`.
@@ -188,14 +176,6 @@ fn blob(seed: &str, k: usize) -> B64 {
     }
     v.truncate(len);
     B64(v)
-}
-
-fn defaults() -> OrgDefaults {
-    OrgDefaults {
-        retention_days: 365,
-        min_client: Version::new(0, 2, 0),
-        max_members: 100,
-    }
 }
 
 fn rec(t: &str, idx: u64, id: Id, epoch: u32, b: B64) -> PushItem {
@@ -214,79 +194,6 @@ fn marker(t: &str, idx: u64, id: Id) -> PushItem {
         idx,
         id,
     })
-}
-
-struct Org {
-    org_id: Id,
-    admin: Actor,
-}
-
-async fn bootstrap(s: &dyn Store) -> Org {
-    s.set_bootstrap(h("bootstrap"), T0 + DAY).await.unwrap();
-    let device = Id::new_v4();
-    let org_id = Id::new_v4();
-    let member = s
-        .bootstrap(NewBootstrap {
-            bootstrap_token_hash: h("bootstrap"),
-            org_id,
-            handle: handle("alf"),
-            device_id: device,
-            device_pubkey: Key32([1; 32]),
-            device_token_hash: device_token_hash(device),
-            defaults: defaults(),
-            now: T0,
-        })
-        .await
-        .unwrap();
-    Org {
-        org_id,
-        admin: Actor {
-            member_id: member,
-            device_id: device,
-            admin: true,
-        },
-    }
-}
-
-async fn invite(s: &dyn Store, by: Actor, kind: InviteKind, name: &str) -> Id {
-    let invite_id = Id::new_v4();
-    s.create_invite(NewInvite {
-        invite_id,
-        token_hash: invite_token_hash(invite_id),
-        kind,
-        handle: handle(name),
-        role: None,
-        expires_at: T0 + 7 * DAY,
-        by,
-        now: T0,
-    })
-    .await
-    .unwrap();
-    invite_id
-}
-
-fn join_req(invite_id: Id, name: &str, device: Id, n: u8) -> NewJoin {
-    NewJoin {
-        invite_id,
-        invite_token_hash: invite_token_hash(invite_id),
-        handle: handle(name),
-        device_id: device,
-        device_pubkey: Key32([n; 32]),
-        join_mac: Key32([n.wrapping_add(100); 32]),
-        device_token_hash: device_token_hash(device),
-        now: T0 + 60,
-    }
-}
-
-async fn wraps_for(s: &dyn Store) -> Vec<EpochWrap> {
-    let epoch = s.org(T0).await.unwrap().unwrap().current_epoch;
-    (0..=epoch)
-        .map(|e| EpochWrap {
-            epoch: e,
-            wrap: B64(vec![e as u8; 89]),
-            auth: Key32([7; 32]),
-        })
-        .collect()
 }
 
 /// Invites, joins and approves a member with one device.

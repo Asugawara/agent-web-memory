@@ -9,15 +9,20 @@
 
 #![cfg(feature = "sqlite")]
 
+#[path = "support/log.rs"]
+mod capture;
+#[path = "support/org.rs"]
+mod fixtures;
+
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use awm_proto::wire::{BootstrapToken, Id, Version, B64};
+use awm_proto::wire::{BootstrapToken, Id, Version};
 use awm_server::config::{self, Flags, Resolved, Secret, StoreChoice};
-use awm_server::http::{self, LogSink, RetentionMode};
+use awm_server::http::{self, RetentionMode};
 use awm_server::retention::{Clock, SystemClock};
 use awm_server::serve::{self, Command, Invocation, Io, Server, Settings};
 use awm_server::store::Store;
@@ -25,6 +30,8 @@ use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::Request;
 use axum::Router;
+use capture::Capture;
+use fixtures::b64;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -62,21 +69,6 @@ fn chmod(path: &Path, mode: u32) {
 fn write_private(path: &Path, text: &str) {
     std::fs::write(path, text).unwrap();
     chmod(path, 0o600);
-}
-
-#[derive(Default)]
-struct Capture(Mutex<Vec<String>>);
-
-impl LogSink for Capture {
-    fn line(&self, line: &str) {
-        self.0.lock().unwrap().push(line.to_string());
-    }
-}
-
-impl Capture {
-    fn text(&self) -> String {
-        self.0.lock().unwrap().join("\n")
-    }
 }
 
 /// A clock the tests move; `sleep` never returns on its own.
@@ -176,10 +168,6 @@ async fn cmd(flags: Flags, command: Command, s: Settings, tty: bool) -> (i32, St
         String::from_utf8(out).unwrap(),
         String::from_utf8(err).unwrap(),
     )
-}
-
-fn b64(bytes: &[u8]) -> String {
-    String::from(B64(bytes.to_vec()))
 }
 
 struct Resp {

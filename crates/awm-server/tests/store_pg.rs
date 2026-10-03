@@ -18,6 +18,9 @@
 #[path = "support/pg.rs"]
 mod support;
 
+#[path = "support/org.rs"]
+mod fixtures;
+
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,35 +28,23 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use awm_proto::wire::{
-    DeleteRequest, DeviceWrap, EpochWrap, Handle, Id, InviteKind, Key32, PulledItem, PushDeleted,
-    PushItem, PushRecord, SettingsUpdate, Tag, Version, B64,
+    DeleteRequest, DeviceWrap, EpochWrap, Id, InviteKind, Key32, PulledItem, PushDeleted, PushItem,
+    PushRecord, SettingsUpdate, Tag, Version, B64,
 };
 use awm_server::store::pg::{
     migrate, migrate_with, org_lock_key, parse_url, PgStore, MAX_POOL_SIZE, MIGRATIONS, ORG_TABLES,
     RETENTION_CLAIM,
 };
 use awm_server::store::sqlite::SqliteStore;
-use awm_server::store::{
-    checksum, Actor, AuditEntry, NewBootstrap, NewInvite, NewJoin, OrgDefaults, PushBatch, Store,
-    StoreError,
-};
+use awm_server::store::{checksum, Actor, AuditEntry, PushBatch, Store, StoreError};
+use fixtures::{bootstrap, device_token_hash, invite, join_req, Org, DAY, T0};
 use support::{PgEnv, APP, OWNER};
 
-const T0: i64 = 1_790_000_000;
-const DAY: i64 = 86_400;
 const HOUR: i64 = 3_600;
 const BIG: usize = awm_proto::wire::limits::PULL_RESPONSE_BYTES;
 
 // ---------------------------------------------------------------------------------------------
 // Helpers
-
-fn h(s: &str) -> String {
-    checksum(s.as_bytes())
-}
-
-fn handle(s: &str) -> Handle {
-    Handle::parse(s).unwrap()
-}
 
 fn tag(s: &str) -> Tag {
     Tag::parse(s).unwrap()
@@ -81,10 +72,6 @@ fn rec(t: &str, idx: u64, id: Id, epoch: u32) -> PushItem {
     })
 }
 
-fn device_token_hash(device: Id) -> String {
-    h(&format!("device-token-{device}"))
-}
-
 struct TempDir(PathBuf);
 
 impl TempDir {
@@ -104,67 +91,6 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-async fn bootstrap(s: &dyn Store) -> (Id, Actor) {
-    s.set_bootstrap(h("bootstrap"), T0 + DAY).await.unwrap();
-    let device = Id::new_v4();
-    let org_id = Id::new_v4();
-    let member = s
-        .bootstrap(NewBootstrap {
-            bootstrap_token_hash: h("bootstrap"),
-            org_id,
-            handle: handle("alf"),
-            device_id: device,
-            device_pubkey: Key32([1; 32]),
-            device_token_hash: device_token_hash(device),
-            defaults: OrgDefaults {
-                retention_days: 365,
-                min_client: Version::new(0, 2, 0),
-                max_members: 100,
-            },
-            now: T0,
-        })
-        .await
-        .unwrap();
-    (
-        org_id,
-        Actor {
-            member_id: member,
-            device_id: device,
-            admin: true,
-        },
-    )
-}
-
-async fn invite(s: &dyn Store, by: Actor, kind: InviteKind, name: &str) -> Id {
-    let invite_id = Id::new_v4();
-    s.create_invite(NewInvite {
-        invite_id,
-        token_hash: h(&format!("invite-{invite_id}")),
-        kind,
-        handle: handle(name),
-        role: None,
-        expires_at: T0 + 7 * DAY,
-        by,
-        now: T0,
-    })
-    .await
-    .unwrap();
-    invite_id
-}
-
-fn join_req(invite_id: Id, name: &str, device: Id, n: u8) -> NewJoin {
-    NewJoin {
-        invite_id,
-        invite_token_hash: h(&format!("invite-{invite_id}")),
-        handle: handle(name),
-        device_id: device,
-        device_pubkey: Key32([n; 32]),
-        join_mac: Key32([n.wrapping_add(100); 32]),
-        device_token_hash: device_token_hash(device),
-        now: T0 + 60,
     }
 }
 
@@ -224,7 +150,7 @@ struct Seeded {
 }
 
 async fn seed(s: &dyn Store) -> Seeded {
-    let (org_id, admin) = bootstrap(s).await;
+    let Org { org_id, admin } = bootstrap(s).await;
     let roy = add_member(s, admin, "roy", 2).await;
     let kit = add_member(s, admin, "kit", 3).await;
     let pending = invite(s, roy, InviteKind::Device, "roy").await;
@@ -997,7 +923,7 @@ async fn pushes_from_4_connections_in_2_processes_stay_contiguous() {
     };
     let org = Id::new_v4();
     let s = env.store.create_org(org).await.unwrap();
-    let (_, a) = bootstrap(&*s).await;
+    let a = bootstrap(&*s).await.admin;
     let started = Instant::now();
     let child = {
         let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
@@ -1100,7 +1026,7 @@ async fn one_id_pushed_into_two_streams_at_once_conflicts_cleanly() {
         return eprintln!("skipped: AWM_TEST_PG_URL not set");
     };
     let s = env.store.create_org(Id::new_v4()).await.unwrap();
-    let (_, a) = bootstrap(&*s).await;
+    let a = bootstrap(&*s).await.admin;
     let roy = add_member(&*s, a, "roy", 2).await;
     let (mut stored, mut conflicts) = (0, 0);
     for _ in 0..30 {
@@ -1144,7 +1070,7 @@ async fn markers_and_deletions_at_once_keep_the_deletion_stream_contiguous() {
         return eprintln!("skipped: AWM_TEST_PG_URL not set");
     };
     let s = env.store.create_org(Id::new_v4()).await.unwrap();
-    let (_, a) = bootstrap(&*s).await;
+    let a = bootstrap(&*s).await.admin;
     let roy = add_member(&*s, a, "roy", 2).await;
     const N: u64 = 60;
     let markers: Vec<_> = [a, roy]
@@ -1361,7 +1287,7 @@ async fn the_retention_claim_holds_across_instances() {
     let org = Id::new_v4();
     let one = env.store.create_org(org).await.unwrap();
     let two = other.for_org(org);
-    let (_, a) = bootstrap(&*one).await;
+    let a = bootstrap(&*one).await.admin;
     for _ in 0..3 {
         push_n(&*one, &a, "rec", 500, T0).await;
     }
@@ -1518,7 +1444,7 @@ async fn error_texts_hold_no_token_hash_or_blob() {
         return eprintln!("skipped: AWM_TEST_PG_URL not set");
     };
     let s = env.store.create_org(Id::new_v4()).await.unwrap();
-    let (_, a) = bootstrap(&*s).await;
+    let a = bootstrap(&*s).await.admin;
     let inv = invite(&*s, a, InviteKind::Member, "roy").await;
     // A join whose new device token hash equals the admin's: the unique (org_id, token_hash).
     let mut req = join_req(inv, "roy", Id::new_v4(), 2);

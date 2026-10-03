@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::der::{pem_blocks, CertInfo};
+use crate::fsutil::{create_new_private_file, ensure_private_dir};
 
 pub const ACCOUNT_FILE: &str = "account.json";
 pub const CERT_FILE: &str = "cert.pem";
@@ -81,20 +82,7 @@ impl AcmeCache {
     /// Creates the directory with mode 0700 when missing and refuses one that others can read.
     pub fn open(dir: &Path) -> Result<AcmeCache, CacheError> {
         if !dir.exists() {
-            let mut b = std::fs::DirBuilder::new();
-            b.recursive(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                b.mode(0o700);
-            }
-            b.create(dir).map_err(|e| io("cannot create", dir, e))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-                    .map_err(|e| io("cannot set mode 0700 on", dir, e))?;
-            }
+            ensure_private_dir(dir).map_err(|e| io("cannot create", dir, e))?;
         }
         if let Some(m) = crate::config::mode_problem(dir) {
             return Err(CacheError::Permissions(m));
@@ -134,24 +122,11 @@ impl AcmeCache {
         let path = self.dir.join(name);
         let tmp = self.dir.join(format!(".{name}.tmp"));
         let _ = std::fs::remove_file(&tmp);
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&tmp).map_err(|e| io("cannot create", &tmp, e))?;
+        let mut f = create_new_private_file(&tmp).map_err(|e| io("cannot create", &tmp, e))?;
         f.write_all(contents.as_bytes())
             .and_then(|()| f.sync_all())
             .map_err(|e| io("cannot write", &tmp, e))?;
         drop(f);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| io("cannot set mode 0600 on", &tmp, e))?;
-        }
         std::fs::rename(&tmp, &path).map_err(|e| io("cannot replace", &path, e))
     }
 

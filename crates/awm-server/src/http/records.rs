@@ -10,9 +10,9 @@ use awm_proto::wire::{
 use axum::extract::{Request, State};
 use axum::response::Response;
 
-use super::ctx::{Cap, Class, Client, Cx};
+use super::ctx::Cx;
 use super::error::ApiError;
-use super::{json, reply, AppState};
+use super::{json, AppState};
 use crate::authz::{self, Action};
 use crate::delete;
 use crate::quota::{self, Quota};
@@ -22,20 +22,16 @@ use crate::store::{AuditEntry, PushBatch};
 const MAX_IDX: u64 = 1 << 53;
 
 /// `POST /v1/records`.
-pub(super) async fn push(State(app): State<AppState>, req: Request) -> Response {
-    reply(push_inner(&app, req).await)
-}
-
-async fn push_inner(app: &AppState, req: Request) -> Result<Response, ApiError> {
+pub(super) async fn push(State(app): State<AppState>, req: Request) -> Result<Response, ApiError> {
     let limits = &app.config.limits;
-    let mut cx = Cx::open(app, req, Client::Required, Class::Token, Cap::Batch)?;
+    let mut cx = Cx::token_batch(&app, req)?;
 
     // Step 1: the token, before the body is read (RVT2 B1).
     let caller = cx.authenticate().await?;
     cx.authorise(&caller, Action::Push(KnownTag::Rec)).await?;
 
     // Step 2: the body.
-    let body: PushRequest = cx.json(Cap::Batch).await?;
+    let body: PushRequest = cx.json().await?;
     let items = body.records;
     if items.is_empty() {
         return Err(ApiError::invalid(
@@ -157,11 +153,16 @@ async fn quota(cx: &Cx, actor: &crate::store::Actor, items: &[PushItem]) -> Resu
     } else {
         cx.app.store.unknown_ids(markers).await?
     };
+    let adding = records + new_markers;
+    if adding == 0 {
+        return Ok(());
+    }
     let per_day = cx.app.config.limits.records_per_day;
-    match quota::check(
+    match quota::check_state(
         &*cx.app.store,
+        cx.restore_state().await?,
         actor.member_id,
-        records + new_markers,
+        adding,
         per_day,
         cx.now,
     )
@@ -187,13 +188,12 @@ fn page_limit(limit: Option<u32>, max: u32, field: &str) -> Result<u32, ApiError
 }
 
 /// `GET /v1/records`: one stream.
-pub(super) async fn get_records(State(app): State<AppState>, req: Request) -> Response {
-    reply(records_inner(&app, req).await)
-}
-
-async fn records_inner(app: &AppState, req: Request) -> Result<Response, ApiError> {
+pub(super) async fn get_records(
+    State(app): State<AppState>,
+    req: Request,
+) -> Result<Response, ApiError> {
     let limits = &app.config.limits;
-    let mut cx = Cx::open(app, req, Client::Required, Class::Token, Cap::Body)?;
+    let mut cx = Cx::token(&app, req)?;
     let q: RecordsQuery = cx.query()?;
     let caller = cx.authenticate().await?;
     cx.authorise(&caller, Action::Pull).await?;
@@ -216,16 +216,12 @@ async fn records_inner(app: &AppState, req: Request) -> Result<Response, ApiErro
 }
 
 /// `POST /v1/pull`: up to 1,000 cursors.
-pub(super) async fn pull(State(app): State<AppState>, req: Request) -> Response {
-    reply(pull_inner(&app, req).await)
-}
-
-async fn pull_inner(app: &AppState, req: Request) -> Result<Response, ApiError> {
+pub(super) async fn pull(State(app): State<AppState>, req: Request) -> Result<Response, ApiError> {
     let limits = &app.config.limits;
-    let mut cx = Cx::open(app, req, Client::Required, Class::Token, Cap::Body)?;
+    let mut cx = Cx::token(&app, req)?;
     let caller = cx.authenticate().await?;
     cx.authorise(&caller, Action::Pull).await?;
-    let body: PullRequest = cx.json(Cap::Body).await?;
+    let body: PullRequest = cx.json().await?;
     if body.cursors.len() > limits.pull_cursors {
         return Err(ApiError::too_large(
             "pull_cursors",
@@ -267,13 +263,12 @@ async fn pull_inner(app: &AppState, req: Request) -> Result<Response, ApiError> 
 }
 
 /// `GET /v1/deletions`.
-pub(super) async fn deletions(State(app): State<AppState>, req: Request) -> Response {
-    reply(deletions_inner(&app, req).await)
-}
-
-async fn deletions_inner(app: &AppState, req: Request) -> Result<Response, ApiError> {
+pub(super) async fn deletions(
+    State(app): State<AppState>,
+    req: Request,
+) -> Result<Response, ApiError> {
     let limits = &app.config.limits;
-    let mut cx = Cx::open(app, req, Client::Required, Class::Token, Cap::Body)?;
+    let mut cx = Cx::token(&app, req)?;
     let q: DeletionsQuery = cx.query()?;
     let caller = cx.authenticate().await?;
     cx.authorise(&caller, Action::Pull).await?;
@@ -285,15 +280,14 @@ async fn deletions_inner(app: &AppState, req: Request) -> Result<Response, ApiEr
 }
 
 /// `POST /v1/delete`: by ids, `all_mine`, or (admins) by member.
-pub(super) async fn delete_records(State(app): State<AppState>, req: Request) -> Response {
-    reply(delete_inner(&app, req).await)
-}
-
-async fn delete_inner(app: &AppState, req: Request) -> Result<Response, ApiError> {
+pub(super) async fn delete_records(
+    State(app): State<AppState>,
+    req: Request,
+) -> Result<Response, ApiError> {
     let limits = &app.config.limits;
-    let mut cx = Cx::open(app, req, Client::Required, Class::Token, Cap::Body)?;
+    let mut cx = Cx::token(&app, req)?;
     let caller = cx.authenticate().await?;
-    let body: DeleteRequest = cx.json(Cap::Body).await?;
+    let body: DeleteRequest = cx.json().await?;
     // Kept in front of `delete::run` (which checks the same cap after authorising): it rejects an
     // oversized list before any store read for its ids.
     if let DeleteRequest::Ids(ids) = &body {

@@ -12,6 +12,9 @@
 
 #![cfg(any(feature = "sqlite", feature = "pg"))]
 
+#[path = "support/org.rs"]
+mod fixtures;
+
 use std::any::Any;
 use std::collections::HashSet;
 use std::future::Future;
@@ -22,17 +25,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use awm_proto::wire::{
-    DeleteRequest, EpochWrap, ErrorCode, Handle, Id, InviteKind, Key32, PulledItem, PushDeleted,
-    PushItem, PushRecord, Role, SettingsUpdate, Tag, Version, B64,
+    DeleteRequest, ErrorCode, Id, InviteKind, PulledItem, PushDeleted, PushItem, PushRecord, Role,
+    SettingsUpdate, Tag, Version, B64,
 };
 use awm_server::auth::{Caller, CloudOwner, Device};
 use awm_server::authz::Refusal;
 use awm_server::delete::{self, DeleteError, NOTICE_ACTION};
 use awm_server::retention::{self, Clock, HourlyReport, RetentionRun};
-use awm_server::store::{
-    checksum, meta_keys, Actor, NewBootstrap, NewInvite, NewJoin, OrgDefaults, PushBatch, Store,
-    StoreError,
-};
+use awm_server::store::{checksum, meta_keys, Actor, PushBatch, Store, StoreError};
+use fixtures::{bootstrap, device_token_hash, join, wraps_for, Org, DAY, T0};
 
 // ---------------------------------------------------------------------------------------------
 // Fixtures
@@ -109,20 +110,10 @@ async fn pg_fixture() -> Option<Fixture> {
 // ---------------------------------------------------------------------------------------------
 // Helpers
 
-const T0: i64 = 1_790_000_000;
 const HOUR: i64 = 3_600;
-const DAY: i64 = 86_400;
 const BIG: usize = awm_proto::wire::limits::PULL_RESPONSE_BYTES;
 /// Handles used in the cases; none of them can appear inside a UUID or hex text.
 const HANDLES: &[&str] = &["alf", "roy", "kit", "mia"];
-
-fn h(s: &str) -> String {
-    checksum(s.as_bytes())
-}
-
-fn handle(s: &str) -> Handle {
-    Handle::parse(s).unwrap()
-}
 
 fn tag(s: &str) -> Tag {
     Tag::parse(s).unwrap()
@@ -142,19 +133,6 @@ fn blob(seed: &str, k: usize) -> B64 {
     B64(v)
 }
 
-fn defaults() -> OrgDefaults {
-    OrgDefaults {
-        retention_days: 365,
-        min_client: Version::new(0, 2, 0),
-        max_members: 100,
-    }
-}
-
-struct Org {
-    org_id: Id,
-    admin: Actor,
-}
-
 impl Org {
     fn caller(&self, a: Actor) -> Caller {
         let d = Device {
@@ -167,80 +145,6 @@ impl Org {
         } else {
             Caller::Member(d)
         }
-    }
-}
-
-async fn bootstrap(s: &dyn Store) -> Org {
-    s.set_bootstrap(h("bootstrap"), T0 + DAY).await.unwrap();
-    let device = Id::new_v4();
-    let org_id = Id::new_v4();
-    let member = s
-        .bootstrap(NewBootstrap {
-            bootstrap_token_hash: h("bootstrap"),
-            org_id,
-            handle: handle("alf"),
-            device_id: device,
-            device_pubkey: Key32([1; 32]),
-            device_token_hash: h(&format!("device-{device}")),
-            defaults: defaults(),
-            now: T0,
-        })
-        .await
-        .unwrap();
-    Org {
-        org_id,
-        admin: Actor {
-            member_id: member,
-            device_id: device,
-            admin: true,
-        },
-    }
-}
-
-async fn wraps_for(s: &dyn Store) -> Vec<EpochWrap> {
-    let epoch = s.org(T0).await.unwrap().unwrap().current_epoch;
-    (0..=epoch)
-        .map(|e| EpochWrap {
-            epoch: e,
-            wrap: B64(vec![e as u8; 89]),
-            auth: Key32([7; 32]),
-        })
-        .collect()
-}
-
-/// An invite by `by` and a join; returns the new device's actor (not yet approved).
-async fn join(s: &dyn Store, by: Actor, kind: InviteKind, name: &str, n: u8) -> Actor {
-    let invite_id = Id::new_v4();
-    s.create_invite(NewInvite {
-        invite_id,
-        token_hash: h(&format!("invite-{invite_id}")),
-        kind,
-        handle: handle(name),
-        role: None,
-        expires_at: T0 + 7 * DAY,
-        by,
-        now: T0,
-    })
-    .await
-    .unwrap();
-    let device = Id::new_v4();
-    let joined = s
-        .join(NewJoin {
-            invite_id,
-            invite_token_hash: h(&format!("invite-{invite_id}")),
-            handle: handle(name),
-            device_id: device,
-            device_pubkey: Key32([n; 32]),
-            join_mac: Key32([n.wrapping_add(100); 32]),
-            device_token_hash: h(&format!("device-{device}")),
-            now: T0 + 60,
-        })
-        .await
-        .unwrap();
-    Actor {
-        member_id: joined.member_id,
-        device_id: device,
-        admin: false,
     }
 }
 
@@ -782,7 +686,7 @@ mod cases {
         assert_eq!(n, 3);
         assert!(s.org(T0).await.unwrap().unwrap().rotation_needed);
         let auth = s
-            .auth_device(h(&format!("device-{}", kit.device_id)))
+            .auth_device(device_token_hash(kit.device_id))
             .await
             .unwrap()
             .unwrap();
@@ -1254,7 +1158,7 @@ mod cases {
         s.remove_member(roy.member_id, false, a, T0 + 600)
             .await
             .unwrap();
-        let auth = |d: Id| s.auth_device(h(&format!("device-{d}")));
+        let auth = |d: Id| s.auth_device(device_token_hash(d));
         let k = auth(kit.device_id).await.unwrap().unwrap();
         assert!(k.device_revoked && k.member_revoked, "{k:?}");
         let m = auth(mia.device_id).await.unwrap().unwrap();

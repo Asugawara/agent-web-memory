@@ -10,6 +10,7 @@ pub mod backup;
 pub mod check;
 pub mod config;
 pub mod delete;
+pub(crate) mod fsutil;
 pub mod http;
 pub mod limits;
 pub mod lockfile;

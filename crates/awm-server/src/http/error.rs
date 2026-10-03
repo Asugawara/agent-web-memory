@@ -7,7 +7,7 @@
 use awm_proto::wire::{ErrorBody, ErrorCode, Id, Version};
 use axum::body::Body;
 use axum::http::{header, HeaderValue, StatusCode};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 
 use crate::auth::AuthError;
@@ -130,8 +130,12 @@ impl ApiError {
             log: Some(text),
         }
     }
+}
 
-    pub fn into_response(self) -> Response {
+/// The response of a failed request. An internal error is a bodiless 500 whose text rides in the
+/// [`ApiLog`] extension for the request log.
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
         let mut resp = match &self.body {
             Some(b) => {
                 let bytes = serde_json::to_vec(b).unwrap_or_default();
