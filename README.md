@@ -105,7 +105,7 @@ In each 5-hour window, awm compares the rise of the usage percentage with the li
 
 ### Blocking repeats (short-circuit)
 
-A fetch of a URL awm already holds is answered from the record instead: **WebFetch is a per-URL cache**, on by default with a 7-day window. A search that earlier research already answers is denied once as well, with the matching notes in the reason. There is no shadow mode; a setting is on or off.
+A fetch of a URL awm already holds is answered from the record instead: **WebFetch is a per-URL cache**, on by default with a 7-day window. A search that earlier research already answers is denied once as well, with the matching notes in the reason. When this agent was already shown the record in an earlier `<awm-notes>` block, the deny still blocks the call but only points to that note (`awm log --ref`) instead of repeating its text. There is no shadow mode; a setting is on or off.
 
 | Key | Default | Values | Meaning |
 |-----|---------|--------|---------|

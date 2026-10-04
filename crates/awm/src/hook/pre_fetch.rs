@@ -78,7 +78,9 @@ fn handle_fetch(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
             let who = who_text(&note.relation, c.own);
             items.push((c.hit.event_id, c.hit.score));
             let ctx = env.render_ctx(Channel::Url, &ref_id);
-            if note.status == Status::DeadEnd {
+            if let Some(note_ref) = env.shown_note_ref(conn, c.hit.event_id)? {
+                render::deny_reason_shown(&note, &ctx, &who, c.candidates, &note_ref)
+            } else if note.status == Status::DeadEnd {
                 render::deny_reason_dead_url(&note, &ctx, &who)
             } else {
                 render::deny_reason(&note, &ctx, &who, c.candidates)

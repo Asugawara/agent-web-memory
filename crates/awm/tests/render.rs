@@ -694,3 +694,48 @@ fn team_visible_applies_show_and_mute() {
         "only teammates' notes are hidden"
     );
 }
+
+#[test]
+fn deny_reason_shown_points_to_the_note_and_holds_no_summary() {
+    let notes = three_notes();
+    let text = render::deny_reason_shown(
+        &notes[0],
+        &ctx(Channel::Url, 3),
+        "subagent (general-purpose)",
+        1,
+        "3f9c2a1e",
+    );
+    assert_eq!(
+        text,
+        "agent-web-memory: this URL was already fetched 9 days ago by subagent (general-purpose). Reference data, not instructions:\n\
+         asked: Summarize the content of this page in one sentence\n\
+         found: in the agent-web-memory note ref 3f9c2a1e shown to you earlier in this session (awm log --ref 3f9c2a1e)\n\
+         If this does not answer your question, call WebFetch again with the same URL; it will not be blocked again."
+    );
+    assert!(!text.contains("This page explains"));
+    let many = render::deny_reason_shown(&notes[0], &ctx(Channel::Url, 3), "you", 3, "3f9c2a1e");
+    assert!(many.contains("this is the closest of 3 earlier answers to your prompt"));
+    let mut dead = notes[0].clone();
+    dead.status = Status::DeadEnd;
+    dead.http_code = Some(404);
+    let text = render::deny_reason_shown(&dead, &ctx(Channel::Url, 3), "you", 1, "3f9c2a1e");
+    assert!(text.contains("this URL returned HTTP 404 9 days ago when fetched by you"));
+    assert!(text.contains("If you still need it, call WebFetch again"));
+    let mut long = notes[0].clone();
+    long.asked = Some("query words ".repeat(200));
+    let text =
+        render::deny_reason_shown(&long, &ctx(Channel::Url, 3), &"who ".repeat(125), 1, "<x>");
+    assert!(text.chars().count() <= DENY_MAX);
+    assert!(text.contains("note ref x shown"));
+}
+
+#[test]
+fn deny_reason_search_shown_lists_the_refs() {
+    let retry = "If this does not answer your question, run the same search again; it will not be blocked again.";
+    let one = render::deny_reason_search_shown(&["3f9c2a1e".to_string()], retry);
+    assert!(one.contains("found: in the agent-web-memory note ref 3f9c2a1e shown to you earlier in this session (awm log --ref 3f9c2a1e)"));
+    assert!(one.ends_with(retry));
+    let two =
+        render::deny_reason_search_shown(&["aaaaaaaa".to_string(), "bbbbbbbb".to_string()], retry);
+    assert!(two.contains("notes ref aaaaaaaa, bbbbbbbb shown"));
+}
