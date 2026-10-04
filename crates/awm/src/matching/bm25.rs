@@ -6,17 +6,22 @@
 //! (`fts5vocab`) walks them (measured in docs/reports/DENY6.md), so both cost more as the corpus
 //! grows; this scorer's cost depends on the prompt length and the candidate count only.
 //!
-//! Formula (the one of `fts5Bm25` in SQLite's `fts5_aux.c`, with local statistics):
-//! `idf = ln((N - n + 0.5) / (n + 0.5))`, set to `1e-6` when it is not positive (FTS5 does the
-//! same), `k1 = 1.2`, `b = 0.75`, and per document
+//! Formula (Lucene's `BM25Similarity`, with local statistics):
+//! `idf = ln(1 + (N - n + 0.5) / (n + 0.5))`, `k1 = 1.2`, `b = 0.75`, and per document
 //! `sum over query terms of idf * tf * (k1 + 1) / (tf + k1 * (1 - b + b * dl / avgdl))`.
+//!
+//! Why not FTS5's `ln((N - n + 0.5) / (n + 0.5))` floored at `1e-6`: with `N` this small it
+//! degenerates. For `N = 2` every term is floored (`n = 1` gives `ln 1 = 0`), for `N = 3` a term in
+//! two candidates is floored, and the ranking then follows tf and length instead of the terms that
+//! tell the answers apart. The Lucene form is always positive and needs no floor: for `N = 2`,
+//! `n = 1` weighs 0.69 and `n = 2` weighs 0.18, so a distinguishing term counts about four times a
+//! shared one.
 //!
 //! Deviations from `bm25(event_fts)`:
 //! - `N` is the number of candidates, `n` the number of candidates whose text holds the term, and
 //!   `avgdl` the mean candidate length, not the statistics of the whole index. A term present in
-//!   every candidate (with 20 candidates or fewer, in half of them or more) gets the floor idf:
-//!   that is the intent, page boilerplate that every stored answer of the URL shares stops
-//!   counting, and the terms that tell the answers apart decide. Corpus-wide rarity is not used.
+//!   every candidate (page boilerplate that every stored answer of the URL shares) weighs little,
+//!   and the terms that tell the answers apart weigh more. Corpus-wide rarity is not used.
 //! - Terms come from [`crate::normalize::words`] (NFKC, lower case, every non-alphanumeric
 //!   character is a separator), the tokens `fts::match_expr` sends to FTS5, here of 2 or more
 //!   characters; documents are tokenised the same way, so there is no `unicode61` mismatch (the
@@ -30,8 +35,6 @@ use crate::normalize::words;
 
 const K1: f64 = 1.2;
 const B: f64 = 0.75;
-/// FTS5's floor for an idf that is not positive.
-const IDF_FLOOR: f64 = 1e-6;
 
 /// Index of the best document among `docs` (the first on a tie) and its score, or `None` when
 /// nothing can be ranked: no term of 2 or more characters in `prompt`, no term in any document, or
@@ -54,13 +57,9 @@ pub fn query_terms(prompt: &str) -> Vec<String> {
         .collect()
 }
 
+/// Lucene's idf: always positive, decreasing in `n`.
 fn idf(n_docs: usize, n: usize) -> f64 {
-    let v = ((n_docs as f64 - n as f64 + 0.5) / (n as f64 + 0.5)).ln();
-    if v <= 0.0 {
-        IDF_FLOOR
-    } else {
-        v
-    }
+    (1.0 + (n_docs as f64 - n as f64 + 0.5) / (n as f64 + 0.5)).ln()
 }
 
 /// Score of every document for `terms`; a term in no document scores nothing.
@@ -123,16 +122,27 @@ mod tests {
     }
 
     #[test]
-    fn idf_comes_from_the_candidate_counts_and_is_floored() {
-        assert!(idf(20, 1) > idf(20, 5));
-        assert!(idf(20, 5) > idf(20, 9));
-        assert_eq!(idf(20, 10), IDF_FLOOR);
-        assert_eq!(idf(20, 20), IDF_FLOOR);
-        assert!((idf(20, 1) - (19.5f64 / 1.5).ln()).abs() < 1e-12);
+    fn idf_is_the_lucene_form() {
+        assert!((idf(2, 1) - 2f64.ln()).abs() < 1e-12);
+        assert!((idf(2, 2) - (1.0 + 0.5 / 2.5f64).ln()).abs() < 1e-12);
+        assert!((idf(20, 1) - (1.0 + 19.5 / 1.5f64).ln()).abs() < 1e-12);
+        assert!((idf(20, 20) - (1.0 + 0.5 / 20.5f64).ln()).abs() < 1e-12);
     }
 
     #[test]
-    fn a_term_in_every_candidate_gets_the_floor() {
+    fn idf_is_positive_and_strictly_decreasing_in_n() {
+        for n_docs in 1..=20 {
+            let mut prev = f64::INFINITY;
+            for n in 1..=n_docs {
+                let v = idf(n_docs, n);
+                assert!(v > 0.0 && v < prev, "N={n_docs} n={n}");
+                prev = v;
+            }
+        }
+    }
+
+    #[test]
+    fn a_term_in_every_candidate_weighs_little_and_the_rare_term_decides() {
         // "page" is in all four, "rare" in one: the rare term decides although "page" repeats.
         let docs = [
             "page page page a",
@@ -142,8 +152,16 @@ mod tests {
         ];
         let (i, _) = rank("page rare", &docs).unwrap();
         assert_eq!(i, 2);
-        let s = score_all(&terms(&["page"]), &docs);
-        assert!(s.iter().all(|v| *v < 1e-5));
+        let page = score_all(&terms(&["page"]), &docs);
+        let rare = score_all(&terms(&["rare"]), &docs);
+        assert!(rare[2] > 3.0 * page[1]);
+    }
+
+    #[test]
+    fn with_two_candidates_the_distinguishing_term_beats_a_higher_tf_of_a_shared_one() {
+        // "page" is in both (tf 1 against 4), "alpha" only in the first, which is also longer.
+        let docs = ["page alpha x y z w v u", "page page page page"];
+        assert_eq!(rank("page alpha", &docs).unwrap().0, 0);
     }
 
     #[test]
