@@ -25,9 +25,9 @@ use crate::config::{self, Config, Mode, Notify};
 use crate::db::{self, Role, VersionCheck};
 use crate::deadline::Watchdog;
 use crate::matching::{self, Hit, MatchOpts};
-use crate::note::{Channel, RenderCtx};
+use crate::note::{Channel, Known, RenderCtx, Tool};
 use crate::record::sha256_hex;
-use crate::{paths, redact, render};
+use crate::{paths, redact, render, sanitize};
 
 #[derive(clap::Args, Debug, Default)]
 pub struct HookArgs {
@@ -319,13 +319,17 @@ impl Env {
         })
     }
 
-    /// Events already shown to this (session, agent) by an inject or a deny.
+    /// Events already in this (session, agent)'s context: shown to it by an inject or a deny, or
+    /// recorded by it (`origin = 'local'`, same session and agent).
     fn shown_event_ids(&self, conn: &Connection) -> Result<Vec<i64>> {
         let mut st = conn.prepare_cached(
-            "SELECT DISTINCT ii.event_id FROM injection_item ii \
+            "SELECT ii.event_id FROM injection_item ii \
              JOIN injection i ON i.id = ii.injection_id \
              WHERE i.session_id = ?1 AND i.agent_id IS ?2 AND i.mode IN ('inject', 'deny') \
-               AND ii.event_id IS NOT NULL",
+               AND ii.event_id IS NOT NULL \
+             UNION \
+             SELECT e.id FROM event e \
+             WHERE e.session_id = ?1 AND e.agent_id IS ?2 AND e.origin = 'local'",
         )?;
         let rows = st.query_map(params![self.input.session_id, self.input.agent_id], |r| {
             r.get(0)
@@ -349,6 +353,35 @@ impl Env {
                 |r| r.get(0),
             )
             .optional()?)
+    }
+
+    /// Whether `event_id` is already in this (session, agent)'s context: a note it was given (its
+    /// ref, checked first) or a result it recorded itself in this session. `None` otherwise.
+    pub fn known(&self, conn: &Connection, event_id: i64) -> Result<Option<Known>> {
+        if let Some(r) = self.shown_note_ref(conn, event_id)? {
+            return Ok(Some(Known::Note(r)));
+        }
+        let row: Option<(String, Option<String>, Option<String>)> = conn
+            .prepare_cached(
+                "SELECT tool, fetch_prompt, query FROM event \
+                 WHERE id = ?3 AND origin = 'local' AND session_id = ?1 AND agent_id IS ?2",
+            )?
+            .query_row(
+                params![self.input.session_id, self.input.agent_id, event_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(tool, prompt, query)| {
+            let (tool, raw) = if tool == "WebFetch" {
+                (Tool::WebFetch, prompt)
+            } else {
+                (Tool::WebSearch, query)
+            };
+            let text = raw
+                .map(|s| sanitize::line_text(&s, render::FIELD_CAP).text)
+                .unwrap_or_default();
+            Known::Own { tool, text }
+        }))
     }
 
     pub fn render_ctx(&self, channel: Channel, ref_id: &str) -> RenderCtx {

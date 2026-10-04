@@ -9,6 +9,15 @@ pub enum Tool {
     WebFetch,
 }
 
+/// Why a record is already in an agent's context (`hook::Env::known`): a note it was given
+/// (`Note`, that note's ref) or a result it produced itself in this session (`Own`; `text` is the
+/// stored fetch prompt or query, sanitised and capped).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Known {
+    Note(String),
+    Own { tool: Tool, text: String },
+}
+
 /// `event.status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

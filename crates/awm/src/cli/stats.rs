@@ -250,8 +250,10 @@ fn url_deny_kinds(conn: &Connection) -> anyhow::Result<Value> {
                    ON ii.injection_id = i.id AND ii.position = 1 \
                  JOIN event e ON e.id = ii.event_id \
                  WHERE i.mode = 'deny' AND i.channel = 'url' AND e.status {status} \
-                   AND (instr(COALESCE(i.rendered, ''), '{}') > 0) = {}",
+                   AND ((instr(COALESCE(i.rendered, ''), '{}') > 0 \
+                         OR instr(COALESCE(i.rendered, ''), '{}') > 0)) = {}",
                 crate::render::SHOWN_MARK,
+                crate::render::OWN_MARK,
                 u8::from(shown)
             ),
         )

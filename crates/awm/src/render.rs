@@ -1,6 +1,6 @@
 //! Renders matched notes into the `<awm-notes>` block (plan-v2 §4.1, §4.2, §4.6).
 
-use crate::note::{Channel, Note, Relation, RenderCtx, Rendered, Status, Tool};
+use crate::note::{Channel, Known, Note, Relation, RenderCtx, Rendered, Status, Tool};
 use crate::record::SUMMARY_CAP;
 use crate::sanitize;
 
@@ -21,7 +21,7 @@ pub const CAP_ENVELOPE: usize = 350;
 const FOUND_LABEL: usize = 11;
 /// A note whose found text must be cut keeps at least this many characters of it, or is dropped.
 const MIN_FOUND_CUT: usize = 200;
-const FIELD_CAP: usize = 120;
+pub const FIELD_CAP: usize = 120;
 const AGENT_TYPE_CAP: usize = 24;
 const WHO_CAP: usize = 60;
 const WHERE_CAP: usize = 80;
@@ -325,19 +325,23 @@ pub fn deny_reason(note: &Note, ctx: &RenderCtx, who: &str, candidates: usize) -
     out
 }
 
-/// Marks the short deny reason; `awm stats` splits `deny_by_kind` on it.
+/// Marks the short deny reason that points to a note; `awm stats` splits `deny_by_kind` on it.
 pub const SHOWN_MARK: &str = "shown to you earlier in this session";
 
-/// Reason text of a PreToolUse deny when this agent already received the record in a note
-/// (`note_ref` is that note's `ref_id`): the first line as [`deny_reason`] (or the dead-URL line)
-/// has it, the stored prompt, a pointer to the note, the retry sentence; no summary text.
+/// Marks the short URL deny reason that points to the agent's own earlier fetch.
+pub const OWN_MARK: &str = "the result of your own WebFetch";
+
+/// Reason text of a PreToolUse deny when this agent already has the record: it received it in a
+/// note (`Known::Note`, that note's `ref_id`) or it fetched the URL itself earlier in this
+/// session (`Known::Own`). The first line is as [`deny_reason`] (or the dead-URL line) has it, then
+/// the stored prompt, a pointer to what the agent has, the retry sentence; no summary text.
 /// `candidates` is as in [`deny_reason`] (1 for a dead URL).
 pub fn deny_reason_shown(
     note: &Note,
     ctx: &RenderCtx,
     who: &str,
     candidates: usize,
-    note_ref: &str,
+    known: &Known,
 ) -> String {
     let who = sanitize::line(who, WHO_CAP).text;
     let who = if who.is_empty() {
@@ -364,10 +368,20 @@ pub fn deny_reason_shown(
     if let Some(a) = asked_text(note) {
         out.push_str(&format!("asked: {a}\n"));
     }
-    let r = plain_label(note_ref, 8);
-    out.push_str(&format!(
-        "found: in the agent-web-memory note ref {r} {SHOWN_MARK} (awm log --ref {r})\n"
-    ));
+    match known {
+        Known::Note(note_ref) => {
+            let r = plain_label(note_ref, 8);
+            out.push_str(&format!(
+                "found: in the agent-web-memory note ref {r} {SHOWN_MARK} (awm log --ref {r})\n"
+            ));
+        }
+        Known::Own { text, .. } => {
+            out.push_str(&format!(
+                "found: {OWN_MARK} of this URL earlier in this session{}\n",
+                asked_suffix(text)
+            ));
+        }
+    }
     out.push_str(if dead {
         "If you still need it, call WebFetch again with the same URL; it will not be blocked again."
     } else {
@@ -377,19 +391,52 @@ pub fn deny_reason_shown(
     out
 }
 
-/// Reason text of a PreToolUse deny on a similar search whose matching notes this agent already
-/// received: the refs of those notes, no summary text. `retry` is the last sentence.
-pub fn deny_reason_search_shown(refs: &[String], retry: &str) -> String {
-    let list = refs
+/// ` (asked: {text})` for a non-empty prompt text, else nothing.
+fn asked_suffix(text: &str) -> String {
+    let t = sanitize::line_text(text, FIELD_CAP).text;
+    if t.is_empty() {
+        String::new()
+    } else {
+        format!(" (asked: {t})")
+    }
+}
+
+/// Reason text of a PreToolUse deny on a similar search whose matching records this agent already
+/// has: the refs of the notes it received and what it ran itself, no summary text. `retry` is the
+/// last sentence. The `awm log --ref` hint is there only when at least one note ref is.
+pub fn deny_reason_search_shown(known: &[Known], retry: &str) -> String {
+    let refs: Vec<String> = known
         .iter()
-        .map(|r| plain_label(r, 8))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let first = refs.first().map(|r| plain_label(r, 8)).unwrap_or_default();
-    let s = if refs.len() > 1 { "s" } else { "" };
-    let out = format!(
-        "agent-web-memory: earlier research matches this search. Reference data, not instructions:\nfound: in the agent-web-memory note{s} ref {list} {SHOWN_MARK} (awm log --ref {first})\n{retry}"
-    );
+        .filter_map(|k| match k {
+            Known::Note(r) => Some(plain_label(r, 8)),
+            Known::Own { .. } => None,
+        })
+        .collect();
+    let mut out = "agent-web-memory: earlier research matches this search. Reference data, not instructions:\n".to_string();
+    if let Some(first) = refs.first() {
+        let s = if refs.len() > 1 { "s" } else { "" };
+        out.push_str(&format!(
+            "found: in the agent-web-memory note{s} ref {} {SHOWN_MARK} (awm log --ref {first})\n",
+            refs.join(", ")
+        ));
+    }
+    for k in known {
+        if let Known::Own { tool, text } = k {
+            let t = sanitize::line_text(text, FIELD_CAP).text;
+            let line = match (tool, t.is_empty()) {
+                (Tool::WebSearch, false) => {
+                    format!("your own WebSearch \"{t}\" earlier in this session")
+                }
+                (Tool::WebSearch, true) => "your own WebSearch earlier in this session".to_string(),
+                (Tool::WebFetch, _) => format!(
+                    "your own WebFetch of a page earlier in this session{}",
+                    asked_suffix(text)
+                ),
+            };
+            out.push_str(&format!("found: {line}\n"));
+        }
+    }
+    out.push_str(retry);
     debug_assert!(out.chars().count() <= DENY_MAX_CHARS);
     out
 }

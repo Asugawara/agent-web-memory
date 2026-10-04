@@ -16,7 +16,7 @@ use rusqlite::{params, Connection};
 use super::{append_canary, canary_line, deny_json, Env, Injection, Verdict};
 use crate::config::ShortCircuitMode;
 use crate::matching::{self, calibrate};
-use crate::note::{Channel, Note, Relation};
+use crate::note::{Channel, Known, Note, Relation};
 use crate::record::codex_query;
 use crate::render::{self, plain_label};
 use crate::{redact, sanitize};
@@ -134,16 +134,17 @@ pub fn handle(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
         "If this does not answer your question, call WebSearch again with the same query; it will not be blocked again."
     };
     let only: Vec<Note> = notes.iter().map(|(n, _)| n.clone()).collect();
-    // Every match was already shown to this agent in a note: deny with the refs, no summary text.
+    // Every match is already in this agent's context (a note it got, its own earlier result): deny
+    // with a pointer to it, no summary text.
     let shown = if only.is_empty() && !clean.trim().is_empty() {
-        shown_matches(env, conn, &clean)?
+        known_matches(env, conn, &clean)?
     } else {
         Vec::new()
     };
     let rendered = if !shown.is_empty() {
-        let refs: Vec<String> = shown.iter().map(|(_, r, _)| r.clone()).collect();
+        let known: Vec<Known> = shown.iter().map(|(_, k, _)| k.clone()).collect();
         let items = shown.iter().map(|(id, _, sc)| (*id, *sc)).collect();
-        Some((render::deny_reason_search_shown(&refs, retry), items))
+        Some((render::deny_reason_search_shown(&known, retry), items))
     } else if only.is_empty() {
         None
     } else {
@@ -194,17 +195,18 @@ pub fn handle(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
     })
 }
 
-/// The usable matches this agent already received in a note: (event id, ref of the newest note
-/// that carried it, score), best first. Matches it only saw in an earlier deny are left out.
-fn shown_matches(
+/// The usable matches this agent already has: (event id, why it has it, score), best first. A
+/// match counts when a note carried it to this agent or the agent recorded it itself in this
+/// session. Matches it only saw in an earlier deny are left out.
+fn known_matches(
     env: &Env,
     conn: &Connection,
     text: &str,
-) -> anyhow::Result<Vec<(i64, String, f64)>> {
+) -> anyhow::Result<Vec<(i64, Known, f64)>> {
     let mut out = Vec::new();
     for (note, score) in similar(env, conn, text, true)? {
-        if let Some(r) = env.shown_note_ref(conn, note.event_id)? {
-            out.push((note.event_id, r, score));
+        if let Some(k) = env.known(conn, note.event_id)? {
+            out.push((note.event_id, k, score));
         }
     }
     Ok(out)
