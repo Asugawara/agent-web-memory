@@ -6,6 +6,10 @@
 # with AWM_CANARY={nonce} (every hook appends AWM-CANARY-{Hook}-{nonce}) and
 # AWM_CANARY_DENY=1 for the deny runs. Uses at most 2 WebSearch calls for a full run
 # (VH2, and VH5 which also serves VH7 and VH8); the VH4q / VH6q searches are denied before they run.
+# --plugin-dir builds target/release/awm and seeds with it. --installed builds nothing: it seeds with
+# the binary the plugin shim (plugin/hooks/awm-hook) would run, found the same way ($AWM_BIN, then
+# `command -v awm`, then the shim's fixed install paths), so the data the installed hooks read was
+# written by the binary under test. The chosen binary and its --version go to stderr first.
 # VH2 and VH5 run with short_circuit.query = "off" in the temporary AWM_HOME (restored after the run):
 # with the default "on" the similarity deny stops the search before PostToolUse, so no note is checked. Never edits ~/.claude/settings.json or plugin settings; the `claude -p` runs create
 # session transcripts under ~/.claude/projects as any session does. Exits non-zero on a mismatch in VH1-VH5 or VH4q.
@@ -29,8 +33,20 @@ case "$plugin_dir" in /*) ;; *) plugin_dir="$root/$plugin_dir" ;; esac
 
 want() { [ -z "$only" ] || case ",$only," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
 
-cargo build --release --locked -p agent-web-memory >/dev/null 2>&1 || { echo "build failed" >&2; exit 2; }
-export AWM_BIN="$root/target/release/awm"
+if [ "$mode" = installed ]; then
+  # The candidate list of plugin/hooks/awm-hook, in its order.
+  bin=""
+  for c in "${AWM_BIN:-}" "$(command -v awm 2>/dev/null)" "$HOME/.local/bin/awm" "$HOME/.cargo/bin/awm" \
+           /opt/homebrew/bin/awm /usr/local/bin/awm /home/linuxbrew/.linuxbrew/bin/awm; do
+    if [ -n "$c" ] && [ -x "$c" ]; then bin="$c"; break; fi
+  done
+  [ -n "$bin" ] || { echo "no installed awm binary found (the plugin shim looks at \$AWM_BIN, PATH, ~/.local/bin, ~/.cargo/bin, /opt/homebrew/bin, /usr/local/bin, /home/linuxbrew/.linuxbrew/bin); install it or use --plugin-dir" >&2; exit 2; }
+  export AWM_BIN="$bin"
+else
+  cargo build --release --locked -p agent-web-memory >/dev/null 2>&1 || { echo "build failed" >&2; exit 2; }
+  export AWM_BIN="$root/target/release/awm"
+fi
+echo "seeding with: $AWM_BIN ($("$AWM_BIN" --version 2>&1 | head -1))" >&2
 tmp="$(mktemp -d)"
 trap '[ -n "${VH_KEEP:-}" ] || rm -rf "$tmp"' EXIT
 [ -z "${VH_KEEP:-}" ] || echo "kept: $tmp" >&2

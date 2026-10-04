@@ -1614,12 +1614,18 @@ fn a_codex_webrun_matches_an_earlier_search_through_the_query_channel() {
         home.text("SELECT mode || '/' || channel || '/' || hook FROM injection"),
         "inject/query/PostToolUse"
     );
-    // With `short_circuit.query` at its default (off) the pre-fetch hook prints nothing.
+    // The note already showed that search to this agent: the default-on deny names its ref and
+    // repeats no summary text.
     let pre = home.hook(
         "pre-fetch",
         &fixture("codex-PreToolUse-webrun-search-1.json"),
     );
-    assert_silent(&pre);
+    let reason = deny_reason(&pre);
+    assert!(
+        reason.contains("shown to you earlier in this session"),
+        "{reason}"
+    );
+    assert!(reason.contains("run the same search again"), "{reason}");
 }
 
 #[test]
@@ -2347,4 +2353,208 @@ fn pre_fetch_still_denies_a_url_and_ignores_other_tools() {
     let bash = json!({"session_id": "s", "hook_event_name": "PreToolUse", "tool_name": "Bash",
         "tool_input": {"query": QD_QUERY}, "tool_use_id": "toolu_b"});
     assert_silent(&home.hook("pre-fetch", &bash));
+}
+
+// ---- DUP1: a deny points to a note the agent already has ----
+
+/// The UserPromptSubmit payload of session `sess-pre` that names the example URL.
+fn url_prompt() -> Value {
+    patch(
+        fixture("UserPromptSubmit-none-plugin-1.json"),
+        &[
+            (
+                "prompt",
+                json!("what did we learn from https://example.com last time?"),
+            ),
+            ("session_id", json!("sess-pre")),
+        ],
+    )
+}
+
+fn deny_chars(home: &Home) -> i64 {
+    home.count("SELECT rendered_chars FROM injection WHERE mode = 'deny'")
+}
+
+#[test]
+fn a_deny_names_the_prompt_url_note_instead_of_repeating_it() {
+    let full_home = Home::new();
+    full_home.seed(
+        &answered_fetch("toolu_old", "List the pricing tiers", &"tier ".repeat(300)),
+        120_000,
+    );
+    deny_reason(&full_home.hook("pre-fetch", &pre_fetch(None, "toolu_main_1")));
+    let full = deny_chars(&full_home);
+
+    let home = Home::new();
+    home.seed(
+        &answered_fetch("toolu_old", "List the pricing tiers", &"tier ".repeat(300)),
+        120_000,
+    );
+    let out = home.hook("prompt", &url_prompt());
+    assert!(out.context().starts_with("<awm-notes"));
+    let note_ref = home.text("SELECT ref FROM injection WHERE mode = 'inject'");
+    let reason = deny_reason(&home.hook("pre-fetch", &pre_fetch(None, "toolu_main_1")));
+    assert!(
+        reason.contains(&format!(
+            "found: in the agent-web-memory note ref {note_ref} shown to you earlier in this session (awm log --ref {note_ref})\n"
+        )),
+        "{reason}"
+    );
+    assert!(!reason.contains("tier tier"), "{reason}");
+    assert!(reason.contains("asked: List the pricing tiers"), "{reason}");
+    assert!(reason.contains("it will not be blocked again."), "{reason}");
+    let short = deny_chars(&home);
+    println!("DUP1 saved characters: full {full}, short {short}");
+    assert!(short * 3 < full, "full {full}, short {short}");
+    // The row keeps mode deny, the item and the short text.
+    assert_eq!(
+        home.text("SELECT e.tool_use_id FROM injection i JOIN injection_item ii ON ii.injection_id = i.id JOIN event e ON e.id = ii.event_id WHERE i.mode = 'deny'"),
+        "toolu_old"
+    );
+    assert_eq!(
+        home.count(
+            "SELECT COUNT(*) FROM injection WHERE mode = 'deny' AND rendered = ?1"
+                .replace("?1", &format!("'{}'", reason.replace('\'', "''")))
+                .as_str()
+        ),
+        1
+    );
+    // The retry still passes.
+    assert_silent(&home.hook("pre-fetch", &pre_fetch(None, "toolu_main_2")));
+}
+
+#[test]
+fn a_post_tool_url_note_shown_earlier_gives_the_short_deny() {
+    let home = Home::new();
+    home.seed(
+        &answered_fetch(
+            "toolu_old",
+            "List the pricing tiers and their cost",
+            "Answer about pricing tiers",
+        ),
+        120_000,
+    );
+    // The agent's own fetch gets a PostToolUse note that shows the older answer.
+    let mut own = sibling_fetch(None, "toolu_main_0");
+    own["tool_input"]["prompt"] = json!("Describe the installation steps for linux");
+    own["tool_response"]["result"] = json!("Answer about installation");
+    let out = home.hook("post-tool", &own);
+    assert!(out.context().starts_with("<awm-notes"), "{}", out.stdout);
+    let note_ref = home.text("SELECT ref FROM injection WHERE mode = 'inject' AND channel = 'url'");
+    let request = pre_fetch_asking("toolu_main_1", Some("What are the pricing tiers and cost?"));
+    let reason = deny_reason(&home.hook("pre-fetch", &request));
+    assert!(
+        reason.contains(&format!("note ref {note_ref} shown to you earlier")),
+        "{reason}"
+    );
+    assert!(!reason.contains("Answer about pricing tiers"), "{reason}");
+}
+
+#[test]
+fn a_subagent_that_never_saw_the_note_gets_the_full_reason() {
+    let home = Home::new();
+    home.seed(
+        &answered_fetch(
+            "toolu_old",
+            "List the pricing tiers",
+            "Answer about pricing tiers",
+        ),
+        120_000,
+    );
+    assert!(home
+        .hook("prompt", &url_prompt())
+        .context()
+        .starts_with("<awm-notes"));
+    let sub = Some(("agent-z", "general-purpose"));
+    let reason = deny_reason(&home.hook("pre-fetch", &pre_fetch(sub, "toolu_z_1")));
+    assert!(
+        reason.contains("found: Answer about pricing tiers"),
+        "{reason}"
+    );
+    assert!(!reason.contains("shown to you earlier"), "{reason}");
+}
+
+#[test]
+fn a_dead_url_note_shown_earlier_gives_the_short_dead_url_deny() {
+    let home = Home::new();
+    seed_fetch_as(&home, "toolu_a", 60_000, "dead_end", Some(404));
+    let out = home.hook("prompt", &url_prompt());
+    assert!(out.context().starts_with("<awm-notes"), "{}", out.stdout);
+    let reason = deny_reason(&home.hook("pre-fetch", &pre_fetch(None, "toolu_main_1")));
+    assert!(reason.contains("this URL returned HTTP 404"), "{reason}");
+    assert!(
+        reason.contains("shown to you earlier in this session"),
+        "{reason}"
+    );
+    assert!(reason.contains("If you still need it"), "{reason}");
+}
+
+#[test]
+fn stats_splits_the_short_denies() {
+    let home = Home::new();
+    home.seed(
+        &answered_fetch(
+            "toolu_old",
+            "List the pricing tiers",
+            "Answer about pricing tiers",
+        ),
+        120_000,
+    );
+    home.hook("prompt", &url_prompt());
+    deny_reason(&home.hook("pre-fetch", &pre_fetch(None, "toolu_main_1")));
+    deny_reason(&home.hook(
+        "pre-fetch",
+        &pre_fetch(Some(("agent-z", "general-purpose")), "toolu_z_1"),
+    ));
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_awm"))
+        .args(["stats", "--json"])
+        .env("AWM_HOME", home.path())
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let kinds = &v["injections"]["deny_by_kind"];
+    assert_eq!(kinds["cached"], 1, "{v}");
+    assert_eq!(kinds["cached_shown"], 1, "{v}");
+    assert_eq!(kinds["dead_url_shown"], 0, "{v}");
+}
+
+#[test]
+fn a_search_whose_matches_were_all_shown_in_a_note_is_denied_with_the_ref() {
+    let home = Home::new();
+    on(&home);
+    seed_repeat(&home);
+    let req = main_search("toolu_1");
+    // The main agent was shown the earlier search in a note (a PostToolUse query note).
+    let c = home.conn();
+    c.execute(
+        "INSERT INTO injection (ref, created_at, hook, channel, mode, session_id, agent_id, rendered, rendered_chars, latency_ms) \
+         VALUES ('abcd1234', 1, 'PostToolUse', 'query', 'inject', ?1, NULL, 'x', 1, 1)",
+        rusqlite::params![req["session_id"].as_str().unwrap()],
+    )
+    .unwrap();
+    c.execute(
+        "INSERT INTO injection_item (injection_id, position, event_id, score) \
+         SELECT (SELECT id FROM injection), 1, id, 1.0 FROM event WHERE tool_use_id = 'toolu_old'",
+        [],
+    )
+    .unwrap();
+    drop(c);
+    let reason = deny_reason(&home.hook("pre-fetch", &req));
+    assert!(
+        reason.contains("note ref abcd1234 shown to you earlier"),
+        "{reason}"
+    );
+    assert!(!reason.contains("bm25() function"), "{reason}");
+    assert!(
+        reason.ends_with("it will not be blocked again."),
+        "{reason}"
+    );
+    assert_eq!(run_outcome(&home), "denied");
+    // The retry passes; a subagent that never saw the note gets the full reason.
+    assert_silent(&home.hook("pre-fetch", &main_search("toolu_2")));
+    let mut sub = main_search("toolu_s");
+    sub["agent_id"] = json!("agent-s");
+    sub["agent_type"] = json!("general-purpose");
+    let full = deny_reason(&home.hook("pre-fetch", &sub));
+    assert!(full.contains("found: The bm25() function"), "{full}");
 }

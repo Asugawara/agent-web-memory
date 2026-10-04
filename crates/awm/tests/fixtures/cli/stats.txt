@@ -4,7 +4,9 @@ injections:
   changed_next_step: 1
   deny_by_kind:
     cached: 0
+    cached_shown: 0
     dead_url: 0
+    dead_url_shown: 0
   harmful: 0
   per_note_precision:
     url:

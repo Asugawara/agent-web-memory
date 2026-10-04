@@ -333,6 +333,24 @@ impl Env {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// The `ref_id` of the newest note (`mode = 'inject'`, any channel) that carried `event_id` to
+    /// this (session, agent), or `None` when it never received it in a note. Served by
+    /// `injection_agent (session_id, agent_id)`, then the primary key of `injection_item`.
+    pub fn shown_note_ref(&self, conn: &Connection, event_id: i64) -> Result<Option<String>> {
+        Ok(conn
+            .prepare_cached(
+                "SELECT i.ref FROM injection i \
+                 JOIN injection_item ii ON ii.injection_id = i.id \
+                 WHERE i.session_id = ?1 AND i.agent_id IS ?2 AND i.mode = 'inject' \
+                   AND ii.event_id = ?3 ORDER BY i.id DESC LIMIT 1",
+            )?
+            .query_row(
+                params![self.input.session_id, self.input.agent_id, event_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn render_ctx(&self, channel: Channel, ref_id: &str) -> RenderCtx {
         RenderCtx {
             channel,

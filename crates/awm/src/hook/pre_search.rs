@@ -60,8 +60,21 @@ pub fn search_text(input: &super::HookInput) -> Option<String> {
 /// else the calibrated `cutoff.query_deny`, stricter than the note cutoff), best first, at
 /// most `inject.max_notes`, each with its score. Read-only use of the query channel.
 pub fn find_similar(env: &Env, conn: &Connection, text: &str) -> anyhow::Result<Vec<(Note, f64)>> {
+    similar(env, conn, text, false)
+}
+
+/// [`find_similar`]; with `with_shown` the notes this agent already received count too.
+fn similar(
+    env: &Env,
+    conn: &Connection,
+    text: &str,
+    with_shown: bool,
+) -> anyhow::Result<Vec<(Note, f64)>> {
     let (cutoff, _) = calibrate::deny_cutoff(conn, env.config.short_circuit.query_min_score)?;
     let mut opts = env.match_opts(conn)?;
+    if with_shown {
+        opts.shown_event_ids.clear();
+    }
     // The caller's own earlier research counts as well; a teammate's row and a row older than the
     // window are skipped in SQL, so neither takes one of the three hits (or a newer teammate's
     // identical search the place of the owner's older one in its group).
@@ -121,14 +134,21 @@ pub fn handle(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
         "If this does not answer your question, call WebSearch again with the same query; it will not be blocked again."
     };
     let only: Vec<Note> = notes.iter().map(|(n, _)| n.clone()).collect();
-    let rendered = if only.is_empty() {
+    // Every match was already shown to this agent in a note: deny with the refs, no summary text.
+    let shown = if only.is_empty() && !clean.trim().is_empty() {
+        shown_matches(env, conn, &clean)?
+    } else {
+        Vec::new()
+    };
+    let rendered = if !shown.is_empty() {
+        let refs: Vec<String> = shown.iter().map(|(_, r, _)| r.clone()).collect();
+        let items = shown.iter().map(|(id, _, sc)| (*id, *sc)).collect();
+        Some((render::deny_reason_search_shown(&refs, retry), items))
+    } else if only.is_empty() {
         None
     } else {
         let ctx = env.render_ctx(Channel::Query, &ref_id);
-        render::deny_reason_matches(&only, &ctx, retry)
-    };
-    let (mut reason, items) = match rendered {
-        Some((reason, ids)) => {
+        render::deny_reason_matches(&only, &ctx, retry).map(|(reason, ids)| {
             let items = ids
                 .iter()
                 .map(|id| {
@@ -140,7 +160,10 @@ pub fn handle(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
                 })
                 .collect::<Vec<(i64, f64)>>();
             (reason, items)
-        }
+        })
+    };
+    let (mut reason, items) = match rendered {
+        Some(r) => r,
         None if forced => (CANARY_REASON.to_string(), Vec::new()),
         None => {
             return Ok(Verdict {
@@ -169,6 +192,22 @@ pub fn handle(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
             items,
         }),
     })
+}
+
+/// The usable matches this agent already received in a note: (event id, ref of the newest note
+/// that carried it, score), best first. Matches it only saw in an earlier deny are left out.
+fn shown_matches(
+    env: &Env,
+    conn: &Connection,
+    text: &str,
+) -> anyhow::Result<Vec<(i64, String, f64)>> {
+    let mut out = Vec::new();
+    for (note, score) in similar(env, conn, text, true)? {
+        if let Some(r) = env.shown_note_ref(conn, note.event_id)? {
+            out.push((note.event_id, r, score));
+        }
+    }
+    Ok(out)
 }
 
 /// The same (session, agent) already has a query deny for this trigger text.

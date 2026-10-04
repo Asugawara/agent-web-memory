@@ -239,20 +239,29 @@ fn injections(conn: &Connection) -> anyhow::Result<Value> {
     }))
 }
 
-/// URL denies by what the record they hand over was: a cached answer or a dead URL.
+/// URL denies by what the record they hand over was: a cached answer or a dead URL, each split
+/// into the full reason and the short one that points to a note the agent already had.
 fn url_deny_kinds(conn: &Connection) -> anyhow::Result<Value> {
-    let kind = |status: &str| {
+    let kind = |status: &str, shown: bool| {
         count(
             conn,
             &format!(
                 "SELECT COUNT(*) FROM injection i JOIN injection_item ii \
                    ON ii.injection_id = i.id AND ii.position = 1 \
                  JOIN event e ON e.id = ii.event_id \
-                 WHERE i.mode = 'deny' AND i.channel = 'url' AND e.status {status}"
+                 WHERE i.mode = 'deny' AND i.channel = 'url' AND e.status {status} \
+                   AND (instr(COALESCE(i.rendered, ''), '{}') > 0) = {}",
+                crate::render::SHOWN_MARK,
+                u8::from(shown)
             ),
         )
     };
-    Ok(json!({"cached": kind("= 'ok'")?, "dead_url": kind("= 'dead_end'")?}))
+    Ok(json!({
+        "cached": kind("= 'ok'", false)?,
+        "cached_shown": kind("= 'ok'", true)?,
+        "dead_url": kind("= 'dead_end'", false)?,
+        "dead_url_shown": kind("= 'dead_end'", true)?,
+    }))
 }
 
 fn refetch_after_deny(conn: &Connection) -> anyhow::Result<Value> {
