@@ -883,12 +883,12 @@ fn a_prompt_matching_the_stored_answer_text_picks_that_answer() {
 }
 
 #[test]
-fn a_candidate_without_an_fts_row_falls_back_to_the_newest_without_an_error() {
+fn a_candidate_with_an_empty_match_text_scores_nothing_and_the_newest_is_kept() {
+    // Both documents empty: nothing to score, the newest is handed over without an error.
     let home = Home::new();
     seed_two_answers(&home);
-    // The external-content index has no row for either candidate.
     home.conn()
-        .execute("INSERT INTO event_fts(event_fts) VALUES('delete-all')", [])
+        .execute("UPDATE event SET match_text = ''", [])
         .unwrap();
     let request = pre_fetch_asking("toolu_main_1", Some("What are the pricing tiers and cost?"));
     let reason = deny_reason(&home.hook("pre-fetch", &request));
@@ -896,13 +896,12 @@ fn a_candidate_without_an_fts_row_falls_back_to_the_newest_without_an_error() {
         reason.contains("\nfound: Answer about installation\n"),
         "{reason}"
     );
-    // Only the newest row lacks its FTS row: the older, indexed one is the only one scored.
+    // Only the newest document is empty: the older one is the only one that scores.
     let home = Home::new();
     seed_two_answers(&home);
     home.conn()
         .execute(
-            "INSERT INTO event_fts(event_fts, rowid, match_text) \
-             SELECT 'delete', id, match_text FROM event WHERE tool_use_id = 'toolu_new'",
+            "UPDATE event SET match_text = '' WHERE tool_use_id = 'toolu_new'",
             [],
         )
         .unwrap();
@@ -910,6 +909,18 @@ fn a_candidate_without_an_fts_row_falls_back_to_the_newest_without_an_error() {
     let reason = deny_reason(&home.hook("pre-fetch", &request));
     assert!(
         reason.contains("\nfound: Answer about pricing tiers\n"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn a_prompt_whose_terms_appear_in_no_candidate_falls_back_to_the_newest() {
+    let home = Home::new();
+    seed_two_answers(&home);
+    let request = pre_fetch_asking("toolu_main_1", Some("zyxwv qponm"));
+    let reason = deny_reason(&home.hook("pre-fetch", &request));
+    assert!(
+        reason.contains("\nfound: Answer about installation\n"),
         "{reason}"
     );
 }
