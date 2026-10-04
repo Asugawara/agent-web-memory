@@ -334,7 +334,8 @@ pub const OWN_MARK: &str = "the result of your own WebFetch";
 /// Reason text of a PreToolUse deny when this agent already has the record: it received it in a
 /// note (`Known::Note`, that note's `ref_id`) or it fetched the URL itself earlier in this
 /// session (`Known::Own`). The first line is as [`deny_reason`] (or the dead-URL line) has it, then
-/// the stored prompt, a pointer to what the agent has, the retry sentence; no summary text.
+/// the stored prompt, a pointer to what the agent has (for its own fetch the `asked:` line already
+/// names that fetch, so the pointer repeats nothing), the retry sentence; no summary text.
 /// `candidates` is as in [`deny_reason`] (1 for a dead URL).
 pub fn deny_reason_shown(
     note: &Note,
@@ -375,10 +376,10 @@ pub fn deny_reason_shown(
                 "found: in the agent-web-memory note ref {r} {SHOWN_MARK} (awm log --ref {r})\n"
             ));
         }
-        Known::Own { text, .. } => {
+        // The `asked:` line above already carries the prompt of that own fetch; no repeat.
+        Known::Own { .. } => {
             out.push_str(&format!(
-                "found: {OWN_MARK} of this URL earlier in this session{}\n",
-                asked_suffix(text)
+                "found: {OWN_MARK} of this URL earlier in this session\n"
             ));
         }
     }

@@ -842,6 +842,36 @@ fn the_earlier_answer_closest_to_the_prompt_is_handed_over() {
 }
 
 #[test]
+fn only_the_newest_twenty_answers_are_candidates() {
+    // 21 answers: the oldest alone holds the word the prompt asks for. It is outside the 20 newest
+    // the deny reads, so nothing matches and the newest is handed over, "closest of 20".
+    let home = Home::new();
+    home.seed(
+        &answered_fetch(
+            "toolu_oldest",
+            "Explain the zebra quota rules",
+            "ZEBRA ANSWER",
+        ),
+        22 * 60_000,
+    );
+    for i in 1..=20 {
+        home.seed(
+            &answered_fetch(
+                &format!("toolu_general_{i}"),
+                &format!("Give a general page summary number {i}"),
+                &format!("GENERAL ANSWER {i}"),
+            ),
+            (21 - i) * 60_000,
+        );
+    }
+    let request = pre_fetch_asking("toolu_main_1", Some("zebra quota"));
+    let reason = deny_reason(&home.hook("pre-fetch", &request));
+    assert!(reason.contains("closest of 20 earlier answers"), "{reason}");
+    assert!(reason.contains("\nfound: GENERAL ANSWER 20\n"), "{reason}");
+    assert!(!reason.contains("ZEBRA ANSWER"), "{reason}");
+}
+
+#[test]
 fn without_a_matching_or_any_prompt_the_newest_answer_is_handed_over() {
     for prompt in [Some("zebra giraffe"), Some("?"), None] {
         let home = Home::new();
@@ -2658,7 +2688,7 @@ fn a_fetch_repeated_by_the_same_agent_gets_the_short_own_deny() {
     );
     assert!(
         reason.contains(
-            "found: the result of your own WebFetch of this URL earlier in this session (asked: List the pricing tiers)\n"
+            "found: the result of your own WebFetch of this URL earlier in this session\n"
         ),
         "{reason}"
     );
