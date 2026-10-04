@@ -6,6 +6,7 @@
 //! per group with its size in `seen` (4), never an id in `shown_event_ids` (5),
 //! and at most three hits.
 
+pub mod bm25;
 pub mod calibrate;
 pub mod fts;
 #[cfg(test)]
