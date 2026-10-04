@@ -914,6 +914,36 @@ fn a_candidate_with_an_empty_match_text_scores_nothing_and_the_newest_is_kept() 
 }
 
 #[test]
+fn with_two_answers_the_word_that_tells_them_apart_decides_over_a_repeated_shared_word() {
+    // The prompts share most words and differ in one ("yearly" / "monthly"); the newer answer
+    // repeats a shared word. DENY6's floored idf ranked the newer one (shared tf); Lucene's idf
+    // hands over the older one, which holds the prompt's differing word.
+    let home = Home::new();
+    home.seed(
+        &answered_fetch(
+            "toolu_old",
+            "Show the billing plans table yearly",
+            "Answer about yearly billing with extra unrelated filler words kept here",
+        ),
+        120_000,
+    );
+    home.seed(
+        &answered_fetch(
+            "toolu_new",
+            "Show the billing plans table monthly",
+            "Answer monthly billing plans billing plans table billing table",
+        ),
+        60_000,
+    );
+    let request = pre_fetch_asking("toolu_main_1", Some("Show billing plans table yearly"));
+    let reason = deny_reason(&home.hook("pre-fetch", &request));
+    assert!(
+        reason.contains("\nfound: Answer about yearly billing with extra"),
+        "{reason}"
+    );
+}
+
+#[test]
 fn a_prompt_whose_terms_appear_in_no_candidate_falls_back_to_the_newest() {
     let home = Home::new();
     seed_two_answers(&home);
