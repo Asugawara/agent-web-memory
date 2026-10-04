@@ -88,7 +88,8 @@ The project is organized into modules:
 - `record.rs`: Parse WebSearch and WebFetch events from hooks and transcripts
 - `capture.rs`: Store records to the database
 - `import.rs`: Import research from Claude Code transcripts
-- `matching/`: URL and query matching with FTS5
+- `matching/`: URL and query matching with FTS5 (the query channel ranks in the index); `bm25.rs` ranks one URL's stored answers in Rust for the fetch deny
+- `paths.rs`: Data directory and the team files
 - `gate.rs`: Gate UserPromptSubmit injections
 - `render.rs`: Format notes for injection
 - `sanitize.rs`: Redact and bound note text

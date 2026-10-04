@@ -5,7 +5,9 @@
 # Runs `claude -p --model haiku` against a temporary AWM_HOME seeded from the T6 fixtures,
 # with AWM_CANARY={nonce} (every hook appends AWM-CANARY-{Hook}-{nonce}) and
 # AWM_CANARY_DENY=1 for the deny runs. Uses at most 2 WebSearch calls for a full run
-# (VH2, and VH5 which also serves VH7 and VH8); the VH4q / VH6q searches are denied before they run. Never edits ~/.claude/settings.json or plugin settings; the `claude -p` runs create
+# (VH2, and VH5 which also serves VH7 and VH8); the VH4q / VH6q searches are denied before they run.
+# VH2 and VH5 run with short_circuit.query = "off" in the temporary AWM_HOME (restored after the run):
+# with the default "on" the similarity deny stops the search before PostToolUse, so no note is checked. Never edits ~/.claude/settings.json or plugin settings; the `claude -p` runs create
 # session transcripts under ~/.claude/projects as any session does. Exits non-zero on a mismatch in VH1-VH5 or VH4q.
 set -u
 
@@ -74,7 +76,20 @@ run() {
 in_main() { [ -n "${tfile:-}" ] && [ -f "$tfile" ] && grep -Fq -- "$1" "$tfile"; }
 in_sub() { [ -d "$sub" ] && grep -rFq -- "$1" "$sub" 2>/dev/null; }
 in_final() { printf '%s' "$final" | grep -Fq -- "$1"; }
-count_main() { [ -f "${tfile:-/nonexistent}" ] && grep -Fc -- "$1" "$tfile" || echo 0; }
+count_main() { # exactly one number: grep -c exits 1 on a count of 0, so its status is ignored
+  if [ -f "${tfile:-/nonexistent}" ]; then { grep -Fc -- "$1" "$tfile" || true; }; else echo 0; fi
+}
+# The similarity deny (short_circuit.query, on by default) would stop the VH2 / VH5 searches before
+# they run, so no PostToolUse note could be checked. These two runs switch it off in the script's
+# own temporary $AWM_HOME and put the previous config back afterwards (VH4q / VH6q cover the deny).
+cfg_save="$tmp/config.toml.saved"
+query_deny_off() {
+  if [ -f "$AWM_HOME/config.toml" ]; then cp "$AWM_HOME/config.toml" "$cfg_save"; else : >"$cfg_save.none"; fi
+  "$AWM_BIN" config set short_circuit.query off >/dev/null || exit 2
+}
+query_deny_restore() {
+  if [ -f "$cfg_save.none" ]; then rm -f "$AWM_HOME/config.toml" "$cfg_save.none"; else cp "$cfg_save" "$AWM_HOME/config.toml"; fi
+}
 
 rows=()
 fail=0
@@ -92,7 +107,9 @@ if want VH1; then
   else row VH1 reached "not reached" MISMATCH; fi
 fi
 if want VH2; then
+  query_deny_off
   run vh2 "$P_SEARCH" 0
+  query_deny_restore
   c="AWM-CANARY-PostToolUse-$nonce"
   if in_main "$c"; then row VH2 reached "reached (final text: $(in_final "$c" && echo yes || echo no))" ok
   else row VH2 reached "not reached" MISMATCH; fi
@@ -118,7 +135,9 @@ if want VH4q; then
   else row VH4q "denied (tool error)" "not denied" MISMATCH; fi
 fi
 if want VH5 || want VH7 || want VH8; then
+  query_deny_off
   run vh5 "$P_SUB" 0
+  query_deny_restore
   cp="AWM-CANARY-PostToolUse-$nonce"
   cu="AWM-CANARY-UserPromptSubmit-$nonce"
   if want VH5; then
