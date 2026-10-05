@@ -913,6 +913,7 @@ impl Acc {
             "tokens_saved": self.chars,
             "overhead_tokens": self.overhead,
             "net_tokens": self.chars - self.overhead,
+            "net_tokens_with_summariser": (self.bytes / 4) as f64 + self.chars - self.overhead,
             "est_cost": self.cost,
             "overhead_cost": self.overhead * pricing.main_input_per_mtok / 1e6,
             "net_cost": (pricing.main_input_per_mtok > 0.0)
@@ -1500,12 +1501,12 @@ fn savings_text(v: &Value) -> String {
     if int("shown") == 0 {
         o.push_str("  No notes shown yet.\n");
     } else {
+        let summariser = num(v, &["est_summariser_tokens"]);
+        let net = kilo(num(v, &["net_tokens_with_summariser"]));
         o.push_str(&format!(
-            "  shown {} = avoided {} + followed up {}; note overhead {} tokens, net {}; est. cost {}",
-            int("shown"),
-            int("avoided"),
-            int("followed_up"),
-            kilo(num(v, &["overhead_tokens"])),
+            "  tokens saved, net: {}{net} = summariser {} + main model {}; est. cost {}",
+            if summariser > 0.0 { "<= " } else { "" },
+            upper_bound(summariser),
             kilo(num(v, &["net_tokens"])),
             money(num(v, &["est_cost"]), currency)
         ));
@@ -1516,6 +1517,17 @@ fn savings_text(v: &Value) -> String {
             ));
         }
         o.push('\n');
+        o.push_str(&format!(
+            "  main model: {} of summaries not read - {} of notes shown\n",
+            kilo(num(v, &["tokens_saved"])),
+            kilo(num(v, &["overhead_tokens"]))
+        ));
+        o.push_str(&format!(
+            "  shown {} = avoided {} + followed up {}\n",
+            int("shown"),
+            int("avoided"),
+            int("followed_up")
+        ));
     }
     if num(v, &["by_origin", "team", "shown"]) > 0.0 {
         o.push_str(
@@ -1529,7 +1541,9 @@ fn savings_text(v: &Value) -> String {
     o.push('\n');
     let footnote = wrap(
         "tokens: main-model context, summary chars / 4. page bytes: what the fetch summariser read; \
-         summariser tokens <= bytes / 4 (upper bound). per avoided item: median of past ok calls of \
+         summariser tokens <= bytes / 4 (upper bound). net: summariser tokens (upper bound) plus \
+         main-model tokens not read, minus the notes shown; the two are different models, so the \
+         parts are printed too. per avoided item: median of past ok calls of \
          the same url or normalised query (fallback: all ok calls of that tool). confirmed: avoided \
          items you labelled 2 in awm review. cost: fetch summariser tokens at [pricing] rates \
          (default Claude Haiku 4.5: $1/M in, $5/M out) plus $0.01 per avoided search (Anthropic web \

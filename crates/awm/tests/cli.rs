@@ -1073,6 +1073,7 @@ fn stats_savings_matches_hand_computed_numbers() {
     // 800 + 1200 + 46 chars). Page bytes: median of 4000, 8000, 20000 is 8000 (event 4 has NULL
     // bytes and is ignored), so 8.0 KB and 8000 / 4 = 2000 summariser tokens; the same for the
     // confirmed item. Repeat fetches: 8000 + 20000 + 0 (event 4) = 28000 bytes, 7000 tokens.
+    // Net with the summariser: 2000 + 200 - 300 = 1900 = 1.9k; the main-model part is -100 = -0.1k.
     let text = env.awm(&["stats", "--savings"]).ok().to_string();
     let want = "\
 savings: an estimate of what did not happen, not a measurement
@@ -1083,7 +1084,9 @@ savings: an estimate of what did not happen, not a measurement
   ceiling: repeat fetches       3  0.5 min    0.5k     28.0 KB     <= 7.0k   $0.01
   ceiling: repeat searches      0  0.0 min    0.0k           -           -   $0.00
 
-  shown 2 = avoided 1 + followed up 1; note overhead 0.3k tokens, net -0.1k; est. cost <$0.01
+  tokens saved, net: <= 1.9k = summariser <= 2.0k + main model -0.1k; est. cost <$0.01
+  main model: 0.2k of summaries not read - 0.3k of notes shown
+  shown 2 = avoided 1 + followed up 1
 
 ";
     assert!(text.starts_with(want), "got:\n{text}");
@@ -1106,6 +1109,7 @@ savings: an estimate of what did not happen, not a measurement
     assert_eq!(s["tokens_saved"], 200.0);
     assert_eq!(s["overhead_tokens"], 300.0);
     assert_eq!(s["net_tokens"], -100.0);
+    assert_eq!(s["net_tokens_with_summariser"], 1_900.0);
     assert_eq!(s["confirmed"]["items"], 1);
     assert_eq!(s["confirmed"]["time_saved_ms"], 8_000.0);
     assert_eq!(s["confirmed"]["tokens_saved"], 200.0);
@@ -1161,7 +1165,10 @@ fn stats_savings_prices_main_tokens_when_the_rate_is_set() {
         "{text}"
     );
     assert!(
-        text.contains("; est. cost $2.00, net $2.00 after pricing the note overhead\n"),
+        text.contains(
+            "  tokens saved, net: <= 1.9k = summariser <= 2.0k + main model -0.1k; est. cost $2.00, \
+             net $2.00 after pricing the note overhead\n"
+        ),
         "{text}"
     );
     assert!(text.contains("<= 7.0k  $7.00\n"), "{text}");
@@ -1213,6 +1220,18 @@ fn stats_savings_avoided_search_adds_no_page_bytes() {
     assert_eq!(v["savings"]["avoided"], 1);
     assert_eq!(v["savings"]["est_bytes_not_fetched"], 0);
     assert_eq!(v["savings"]["est_summariser_tokens"], 0);
+    // Searches only: the net is exact, so no `<=` before it, and the summariser part is `<= 0k`.
+    let text = env.awm(&["stats", "--savings"]).ok().to_string();
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("  tokens saved, net: "))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(!line.starts_with("  tokens saved, net: <="), "{line}");
+    assert!(line.contains(" = summariser <= 0k + main model "), "{line}");
+    assert_eq!(
+        v["savings"]["net_tokens_with_summariser"],
+        v["savings"]["net_tokens"]
+    );
 }
 
 #[test]

@@ -338,6 +338,12 @@ fn stats_savings_splits_every_item_line_by_origin() {
         assert_eq!(o["tokens_saved"], tokens, "{name}: {o}");
         assert_eq!(o["overhead_tokens"], overhead, "{name}: {o}");
         assert_eq!(o["net_tokens"], tokens - overhead, "{name}: {o}");
+        // The summariser side (4,000 tokens per origin) joins the net.
+        assert_eq!(
+            o["net_tokens_with_summariser"],
+            4_000.0 + tokens - overhead,
+            "{name}: {o}"
+        );
         near(&o["est_cost"], cost);
         assert_eq!(o["est_bytes_not_fetched"], 16_000, "{name}: {o}");
         assert_eq!(o["est_summariser_tokens"], 4_000, "{name}: {o}");
