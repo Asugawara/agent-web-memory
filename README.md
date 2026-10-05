@@ -82,7 +82,7 @@ awm purge --all
 
 ### How savings are estimated
 
-`awm stats --savings` counts a shown note as avoided when the same session and agent did not call its URL or query again afterwards, and prices it at the median duration and summary length (chars / 4) of earlier calls of the same URL or query. This is an estimate of something that did not happen, so it also prints the part you confirmed in `awm review` (label 2), the token overhead of the notes, and the repeat calls in your history as an upper bound. It also prints a separate line, the page bytes not fetched: for each avoided fetch, the median size of earlier fetches of that URL, with summariser tokens = bytes / 4. That is an upper bound and is kept apart from the token figures above, because the page is read by Claude Code's fetch summariser and the main model never sees those tokens; on API billing they are cost, on a subscription they are usage, not dollars. Searches add 0.
+`awm stats --savings` counts a shown note as avoided when the same session and agent did not call its URL or query again afterwards, and prices it at the median duration and summary length (chars / 4) of earlier calls of the same URL or query. This is an estimate of something that did not happen, so it also prints the part you confirmed in `awm review` (label 2), the token overhead of the notes, and the repeat calls in your history as an upper bound. It also prints a separate line, the page bytes not fetched: for each avoided fetch, the median size of earlier fetches of that URL, with summariser tokens = bytes / 4. That is an upper bound, and the table keeps it in its own column, because the page is read by Claude Code's fetch summariser and the main model never sees those tokens; on API billing they are cost, on a subscription they are usage, not dollars. Searches add 0. The first summary line adds the summariser tokens and the main-model net into one net and prints both parts, since not running the summariser is most of what an avoided fetch saves.
 
 The `cost` column prices these figures in money: each avoided fetch costs its summariser tokens at the input rate plus its summary at the output rate, and each avoided search costs the web search fee. The rates live in `config.toml` (change them with `awm config set pricing.<key> <value>`; negative values are an error) and default to Claude Haiku 4.5 prices:
 
@@ -95,7 +95,7 @@ search_fee_per_call = 0.01         # Anthropic web search: USD 10 per 1,000 sear
 main_input_per_mtok = 0.0          # your main model's input price; 0 = not priced
 ```
 
-Main-model tokens are priced only when `main_input_per_mtok` is set; the summary line then also shows a net cost after the note overhead. A subscription pays none of this per call, so read the cost as what the same calls would cost on API billing.
+Main-model tokens are priced only when `main_input_per_mtok` is set; the first summary line then also shows a net cost after the note overhead. A subscription pays none of this per call, so read the cost as what the same calls would cost on API billing.
 
 ### Savings in your usage limits (subscription)
 
