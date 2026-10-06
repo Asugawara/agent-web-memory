@@ -383,7 +383,13 @@ fn query_deny_text(conn: &Connection, it: &Item) -> anyhow::Result<Option<String
     };
     let reason = match &it.rendered {
         Some(r) => plain_block(r),
-        None => render::deny_reason_search(&note, &ctx, &who),
+        None => match render::deny_search_body(std::slice::from_ref(&note), &ctx) {
+            Some((body, _)) => format!(
+                "{}\n{body}",
+                render::deny_search_reason(caller_is_codex(it))
+            ),
+            None => "(the deny cannot be rendered)".to_string(),
+        },
     };
     Ok(Some(format!(
         "query deny: {who}, {}\n{reason}",

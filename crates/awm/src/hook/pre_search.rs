@@ -128,11 +128,7 @@ pub fn handle(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
     let search_ms = super::elapsed_ms(start);
 
     let ref_id = env.new_ref();
-    let retry = if input.tool_name == "webrun" {
-        "If this does not answer your question, run the same search again; it will not be blocked again."
-    } else {
-        "If this does not answer your question, call WebSearch again with the same query; it will not be blocked again."
-    };
+    let codex = input.tool_name == "webrun";
     let only: Vec<Note> = notes.iter().map(|(n, _)| n.clone()).collect();
     // Every match is already in this agent's context (a note it got, its own earlier result): deny
     // with a pointer to it, no summary text.
@@ -141,15 +137,16 @@ pub fn handle(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
     } else {
         Vec::new()
     };
+    // (one-line reason, body, items); Codex gets the body below the reason, Claude Code next to it.
     let rendered = if !shown.is_empty() {
         let known: Vec<Known> = shown.iter().map(|(_, k, _)| k.clone()).collect();
         let items = shown.iter().map(|(id, _, sc)| (*id, *sc)).collect();
-        Some((render::deny_reason_search_shown(&known, retry), items))
+        Some((render::deny_search_shown_reason(&known, codex), None, items))
     } else if only.is_empty() {
         None
     } else {
         let ctx = env.render_ctx(Channel::Query, &ref_id);
-        render::deny_reason_matches(&only, &ctx, retry).map(|(reason, ids)| {
+        render::deny_search_body(&only, &ctx).map(|(body, ids)| {
             let items = ids
                 .iter()
                 .map(|id| {
@@ -160,12 +157,12 @@ pub fn handle(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
                     (*id, score)
                 })
                 .collect::<Vec<(i64, f64)>>();
-            (reason, items)
+            (render::deny_search_reason(codex), Some(body), items)
         })
     };
-    let (mut reason, items) = match rendered {
+    let (mut reason, body, items) = match rendered {
         Some(r) => r,
-        None if forced => (CANARY_REASON.to_string(), Vec::new()),
+        None if forced => (CANARY_REASON.to_string(), None, Vec::new()),
         None => {
             return Ok(Verdict {
                 search_ms: Some(search_ms),
@@ -176,8 +173,18 @@ pub fn handle(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
     if let Some(line) = canary_line(EVENT) {
         append_canary(&mut reason, &line);
     }
+    let stored = match &body {
+        Some(b) => format!("{reason}\n{b}"),
+        None => reason.clone(),
+    };
+    // Codex: one channel, the body after the first line of the reason.
+    let output = if codex {
+        deny_json(&stored, None)
+    } else {
+        deny_json(&reason, body.as_deref())
+    };
     Ok(Verdict {
-        output: Some(deny_json(&reason)),
+        output: Some(output),
         outcome: "denied",
         search_ms: Some(search_ms),
         injection: Some(Injection {
@@ -187,8 +194,8 @@ pub fn handle(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
             tool_use_id: input.tool_use_id.clone(),
             trigger_text: Some(trigger),
             cutoff: None,
-            rendered_chars: reason.chars().count(),
-            rendered: Some(reason),
+            rendered_chars: stored.chars().count(),
+            rendered: Some(stored),
             ref_id,
             items,
         }),

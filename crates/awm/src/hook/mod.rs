@@ -115,16 +115,19 @@ pub fn context_json(event: &str, context: &str, system_message: Option<&str>) ->
     out.to_string()
 }
 
-/// PreToolUse deny.
-pub fn deny_json(reason: &str) -> String {
-    json!({
+/// PreToolUse deny: a one-line `reason` and, when non-empty, the `context` the model gets next to it.
+pub fn deny_json(reason: &str, context: Option<&str>) -> String {
+    let mut out = json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
             "permissionDecisionReason": reason
         }
-    })
-    .to_string()
+    });
+    if let Some(c) = context.filter(|c| !c.is_empty()) {
+        out["hookSpecificOutput"]["additionalContext"] = Value::String(c.to_string());
+    }
+    out.to_string()
 }
 
 pub fn now_ms() -> i64 {

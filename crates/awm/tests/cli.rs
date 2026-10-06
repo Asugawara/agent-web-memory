@@ -1606,14 +1606,10 @@ fn review_shows_a_query_deny_without_a_stored_reason_rebuilt_and_accepts_a_label
         "{text}"
     );
     assert!(
-        text.contains("agent-web-memory: this search was already run 1 h ago in another project."),
+        text.contains("agent-web-memory: earlier research matching this search is attached as additional context."),
         "{text}"
     );
-    assert!(
-        text.contains("searched: sqlite fts5 bm25 weights"),
-        "{text}"
-    );
-    assert!(text.contains("found: Weights are passed"), "{text}");
+    assert!(text.contains("\nWeights are passed"), "{text}");
     assert!(
         text.contains("query deny labels: 2 the earlier finding covered"),
         "{text}"

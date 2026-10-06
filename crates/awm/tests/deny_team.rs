@@ -211,7 +211,7 @@ fn a_local_record_of_another_session_does_trigger_the_query_deny() {
     home.seed(&search_record("s-old", "t1", QUERY, "/work/x"), HOUR_MS);
     let (_, out) = home.hook("pre-fetch", &pre_search("toolu_1"));
     assert!(
-        reason(&out).contains("earlier research matches this search"),
+        reason(&out).contains("earlier research matching this search is attached"),
         "{out}"
     );
 }
@@ -225,7 +225,7 @@ fn a_record_of_the_callers_other_machine_triggers_the_query_deny() {
     home.make_team(id, OWN, None);
     let (_, out) = home.hook("pre-fetch", &pre_search("toolu_1"));
     let r = reason(&out);
-    assert!(r.contains("your other machine"), "{r}");
+    assert!(r.contains("is attached as additional context"), "{r}");
     assert_eq!(
         home.count("SELECT COUNT(*) FROM injection WHERE mode = 'deny'"),
         1
@@ -260,7 +260,7 @@ fn a_teammates_newer_identical_search_does_not_hide_the_owners_older_one() {
     home.make_team(team, ALF, None);
     let (_, out) = home.hook("pre-fetch", &pre_search("toolu_1"));
     assert!(
-        reason(&out).contains("earlier research matches this search"),
+        reason(&out).contains("earlier research matching this search is attached"),
         "{out}"
     );
     assert_eq!(denied_event_ids(&home), vec![own]);
@@ -296,7 +296,7 @@ fn a_hit_outside_the_window_never_consumes_one_of_the_note_slots() {
     );
     let (_, out) = home.hook("pre-fetch", &pre_search("toolu_1"));
     assert!(
-        reason(&out).contains("earlier research matches this search"),
+        reason(&out).contains("earlier research matching this search is attached"),
         "{out}"
     );
     assert_eq!(denied_event_ids(&home), vec![fresh]);
@@ -366,7 +366,10 @@ fn a_local_sibling_fetch_does_trigger_the_url_deny() {
         MIN_MS,
     );
     let (_, out) = home.hook("pre-fetch", &pre_fetch("toolu_main"));
-    assert!(reason(&out).contains("already fetched"), "{out}");
+    assert!(
+        reason(&out).contains("an earlier answer for this URL is attached"),
+        "{out}"
+    );
 }
 
 #[test]
@@ -381,7 +384,10 @@ fn a_fetch_row_of_the_callers_other_machine_triggers_the_url_deny() {
     home.make_team(id, OWN, None);
     let (_, out) = home.hook("pre-fetch", &pre_fetch("toolu_main"));
     let r = reason(&out);
-    assert!(r.contains("by your other machine"), "{r}");
+    assert!(
+        r.contains("an earlier answer for this URL is attached"),
+        "{r}"
+    );
 }
 
 #[test]
