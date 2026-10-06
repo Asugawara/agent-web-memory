@@ -18,12 +18,11 @@ use rusqlite::{params, Connection, OptionalExtension};
 use super::{append_canary, canary_line, deny_json, Env, HookArgs, Injection, Verdict};
 use crate::config::ShortCircuitMode;
 use crate::matching::{self, Hit};
-use crate::note::{Channel, Relation, Status};
+use crate::note::{Channel, Status};
 use crate::record::redact_url;
-use crate::render::{self, plain_label};
+use crate::render;
 
 const EVENT: &str = "PreToolUse";
-const AGENT_TYPE_CAP: usize = 24;
 
 pub fn run(_args: HookArgs) -> anyhow::Result<()> {
     super::run_sync("pre-fetch", handle);
@@ -71,29 +70,34 @@ fn handle_fetch(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
 
     let ref_id = env.new_ref();
     let mut items = Vec::new();
-    let mut reason = match &cached {
+    let (mut reason, body) = match &cached {
         Some(c) => {
             let opts = env.match_opts(conn)?;
             let note = matching::to_note(conn, &c.hit, &opts)?;
-            let who = who_text(&note.relation, c.own);
             items.push((c.hit.event_id, c.hit.score));
-            let ctx = env.render_ctx(Channel::Url, &ref_id);
-            if let Some(known) = env.known(conn, c.hit.event_id)? {
-                render::deny_reason_shown(&note, &ctx, &who, c.candidates, &known)
-            } else if note.status == Status::DeadEnd {
-                render::deny_reason_dead_url(&note, &ctx, &who)
+            // A dead end has no body, so what the agent already has does not matter.
+            let known = if note.status == Status::DeadEnd {
+                None
             } else {
-                render::deny_reason(&note, &ctx, &who, c.candidates)
-            }
+                env.known(conn, c.hit.event_id)?
+            };
+            render::deny_url(&note, known.as_ref())
         }
-        None => "agent-web-memory: canary deny. Call WebFetch again with the same URL; it will not be blocked again."
-            .to_string(),
+        None => (
+            "agent-web-memory: canary deny. Call WebFetch again with the same URL; it will not be blocked again."
+                .to_string(),
+            None,
+        ),
     };
     if let Some(line) = canary_line(EVENT) {
         append_canary(&mut reason, &line);
     }
+    let rendered = match &body {
+        Some(b) => format!("{reason}\n{b}"),
+        None => reason.clone(),
+    };
     Ok(Verdict {
-        output: Some(deny_json(&reason)),
+        output: Some(deny_json(&reason, body.as_deref())),
         outcome: "denied",
         search_ms: Some(search_ms),
         injection: Some(Injection {
@@ -103,45 +107,17 @@ fn handle_fetch(env: &Env, conn: &Connection) -> anyhow::Result<Verdict> {
             tool_use_id: input.tool_use_id.clone(),
             trigger_text: Some(trigger),
             cutoff: None,
-            rendered_chars: reason.chars().count(),
-            rendered: Some(reason),
+            rendered_chars: rendered.chars().count(),
+            rendered: Some(rendered),
             ref_id,
             items,
         }),
     })
 }
 
-/// `{who}` of the reason: who made the earlier fetch. `own` is the caller's own earlier fetch
-/// (same session and agent).
-fn who_text(relation: &Relation, own: bool) -> String {
-    if own {
-        return "you, earlier in this session".to_string();
-    }
-    match relation {
-        Relation::OtherSubagent { agent_type } => {
-            let t = plain_label(agent_type, AGENT_TYPE_CAP);
-            if t.is_empty() {
-                "a subagent".to_string()
-            } else {
-                format!("a {t} subagent")
-            }
-        }
-        Relation::MainAgent => "the main agent".to_string(),
-        Relation::SameProject => "another session of this project".to_string(),
-        Relation::OtherProject => "another session".to_string(),
-        Relation::OwnDevice => "your other machine".to_string(),
-        // A teammate's record never triggers a deny (`find_cached`); the text keeps the match total.
-        Relation::Teammate { .. } => "a teammate".to_string(),
-    }
-}
-
 /// The earlier fetch a deny hands over.
 struct Cached {
     hit: Hit,
-    /// Made by the caller itself (same session and agent).
-    own: bool,
-    /// Earlier answers (status ok) the choice was made among; 1 when there was no choice.
-    candidates: usize,
 }
 
 /// Most usable rows read per deny.
@@ -149,7 +125,6 @@ const CANDIDATE_LIMIT: usize = 20;
 
 struct Candidate {
     id: i64,
-    own: bool,
     ok: bool,
     /// The FTS document (`match_text`) the ranking reads.
     text: String,
@@ -165,24 +140,21 @@ struct Candidate {
 fn find_cached(env: &Env, conn: &Connection, norm: &str) -> anyhow::Result<Option<Cached>> {
     let window_ms = i64::from(env.config.short_circuit.window_days) * 86_400_000;
     let mut st = conn.prepare_cached(
-        "SELECT e.id, (e.origin = 'local' AND e.session_id = ?2 AND e.agent_id IS ?3), \
-                e.status = 'ok', e.match_text FROM event e \
+        "SELECT e.id, e.status = 'ok', e.match_text FROM event e \
          WHERE e.tool = 'WebFetch' AND e.url_norm = ?1 \
            AND ((e.status = 'ok' AND e.http_code = 200) \
              OR (e.status = 'dead_end' AND (e.http_code = 202 \
                  OR (e.http_code BETWEEN 300 AND 499 AND e.http_code != 429)))) \
-           AND e.created_at >= ?4 AND e.quarantined = 0 \
-           AND (e.origin = 'local' OR e.member = ?6) \
-           AND (?5 IS NULL OR e.tool_use_id != ?5) \
+           AND e.created_at >= ?2 AND e.quarantined = 0 \
+           AND (e.origin = 'local' OR e.member = ?4) \
+           AND (?3 IS NULL OR e.tool_use_id != ?3) \
            AND NOT EXISTS (SELECT 1 FROM tombstone t \
                            WHERE t.kind = 'tool_use_id' AND t.value = e.tool_use_id) \
-         ORDER BY e.created_at DESC, e.id DESC LIMIT ?7",
+         ORDER BY e.created_at DESC, e.id DESC LIMIT ?5",
     )?;
     let rows = st.query_map(
         params![
             norm,
-            env.input.session_id,
-            env.input.agent_id,
             env.started_at_ms - window_ms,
             env.input.tool_use_id,
             matching::own_member_id(),
@@ -191,9 +163,8 @@ fn find_cached(env: &Env, conn: &Connection, norm: &str) -> anyhow::Result<Optio
         |r| {
             Ok(Candidate {
                 id: r.get(0)?,
-                own: r.get(1)?,
-                ok: r.get(2)?,
-                text: r.get(3)?,
+                ok: r.get(1)?,
+                text: r.get(2)?,
             })
         },
     )?;
@@ -212,8 +183,6 @@ fn find_cached(env: &Env, conn: &Connection, norm: &str) -> anyhow::Result<Optio
                 score: 1.0,
                 seen: 1,
             },
-            own: newest.own,
-            candidates: 1,
         }));
     }
     let oks: Vec<&Candidate> = all.iter().filter(|c| c.ok).collect();
@@ -230,8 +199,6 @@ fn find_cached(env: &Env, conn: &Connection, norm: &str) -> anyhow::Result<Optio
             score,
             seen: 1,
         },
-        own: chosen.own,
-        candidates: oks.len(),
     }))
 }
 

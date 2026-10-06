@@ -6,7 +6,6 @@ injections:
     cached: 0
     cached_shown: 0
     dead_url: 0
-    dead_url_shown: 0
   harmful: 0
   per_note_precision:
     url:

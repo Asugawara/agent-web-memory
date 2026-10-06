@@ -250,10 +250,8 @@ fn url_deny_kinds(conn: &Connection) -> anyhow::Result<Value> {
                    ON ii.injection_id = i.id AND ii.position = 1 \
                  JOIN event e ON e.id = ii.event_id \
                  WHERE i.mode = 'deny' AND i.channel = 'url' AND e.status {status} \
-                   AND ((instr(COALESCE(i.rendered, ''), '{}') > 0 \
-                         OR instr(COALESCE(i.rendered, ''), '{}') > 0)) = {}",
+                   AND (instr(substr(COALESCE(i.rendered, ''), 1, instr(COALESCE(i.rendered, '') || char(10), char(10))), '{}') > 0) = {}",
                 crate::render::SHOWN_MARK,
-                crate::render::OWN_MARK,
                 u8::from(shown)
             ),
         )
@@ -262,7 +260,6 @@ fn url_deny_kinds(conn: &Connection) -> anyhow::Result<Value> {
         "cached": kind("= 'ok'", false)?,
         "cached_shown": kind("= 'ok'", true)?,
         "dead_url": kind("= 'dead_end'", false)?,
-        "dead_url_shown": kind("= 'dead_end'", true)?,
     }))
 }
 
