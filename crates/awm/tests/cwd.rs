@@ -250,3 +250,161 @@ fn resolve_once_writes_a_new_path_and_leaves_a_known_one_to_import() {
     assert_eq!(resolve_once(&conn, "").unwrap().hash, sha256_hex(""));
     assert_eq!(rows(&conn), 1);
 }
+
+// ---- backfill (STATS2) ----
+
+fn event(conn: &Connection, id: i64, session: &str, hash: &str, at: i64) {
+    conn.execute(
+        "INSERT INTO event (id, tool_use_id, tool, session_id, cwd_hash, created_at, query, status, \
+                            summary, match_text, source) \
+         VALUES (?1, ?2, 'WebSearch', ?3, ?4, ?5, 'q', 'ok', 's', 'q', 'hook')",
+        rusqlite::params![id, format!("tu{id}"), session, hash, at],
+    )
+    .unwrap();
+}
+
+fn injection(conn: &Connection, id: i64, session: &str, transcript: Option<&Path>, at: i64) {
+    conn.execute(
+        "INSERT INTO injection (id, ref, created_at, hook, channel, mode, session_id, tool_use_id, \
+                                rendered_chars, latency_ms, transcript_path) \
+         VALUES (?1, ?2, ?3, 'PostToolUse', 'url', 'inject', ?4, ?5, 300, 10, ?6)",
+        rusqlite::params![
+            id,
+            format!("{id:08x}"),
+            at,
+            session,
+            format!("inj{id}"),
+            transcript.map(|p| p.to_string_lossy().into_owned())
+        ],
+    )
+    .unwrap();
+}
+
+fn injection_hash(conn: &Connection, id: i64) -> Option<String> {
+    conn.query_row("SELECT cwd_hash FROM injection WHERE id = ?1", [id], |r| {
+        r.get(0)
+    })
+    .unwrap()
+}
+
+#[test]
+fn backfill_places_old_injections_and_events_from_the_transcripts() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = db(dir.path());
+    let main = checkout(dir.path());
+    let src = main.join("src").to_string_lossy().into_owned();
+    let other = dir.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let other_s = other.to_string_lossy().into_owned();
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let elsewhere_s = elsewhere.to_string_lossy().into_owned();
+
+    // Transcripts: s1 moves from `src` to `other`; e2 and e3 start where events were captured.
+    let projects = dir.path().join("projects/p");
+    std::fs::create_dir_all(&projects).unwrap();
+    let t1 = projects.join("s1.jsonl");
+    std::fs::write(
+        &t1,
+        format!(
+            "{{\"type\":\"user\",\"timestamp\":\"2026-10-04T00:00:00Z\"}}\n\
+             {{\"type\":\"user\",\"cwd\":{src:?},\"timestamp\":\"2026-10-04T00:00:10Z\"}}\n\
+             {{\"type\":\"user\",\"cwd\":{other_s:?},\"timestamp\":\"2026-10-04T01:00:00Z\"}}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        projects.join("e2.jsonl"),
+        format!("{{\"type\":\"user\",\"cwd\":{elsewhere_s:?}}}\n"),
+    )
+    .unwrap();
+    // A Codex rollout: the session meta line names the directory.
+    let codex = dir.path().join("codex/2026/10/04");
+    std::fs::create_dir_all(&codex).unwrap();
+    let rollout_cwd = dir.path().join("rollout-dir");
+    std::fs::create_dir_all(&rollout_cwd).unwrap();
+    let rollout_s = rollout_cwd.to_string_lossy().into_owned();
+    std::fs::write(
+        codex.join("rollout-x.jsonl"),
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"c1\",\"cwd\":{rollout_s:?}}}}}\n"
+        ),
+    )
+    .unwrap();
+
+    let t = |s: &str| {
+        time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+            .map(|t| i64::try_from(t.unix_timestamp_nanos() / 1_000_000).unwrap())
+            .unwrap()
+    };
+    // Injection 1: near the first line (src). 2: near the last (other). 3: its transcript is gone,
+    // its session has an event in `elsewhere`. 4: nothing is left. 5: already placed.
+    injection(&conn, 1, "s1", Some(&t1), t("2026-10-04T00:00:20Z"));
+    injection(&conn, 2, "s1", Some(&t1), t("2026-10-04T00:59:00Z"));
+    injection(&conn, 3, "s3", Some(&dir.path().join("gone.jsonl")), 5);
+    injection(&conn, 4, "s4", None, 6);
+    injection(&conn, 5, "s5", None, 7);
+    conn.execute(
+        "UPDATE injection SET cwd_hash = ?1 WHERE id = 5",
+        [sha256_hex(&rollout_s)],
+    )
+    .unwrap();
+    event(&conn, 1, "s3", &sha256_hex(&elsewhere_s), 1);
+    event(&conn, 2, "s7", &sha256_hex(&rollout_s), 2);
+    event(&conn, 3, "s8", &sha256_hex("/gone/for/good"), 3);
+    // A directory first seen outside git that is a checkout now.
+    let late = dir.path().join("late");
+    std::fs::create_dir_all(&late).unwrap();
+    let late_s = late.to_string_lossy().into_owned();
+    let late_hash = remember(&conn, &late_s, 1).unwrap();
+    if repo_root(&late).is_none() {
+        std::fs::create_dir_all(late.join(".git")).unwrap();
+    }
+
+    let codex_dir = dir.path().join("codex");
+    let b = awm::cwd::backfill(&conn, &dir.path().join("projects"), Some(&codex_dir), 99).unwrap();
+    assert_eq!(b.injections_resolved, 3, "{b:?}");
+    assert_eq!(b.injections_unresolved, 1, "{b:?}");
+    assert_eq!(b.events_resolved, 2, "{b:?}");
+    assert_eq!(b.events_unresolved, 1, "{b:?}");
+
+    assert_eq!(injection_hash(&conn, 1), Some(sha256_hex(&src)));
+    assert_eq!(injection_hash(&conn, 2), Some(sha256_hex(&other_s)));
+    assert_eq!(injection_hash(&conn, 3), Some(sha256_hex(&elsewhere_s)));
+    assert_eq!(injection_hash(&conn, 4), None);
+    assert_eq!(injection_hash(&conn, 5), Some(sha256_hex(&rollout_s)));
+    let main_s = main.to_string_lossy().into_owned();
+    assert_eq!(
+        row(&conn, &sha256_hex(&src)),
+        Some((src.clone(), Some(main_s), 99))
+    );
+    assert_eq!(
+        row(&conn, &sha256_hex(&elsewhere_s)).unwrap().0,
+        elsewhere_s
+    );
+    assert_eq!(row(&conn, &sha256_hex(&rollout_s)).unwrap().0, rollout_s);
+    assert_eq!(row(&conn, &sha256_hex("/gone/for/good")), None);
+    // The refreshed root of the directory that became a checkout.
+    assert_eq!(
+        row(&conn, &late_hash),
+        Some((late_s.clone(), Some(late_s), 99))
+    );
+
+    // The hash no transcript names is remembered, so the next run does not walk for it again.
+    let walked: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM meta WHERE key LIKE 'cwd.walked.%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(walked, 1);
+
+    // A second run finds nothing more to place.
+    let again =
+        awm::cwd::backfill(&conn, &dir.path().join("projects"), Some(&codex_dir), 100).unwrap();
+    assert_eq!(again.injections_resolved, 0);
+    assert_eq!(again.events_resolved, 0);
+    assert_eq!(again.injections_unresolved, 1);
+    assert_eq!(again.events_unresolved, 1);
+}

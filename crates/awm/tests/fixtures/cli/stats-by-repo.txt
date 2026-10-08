@@ -1,0 +1,5 @@
+  records  shown  denied  refetched  repository
+        4      1       1          1  <TMP>/repo
+        1      1       0          0  (no repository) <TMP>/plain
+        1      0       0          0  (unknown)
+        6      2       1          1  total
