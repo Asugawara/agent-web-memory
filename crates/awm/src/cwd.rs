@@ -181,6 +181,15 @@ fn nearest(cands: &[(Option<i64>, String)], at: i64) -> Option<&str> {
         .map(|(_, c)| c.as_str())
 }
 
+/// `<repo>` of a path with the components `worktrees/<repo>/<something>`.
+fn worktree_repo_name(path: &Path) -> Option<std::ffi::OsString> {
+    let parts: Vec<_> = path.components().collect();
+    parts.windows(3).find_map(|w| match w {
+        [a, b, _] if a.as_os_str() == "worktrees" => Some(b.as_os_str().to_os_string()),
+        _ => None,
+    })
+}
+
 /// `meta` key prefix of a hash the transcript walk of [`backfill`] could not place (value: when).
 const WALKED: &str = "cwd.walked.";
 /// How long a fruitless walk for a hash is not repeated.
@@ -204,7 +213,8 @@ fn missing_events(conn: &Connection) -> rusqlite::Result<usize> {
 /// 2. a local event whose `cwd_hash` has no `cwd` row gets one when a transcript under `projects`
 ///    or `codex` starts in that directory (the first `cwd` of each file is hashed);
 /// 3. a `cwd` row without a repository root is looked up again, so a directory that became a
-///    checkout after it was first seen is placed in it.
+///    checkout after it was first seen is placed in it; a vanished `.../worktrees/<repo>/<x>`
+///    directory takes the one known repository root named `<repo>`.
 ///
 /// Every path is resolved before the write transaction (a `stat` of a missing path under an
 /// automounted parent costs ~16 ms and hooks wait at most 50 ms for the lock); the transaction
@@ -348,12 +358,38 @@ pub fn backfill(
         .prepare("SELECT cwd_hash, path FROM cwd WHERE repo_root IS NULL")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    let roots: Vec<(String, String)> = rootless
-        .into_iter()
-        .filter_map(|(h, p)| {
-            repo_root(Path::new(&p)).map(|r| (h, r.to_string_lossy().into_owned()))
-        })
-        .collect();
+    let mut roots: Vec<(String, String)> = Vec::new();
+    let mut orphans: Vec<(String, String)> = Vec::new();
+    for (h, p) in rootless {
+        match repo_root(Path::new(&p)) {
+            Some(r) => roots.push((h, r.to_string_lossy().into_owned())),
+            None => orphans.push((h, p)),
+        }
+    }
+    // A worktree directory that is gone (`.../worktrees/<repo>/<branch>`) belongs to the one
+    // known repository named `<repo>`; with none or several, it stays unplaced.
+    if !orphans.is_empty() {
+        let mut known: HashSet<String> = conn
+            .prepare("SELECT DISTINCT repo_root FROM cwd WHERE repo_root IS NOT NULL")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        known.extend(roots.iter().map(|(_, r)| r.clone()));
+        for (h, p) in orphans {
+            let path = Path::new(&p);
+            if path.exists() {
+                continue;
+            }
+            let Some(repo) = worktree_repo_name(path) else {
+                continue;
+            };
+            let mut named = known
+                .iter()
+                .filter(|r| Path::new(r.as_str()).file_name().is_some_and(|n| n == repo));
+            if let (Some(root), None) = (named.next(), named.next()) {
+                roots.push((h, root.clone()));
+            }
+        }
+    }
 
     // The write: no filesystem access from here on.
     conn.execute_batch("BEGIN IMMEDIATE")?;

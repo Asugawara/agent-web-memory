@@ -408,3 +408,56 @@ fn backfill_places_old_injections_and_events_from_the_transcripts() {
     assert_eq!(again.injections_unresolved, 1);
     assert_eq!(again.events_unresolved, 1);
 }
+
+#[test]
+fn backfill_places_a_vanished_worktree_with_the_one_repository_of_that_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = db(dir.path());
+    let nowhere = Path::new("/nonexistent-awm-stats2");
+    let row_for = |path: &str, root: Option<&str>| {
+        conn.execute(
+            "INSERT INTO cwd (cwd_hash, path, repo_root, updated_at) VALUES (?1, ?2, ?3, 1)",
+            rusqlite::params![sha256_hex(path), path, root],
+        )
+        .unwrap();
+        sha256_hex(path)
+    };
+    let root = nowhere.join("dev/proj").to_string_lossy().into_owned();
+    row_for(&root, Some(&root));
+    let gone = nowhere
+        .join(".herdr/worktrees/proj/t1")
+        .to_string_lossy()
+        .into_owned();
+    let h_gone = row_for(&gone, None);
+    // Nothing named `other` is known: stays NULL.
+    let none = nowhere
+        .join(".herdr/worktrees/other/t1")
+        .to_string_lossy()
+        .into_owned();
+    let h_none = row_for(&none, None);
+    // An existing non-git path with such components is left to the filesystem.
+    let real = dir.path().join("worktrees/proj/t2");
+    std::fs::create_dir_all(&real).unwrap();
+    let real_s = real.to_string_lossy().into_owned();
+    let h_real = row_for(&real_s, None);
+    let projects = dir.path().join("projects");
+    let root_of = |h: &str| row(&conn, h).unwrap().1;
+
+    awm::cwd::backfill(&conn, &projects, None, 5).unwrap();
+    assert_eq!(root_of(&h_gone), Some(root.clone()));
+    assert_eq!(root_of(&h_none), None);
+    if repo_root(&real).is_none() {
+        assert_eq!(root_of(&h_real), None);
+    }
+
+    // A second repository of the same name makes it ambiguous.
+    conn.execute(
+        "UPDATE cwd SET repo_root = NULL WHERE cwd_hash = ?1",
+        [&h_gone],
+    )
+    .unwrap();
+    let other = "/nonexistent-awm-stats2-y/proj";
+    row_for(other, Some(other));
+    awm::cwd::backfill(&conn, &projects, None, 6).unwrap();
+    assert_eq!(root_of(&h_gone), None);
+}
