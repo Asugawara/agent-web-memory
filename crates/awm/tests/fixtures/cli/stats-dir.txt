@@ -1,0 +1,66 @@
+scope: dir <TMP>/repo (2 directories)
+by agent: claude 4, codex 0
+injections:
+  accepted: 0
+  changed_next_step: 0
+  deny_by_kind:
+    cached: 1
+    cached_shown: 0
+    dead_url: 0
+  harmful: 0
+  per_note_precision:
+  refetch_after_deny:
+    denies: 1
+    refetched: 1
+    share: 100.0%
+  rendered_chars:
+    p50: 300
+    p95: 300
+  shown: 2
+  shown_by_agent_kind:
+    main: 2
+  shown_by_channel:
+    url: 2
+  shown_by_day:
+    2026-09-21: 2
+query_deny:
+  by_age:
+    within_24_h: 0
+    within_30_min: 0
+  by_agent_kind:
+    main: 0
+    subagent: 0
+  by_relation:
+    other_coding_agent: 0
+    other_project: 0
+    other_session_project_unknown: 0
+    other_session_same_project: 0
+    same_agent: 0
+    sibling: 0
+  by_top_score:
+    30-40:
+      denies: 0
+      researched: 0
+    40-60:
+      denies: 0
+      researched: 0
+    60+:
+      denies: 0
+      researched: 0
+    <30:
+      denies: 0
+      researched: 0
+  cutoff_used:
+    source: calibrated
+    value: 55.0
+  denied: 0
+  labels:
+    0: 0
+    1: 0
+    2: 0
+    h: 0
+  per_100_searches: -
+  research_after_deny:
+    denies: 0
+    researched: 0
+    share: -

@@ -8,6 +8,15 @@ use serde_json::{json, Map, Value};
 
 const FOLLOWUP_WINDOW_MS: i64 = 120_000;
 
+/// What `--by` groups the records and notes by.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum By {
+    /// The repository checkout that holds the working directory
+    Repo,
+    /// The working directory itself
+    Dir,
+}
+
 #[derive(clap::Args, Debug, Default)]
 pub struct Args {
     /// Hook latency per hook and agent kind
@@ -38,7 +47,36 @@ pub struct Args {
     /// Daily totals of the members who share them (shown when at least 3 members reported)
     #[arg(long)]
     pub team: bool,
-    /// Transcript directory for the quota block (default ~/.claude/projects)
+    /// One row per repository or per directory (alone: records, notes injected and denied; with
+    /// --savings: the savings columns). Places old rows from the transcripts first, which writes
+    /// to the database
+    #[arg(
+        long,
+        value_enum,
+        conflicts_with_all = ["repo", "dir", "latency", "import", "team", "status", "value", "followups"]
+    )]
+    pub by: Option<By>,
+    /// Only the records and notes of the repository that holds PATH (default .), including its
+    /// worktrees and every directory in it
+    #[arg(
+        long,
+        value_name = "PATH",
+        num_args = 0..=1,
+        default_missing_value = ".",
+        conflicts_with_all = ["dir", "latency", "import", "team", "by"]
+    )]
+    pub repo: Option<PathBuf>,
+    /// Only the records and notes of the directory PATH (default .) and everything under it
+    #[arg(
+        long,
+        value_name = "PATH",
+        num_args = 0..=1,
+        default_missing_value = ".",
+        conflicts_with_all = ["repo", "latency", "import", "team", "by"]
+    )]
+    pub dir: Option<PathBuf>,
+    /// Transcript directory for the quota block and for placing old rows (default
+    /// ~/.claude/projects)
     #[arg(long, value_name = "DIR")]
     pub projects: Option<PathBuf>,
     /// Print JSON
@@ -54,15 +92,29 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         )
         .exit();
     }
+    // Validate PATH before anything is written: the backfill may walk every transcript.
+    if let Some(p) = &args.repo {
+        repo_roots(p)?;
+    }
     let conn = super::open_db()?;
+    if args.by.is_some() || args.repo.is_some() || args.dir.is_some() {
+        backfill(&conn, &args)?;
+    }
     let v = collect(&conn, &args)?;
     if args.json {
         println!("{v}");
     } else {
         let mut out = String::new();
         if let Value::Object(map) = &v {
+            if let Some(s) = map.get("scope") {
+                out.push_str(&scope_text(s));
+            }
             for (k, val) in map {
-                if k == "savings" {
+                if k == "scope" {
+                    continue;
+                } else if k == "by_repo" || k == "by_dir" {
+                    out.push_str(&by_text(k, val));
+                } else if k == "savings" {
                     out.push_str(&savings_text(val));
                 } else if k == "team" {
                     out.push_str(&team_text(val));
@@ -80,8 +132,185 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Names the directories of old rows from the transcripts (see [`crate::cwd::backfill`]); one
+/// line on stderr when some stayed unplaced.
+fn backfill(conn: &Connection, args: &Args) -> anyhow::Result<()> {
+    let projects = super::projects_dir(&args.projects).unwrap_or_default();
+    let codex = crate::import::default_codex_dir();
+    let b = crate::cwd::backfill(conn, &projects, codex.as_deref(), super::now_ms())?;
+    if b.injections_unresolved > 0 || b.events_unresolved > 0 {
+        eprintln!(
+            "awm stats: {} injections and {} records could not be placed (no transcript or record names their directory)",
+            b.injections_unresolved, b.events_unresolved
+        );
+    }
+    Ok(())
+}
+
+/// The `cwd_hash` values a query is limited to: the temporary table `scope_cwd`, filled once, and
+/// one SQL fragment per table, so no query exists twice. Without a scope both fragments are empty.
+pub struct Scope {
+    on: bool,
+}
+
+impl Scope {
+    pub fn none() -> Scope {
+        Scope { on: false }
+    }
+
+    /// ` AND <alias>.cwd_hash IN scope` for a query on `event` (`alias` may be empty).
+    fn events(&self, alias: &str) -> String {
+        self.clause(alias)
+    }
+
+    /// The same for a query on `injection`; its `cwd_hash` is NULL on rows not yet placed.
+    fn injections(&self, alias: &str) -> String {
+        self.clause(alias)
+    }
+
+    fn clause(&self, alias: &str) -> String {
+        if !self.on {
+            return String::new();
+        }
+        let col = if alias.is_empty() {
+            "cwd_hash".to_string()
+        } else {
+            format!("{alias}.cwd_hash")
+        };
+        format!(" AND COALESCE({col}, '') IN (SELECT cwd_hash FROM scope_cwd)")
+    }
+
+    /// Empties the table (creating it first) and fills it with `hashes`.
+    fn set(conn: &Connection, hashes: &[String]) -> anyhow::Result<Scope> {
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS scope_cwd(cwd_hash TEXT PRIMARY KEY); \
+             DELETE FROM scope_cwd;",
+        )?;
+        let mut ins = conn.prepare("INSERT OR IGNORE INTO scope_cwd VALUES (?1)")?;
+        for h in hashes {
+            ins.execute([h])?;
+        }
+        Ok(Scope { on: true })
+    }
+
+    /// The scope of `--repo` / `--dir`, with its `scope` object; `None` without either flag.
+    fn from_args(conn: &Connection, args: &Args) -> anyhow::Result<Option<(Scope, Value)>> {
+        let (kind, shown, hashes) = if let Some(p) = &args.repo {
+            let roots = repo_roots(p)?;
+            let first = &roots[0];
+            let shown = first.to_string_lossy().into_owned();
+            let mut hashes = Vec::new();
+            let mut st = conn.prepare("SELECT cwd_hash FROM cwd WHERE repo_root = ?1")?;
+            for r in &roots {
+                for h in st.query_map([r.to_string_lossy()], |row| row.get::<_, String>(0))? {
+                    hashes.push(h?);
+                }
+            }
+            ("repo", shown, hashes)
+        } else if let Some(p) = &args.dir {
+            let abs = absolute(p);
+            let canon = std::fs::canonicalize(&abs).ok();
+            let shown = canon
+                .as_ref()
+                .unwrap_or(&abs)
+                .to_string_lossy()
+                .into_owned();
+            let mut forms: Vec<String> = Vec::new();
+            for f in [Some(abs), canon].into_iter().flatten() {
+                let f = f.to_string_lossy().into_owned();
+                if !forms.contains(&f) {
+                    forms.push(f);
+                }
+            }
+            let mut hashes = Vec::new();
+            let mut st = conn.prepare(
+                "SELECT cwd_hash FROM cwd WHERE path = ?1 OR substr(path, 1, length(?2)) = ?2",
+            )?;
+            for f in &forms {
+                let prefix = if f.ends_with('/') {
+                    f.clone()
+                } else {
+                    format!("{f}/")
+                };
+                for h in st.query_map([f.trim_end_matches('/'), prefix.as_str()], |row| {
+                    row.get::<_, String>(0)
+                })? {
+                    hashes.push(h?);
+                }
+            }
+            ("dir", shown, hashes)
+        } else {
+            return Ok(None);
+        };
+        let scope = Scope::set(conn, &hashes)?;
+        let directories: i64 =
+            conn.query_row("SELECT COUNT(*) FROM scope_cwd", [], |r| r.get(0))?;
+        Ok(Some((
+            scope,
+            json!({"kind": kind, "path": shown, "directories": directories}),
+        )))
+    }
+}
+
+/// The repository roots of `--repo PATH` (the given and the canonical form; at least one), or an
+/// error when PATH is not inside a git repository. Touches no database, so `run` calls it first.
+fn repo_roots(p: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let abs = absolute(p);
+    let canon = std::fs::canonicalize(&abs).ok();
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for form in [Some(abs), canon].into_iter().flatten() {
+        if let Some(r) = crate::cwd::repo_root(&form) {
+            if !roots.contains(&r) {
+                roots.push(r);
+            }
+        }
+    }
+    if roots.is_empty() {
+        anyhow::bail!("{} is not inside a git repository; use --dir", p.display());
+    }
+    Ok(roots)
+}
+
+/// `p` as an absolute path without `.` components (relative ones start at the current directory).
+fn absolute(p: &Path) -> PathBuf {
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(p)
+    };
+    abs.components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect()
+}
+
+/// `scope: repo /Users/me/dev/proj (5 directories)`.
+fn scope_text(v: &Value) -> String {
+    let n = v["directories"].as_i64().unwrap_or(0);
+    format!(
+        "scope: {} {} ({n} {})\n",
+        v["kind"].as_str().unwrap_or(""),
+        v["path"].as_str().unwrap_or(""),
+        if n == 1 { "directory" } else { "directories" }
+    )
+}
+
 /// The selected sections as one object; the default section when no flag is given.
 pub fn collect(conn: &Connection, args: &Args) -> anyhow::Result<Value> {
+    let mut out = Map::new();
+    if let Some(by) = args.by {
+        let since_ms = args.since.as_deref().map(super::parse_date).transpose()?;
+        let (key, rows) = by_groups(conn, by, args.savings, since_ms)?;
+        out.insert(key.into(), rows);
+        return Ok(Value::Object(out));
+    }
+    let scoped = Scope::from_args(conn, args)?;
+    let (sc, info) = match scoped {
+        Some((sc, info)) => (sc, Some(info)),
+        None => (Scope::none(), None),
+    };
+    if let Some(info) = info {
+        out.insert("scope".into(), info);
+    }
     let any = args.latency
         || args.import
         || args.status
@@ -89,14 +318,13 @@ pub fn collect(conn: &Connection, args: &Args) -> anyhow::Result<Value> {
         || args.followups
         || args.savings
         || args.team;
-    let mut out = Map::new();
     if !any {
-        out.insert("by_agent".into(), by_agent(conn)?);
-        out.insert("injections".into(), injections(conn)?);
+        out.insert("by_agent".into(), by_agent(conn, &sc)?);
+        out.insert("injections".into(), injections(conn, &sc)?);
         let min_score = crate::paths::config_path()
             .and_then(|p| crate::config::load(&p))
             .map_or(None, |c| c.short_circuit.query_min_score);
-        out.insert("query_deny".into(), query_deny(conn, min_score)?);
+        out.insert("query_deny".into(), query_deny(conn, min_score, &sc)?);
     }
     if args.latency {
         out.insert("latency".into(), latency(conn)?);
@@ -105,20 +333,20 @@ pub fn collect(conn: &Connection, args: &Args) -> anyhow::Result<Value> {
         out.insert("import".into(), import(conn)?);
     }
     if args.status {
-        out.insert("status".into(), status(conn)?);
+        out.insert("status".into(), status(conn, &sc)?);
     }
     if args.value {
-        out.insert("value".into(), value(conn, args.origin)?);
+        out.insert("value".into(), value(conn, args.origin, &sc)?);
     }
     if args.followups {
-        out.insert("followups".into(), followups(conn)?);
+        out.insert("followups".into(), followups(conn, &sc)?);
     }
     if args.savings {
         // An unresolvable home only leaves the quota block without transcripts.
         let projects = super::projects_dir(&args.projects).unwrap_or_default();
         out.insert(
             "savings".into(),
-            savings(conn, args.since.as_deref(), &projects)?,
+            savings(conn, args.since.as_deref(), &projects, &sc)?,
         );
     }
     if args.team {
@@ -126,6 +354,238 @@ pub fn collect(conn: &Connection, args: &Args) -> anyhow::Result<Value> {
         out.insert("team".into(), team_totals(conn, since, super::now_ms())?);
     }
     Ok(Value::Object(out))
+}
+
+/// `--by`: one row per repository or directory, and a `total` row. Rows are the `cwd` rows
+/// grouped by `repo_root` (a directory outside git by its own path, `(no repository) PATH`) or by
+/// `path`; what no `cwd` row names is `(unknown)`. Without `savings` the fields are `records`,
+/// `notes` (inject mode), `denied` and `refetch_after_deny` (all limited by `since_ms`), ordered by `notes`, `records`, then
+/// name; with it the savings of the group's injections (a group without any is not listed),
+/// ordered by cost. The call-cost medians the savings use stay global.
+fn by_groups(
+    conn: &Connection,
+    by: By,
+    savings: bool,
+    since_ms: Option<i64>,
+) -> anyhow::Result<(&'static str, Value)> {
+    let (section, key) = match by {
+        By::Repo => ("by_repo", "repo"),
+        By::Dir => ("by_dir", "dir"),
+    };
+    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut st = conn.prepare("SELECT cwd_hash, path, repo_root FROM cwd")?;
+    let named = st.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    for r in named {
+        let (hash, path, root) = r?;
+        let label = match by {
+            By::Dir => path,
+            By::Repo => root.unwrap_or_else(|| format!("(no repository) {path}")),
+        };
+        groups.entry(label).or_default().push(hash);
+    }
+    // `''` stands for a NULL or empty hash, as in the scope clause.
+    let unknown: Vec<String> = conn
+        .prepare(
+            "SELECT DISTINCT COALESCE(cwd_hash, '') FROM ( \
+               SELECT cwd_hash FROM event WHERE origin = 'local' \
+               UNION ALL SELECT cwd_hash FROM injection WHERE mode IN ('inject','deny')) \
+             WHERE COALESCE(cwd_hash, '') NOT IN (SELECT cwd_hash FROM cwd)",
+        )?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !unknown.is_empty() {
+        groups.insert("(unknown)".into(), unknown);
+    }
+
+    let mut rows: Vec<(String, Map<String, Value>, f64)> = Vec::new();
+    let mut total = [0.0_f64; 6];
+    if savings {
+        let pricing = crate::config::load(&crate::paths::config_path()?)?.pricing;
+        for (label, hashes) in &groups {
+            Scope::set(conn, hashes)?;
+            let sc = Scope { on: true };
+            let core = savings_core(conn, &pricing, since_ms, None, &sc)?;
+            let t = &core.total;
+            if t.shown == 0 {
+                continue;
+            }
+            let fields = [
+                t.shown as f64,
+                t.avoided as f64,
+                t.ms / 60_000.0,
+                (t.bytes / 4) as f64 + t.chars - t.overhead,
+                (t.bytes / 4) as f64,
+                t.cost,
+            ];
+            for (sum, f) in total.iter_mut().zip(fields) {
+                *sum += f;
+            }
+            rows.push((label.clone(), savings_row(key, label, fields), fields[5]));
+        }
+        rows.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        let mut sum = savings_row(key, "total", total);
+        sum.insert("currency".into(), json!(pricing.currency));
+        let mut out: Vec<Value> = rows.into_iter().map(|r| Value::Object(r.1)).collect();
+        out.push(Value::Object(sum));
+        return Ok((section, Value::Array(out)));
+    }
+
+    let per_hash = |sql: &str| -> anyhow::Result<HashMap<String, [i64; 2]>> {
+        let mut m: HashMap<String, [i64; 2]> = HashMap::new();
+        let mut st = conn.prepare(sql)?;
+        for r in st.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })? {
+            let (h, a, b) = r?;
+            m.insert(h, [a, b]);
+        }
+        Ok(m)
+    };
+    let from = since_ms.unwrap_or(i64::MIN);
+    let records = per_hash(&format!(
+        "SELECT COALESCE(cwd_hash, ''), COUNT(*), 0 FROM event \
+         WHERE origin = 'local' AND created_at >= {from} GROUP BY 1"
+    ))?;
+    let notes = per_hash(&format!(
+        "SELECT COALESCE(cwd_hash, ''), COALESCE(SUM(mode = 'inject'), 0), COALESCE(SUM(mode = 'deny'), 0) \
+         FROM injection WHERE mode IN ('inject','deny') AND created_at >= {from} GROUP BY 1"
+    ))?;
+    let refetched = per_hash(&format!(
+        "SELECT COALESCE(i.cwd_hash, ''), COUNT(*), 0 FROM injection i \
+         WHERE i.mode = 'deny' AND i.channel = 'url' AND i.created_at >= {from} AND {} GROUP BY 1",
+        refetched_sql()
+    ))?;
+    let mut sums: Vec<(String, [i64; 4])> = Vec::new();
+    for (label, hashes) in &groups {
+        let mut f = [0_i64; 4];
+        for h in hashes {
+            f[0] += records.get(h).map_or(0, |v| v[0]);
+            f[1] += notes.get(h).map_or(0, |v| v[0]);
+            f[2] += notes.get(h).map_or(0, |v| v[1]);
+            f[3] += refetched.get(h).map_or(0, |v| v[0]);
+        }
+        if f[0] == 0 && f[1] + f[2] == 0 {
+            continue;
+        }
+        sums.push((label.clone(), f));
+    }
+    sums.sort_by(|a, b| {
+        b.1[1]
+            .cmp(&a.1[1])
+            .then(b.1[0].cmp(&a.1[0]))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let row = |label: &str, f: [i64; 4]| json!({key: label, "records": f[0], "notes": f[1], "denied": f[2], "refetch_after_deny": f[3]});
+    let mut all = [0_i64; 4];
+    let mut out: Vec<Value> = Vec::new();
+    for (label, f) in &sums {
+        for (a, v) in all.iter_mut().zip(f) {
+            *a += v;
+        }
+        out.push(row(label, *f));
+    }
+    out.push(row("total", all));
+    Ok((section, Value::Array(out)))
+}
+
+/// A `--by --savings` row from `[shown, avoided, minutes, net tokens, summariser tokens, cost]`.
+fn savings_row(key: &str, label: &str, f: [f64; 6]) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert(key.into(), json!(label));
+    m.insert("shown".into(), json!(f[0] as i64));
+    m.insert("avoided".into(), json!(f[1] as i64));
+    m.insert("minutes".into(), json!((f[2] * 10.0).round() / 10.0));
+    m.insert("net_tokens".into(), json!(f[3].round()));
+    m.insert("summariser_tokens".into(), json!(f[4].round()));
+    m.insert("cost".into(), json!(f[5]));
+    m
+}
+
+/// The `--by` table: numbers right-aligned, the label (a long path) last, a `total` row at the end.
+fn by_text(section: &str, rows: &Value) -> String {
+    let rows = rows.as_array().cloned().unwrap_or_default();
+    let (key, head) = if section == "by_repo" {
+        ("repo", "repository")
+    } else {
+        ("dir", "directory")
+    };
+    let savings = rows.first().is_some_and(|r| r.get("avoided").is_some());
+    let currency = rows
+        .last()
+        .and_then(|r| r["currency"].as_str())
+        .unwrap_or("USD")
+        .to_string();
+    let int = |r: &Value, k: &str| r[k].as_i64().unwrap_or(0).to_string();
+    let mut table: Vec<Vec<String>> = Vec::new();
+    let cols: Vec<&str> = if savings {
+        vec![
+            "shown",
+            "avoided",
+            "time",
+            "net tokens",
+            "summariser",
+            "cost",
+        ]
+    } else {
+        vec!["records", "notes", "denied", "refetched"]
+    };
+    for r in &rows {
+        let mut cells = if savings {
+            vec![
+                int(r, "shown"),
+                int(r, "avoided"),
+                format!("{:.1} min", num(r, &["minutes"])),
+                kilo(num(r, &["net_tokens"])),
+                upper_bound(num(r, &["summariser_tokens"])),
+                money(num(r, &["cost"]), &currency),
+            ]
+        } else {
+            vec![
+                int(r, "records"),
+                int(r, "notes"),
+                int(r, "denied"),
+                int(r, "refetch_after_deny"),
+            ]
+        };
+        cells.push(r[key].as_str().unwrap_or("").to_string());
+        table.push(cells);
+    }
+    let mut header: Vec<String> = cols.iter().map(|c| (*c).to_string()).collect();
+    header.push(head.to_string());
+    let widths: Vec<usize> = (0..header.len())
+        .map(|c| {
+            table
+                .iter()
+                .map(|r| r[c].chars().count())
+                .chain([header[c].chars().count()])
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let line = |r: &[String]| {
+        let n = r.len() - 1;
+        let mut o = String::new();
+        for (c, cell) in r.iter().enumerate().take(n) {
+            o.push_str(&format!("  {cell:>w$}", w = widths[c]));
+        }
+        o.push_str(&format!("  {}\n", r[n]));
+        o
+    };
+    let mut o = line(&header);
+    for r in &table {
+        o.push_str(&line(r));
+    }
+    o
 }
 
 fn count(conn: &Connection, sql: &str) -> anyhow::Result<i64> {
@@ -145,13 +605,16 @@ fn grouped(conn: &Connection, sql: &str) -> anyhow::Result<Value> {
 }
 
 /// Events per coding agent (`event.agent`); both agents are always listed.
-fn by_agent(conn: &Connection) -> anyhow::Result<Value> {
+fn by_agent(conn: &Connection, sc: &Scope) -> anyhow::Result<Value> {
     let mut v = json!({"claude": 0, "codex": 0});
     if let (Value::Object(m), Value::Object(found)) = (
         &mut v,
         grouped(
             conn,
-            "SELECT agent, COUNT(*) FROM event WHERE origin = 'local' GROUP BY agent",
+            &format!(
+                "SELECT agent, COUNT(*) FROM event WHERE origin = 'local'{} GROUP BY agent",
+                sc.events("")
+            ),
         )?,
     ) {
         m.extend(found);
@@ -170,21 +633,22 @@ fn by_agent_text(v: &Value) -> String {
     format!("by agent: {}\n", parts.join(", "))
 }
 
-fn injections(conn: &Connection) -> anyhow::Result<Value> {
+fn injections(conn: &Connection, sc: &Scope) -> anyhow::Result<Value> {
     let kind = "CASE WHEN agent_id IS NULL THEN 'main' ELSE 'subagent' END";
-    let shown = "mode IN ('inject','deny')";
+    let shown = format!("mode IN ('inject','deny'){}", sc.injections(""));
+    let shown_i = sc.injections("i");
     let mut day: BTreeMap<String, i64> = BTreeMap::new();
     let mut st = conn.prepare(&format!("SELECT created_at FROM injection WHERE {shown}"))?;
     for ms in st.query_map([], |r| r.get::<_, i64>(0))? {
         *day.entry(super::fmt_day(ms?)).or_default() += 1;
     }
     let mut precision = Map::new();
-    let mut st = conn.prepare(
+    let mut st = conn.prepare(&format!(
         "SELECT i.channel, \
                 SUM(o.label IN ('1','2')), SUM(o.label = '2'), COUNT(*) \
          FROM outcome o JOIN injection i ON i.id = o.injection_id \
-         WHERE i.mode IN ('inject','deny') GROUP BY i.channel ORDER BY i.channel",
-    )?;
+         WHERE i.mode IN ('inject','deny'){shown_i} GROUP BY i.channel ORDER BY i.channel"
+    ))?;
     let rows = st.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -210,7 +674,7 @@ fn injections(conn: &Connection) -> anyhow::Result<Value> {
             &format!(
                 "SELECT COUNT(DISTINCT o.injection_id) FROM outcome o \
                  JOIN injection i ON i.id = o.injection_id \
-                 WHERE i.mode IN ('inject','deny') AND o.label IN ({labels})"
+                 WHERE i.mode IN ('inject','deny'){shown_i} AND o.label IN ({labels})"
             ),
         )
     };
@@ -220,7 +684,7 @@ fn injections(conn: &Connection) -> anyhow::Result<Value> {
         ))?
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
-    let refetch = refetch_after_deny(conn)?;
+    let refetch = refetch_after_deny(conn, sc)?;
     Ok(json!({
         "shown": count(conn, &format!("SELECT COUNT(*) FROM injection WHERE {shown}"))?,
         "shown_by_channel": grouped(conn, &format!("SELECT channel, COUNT(*) FROM injection WHERE {shown} GROUP BY channel ORDER BY channel"))?,
@@ -231,7 +695,7 @@ fn injections(conn: &Connection) -> anyhow::Result<Value> {
         "harmful": with_label("'h'")?,
         "per_note_precision": precision,
         "refetch_after_deny": refetch,
-        "deny_by_kind": url_deny_kinds(conn)?,
+        "deny_by_kind": url_deny_kinds(conn, sc)?,
         "rendered_chars": {
             "p50": super::percentile(&mut chars, 50.0),
             "p95": super::percentile(&mut chars, 95.0),
@@ -241,7 +705,8 @@ fn injections(conn: &Connection) -> anyhow::Result<Value> {
 
 /// URL denies by what the record they hand over was: a cached answer or a dead URL, each split
 /// into the full reason and the short one that points to a note the agent already had.
-fn url_deny_kinds(conn: &Connection) -> anyhow::Result<Value> {
+fn url_deny_kinds(conn: &Connection, sc: &Scope) -> anyhow::Result<Value> {
+    let scope = sc.injections("i");
     let kind = |status: &str, shown: bool| {
         count(
             conn,
@@ -249,7 +714,7 @@ fn url_deny_kinds(conn: &Connection) -> anyhow::Result<Value> {
                 "SELECT COUNT(*) FROM injection i JOIN injection_item ii \
                    ON ii.injection_id = i.id AND ii.position = 1 \
                  JOIN event e ON e.id = ii.event_id \
-                 WHERE i.mode = 'deny' AND i.channel = 'url' AND e.status {status} \
+                 WHERE i.mode = 'deny' AND i.channel = 'url' AND e.status {status}{scope} \
                    AND (instr(substr(COALESCE(i.rendered, ''), 1, instr(COALESCE(i.rendered, '') || char(10), char(10))), '{}') > 0) = {}",
                 crate::render::SHOWN_MARK,
                 u8::from(shown)
@@ -263,21 +728,33 @@ fn url_deny_kinds(conn: &Connection) -> anyhow::Result<Value> {
     }))
 }
 
-fn refetch_after_deny(conn: &Connection) -> anyhow::Result<Value> {
+/// SQL condition on an injection `i`: a later fetch of the same URL by the same agent followed it.
+pub(crate) fn refetched_sql() -> String {
+    format!(
+        "EXISTS ( \
+           SELECT 1 FROM injection_item ii JOIN event src ON src.id = ii.event_id \
+           JOIN event e ON e.url_norm = src.url_norm \
+             AND e.session_id = i.session_id AND e.agent_id IS i.agent_id \
+             AND e.created_at > i.created_at AND e.created_at <= i.created_at + {FOLLOWUP_WINDOW_MS} \
+             AND (i.tool_use_id IS NULL OR e.tool_use_id != i.tool_use_id) \
+           WHERE ii.injection_id = i.id AND src.url_norm IS NOT NULL)"
+    )
+}
+
+fn refetch_after_deny(conn: &Connection, sc: &Scope) -> anyhow::Result<Value> {
     let denies = count(
         conn,
-        "SELECT COUNT(*) FROM injection WHERE mode = 'deny' AND channel = 'url'",
+        &format!(
+            "SELECT COUNT(*) FROM injection WHERE mode = 'deny' AND channel = 'url'{}",
+            sc.injections("")
+        ),
     )?;
     let refetched = count(
         conn,
         &format!(
-            "SELECT COUNT(*) FROM injection i WHERE i.mode = 'deny' AND i.channel = 'url' AND EXISTS ( \
-               SELECT 1 FROM injection_item ii JOIN event src ON src.id = ii.event_id \
-               JOIN event e ON e.url_norm = src.url_norm \
-                 AND e.session_id = i.session_id AND e.agent_id IS i.agent_id \
-                 AND e.created_at > i.created_at AND e.created_at <= i.created_at + {FOLLOWUP_WINDOW_MS} \
-                 AND (i.tool_use_id IS NULL OR e.tool_use_id != i.tool_use_id) \
-               WHERE ii.injection_id = i.id AND src.url_norm IS NOT NULL)"
+            "SELECT COUNT(*) FROM injection i WHERE i.mode = 'deny' AND i.channel = 'url'{} AND {}",
+            sc.injections("i"),
+            refetched_sql()
         ),
     )?;
     Ok(json!({"denies": denies, "refetched": refetched, "share": super::pct(refetched, denies)}))
@@ -302,22 +779,27 @@ type DenyRow = (
 /// project (from any event of the caller's session; `other_session_project_unknown` when none
 /// was captured). The caller's coding agent is Codex when its transcript is under `/.codex/` or its
 /// tool use id starts with `exec-`. `by_age` is cumulative.
-fn query_deny(conn: &Connection, min_score: Option<f64>) -> anyhow::Result<Value> {
-    const ROWS: &str = "FROM injection i JOIN injection_item ii ON ii.injection_id = i.id \
+fn query_deny(conn: &Connection, min_score: Option<f64>, sc: &Scope) -> anyhow::Result<Value> {
+    let (scope, scope_i) = (sc.injections(""), sc.injections("i"));
+    let rows = format!(
+        "FROM injection i JOIN injection_item ii ON ii.injection_id = i.id \
         JOIN event e ON e.id = ii.event_id \
-        WHERE i.hook = 'PreToolUse' AND i.channel = 'query' AND ii.position = 1";
+        WHERE i.hook = 'PreToolUse' AND i.channel = 'query' AND ii.position = 1{scope_i}"
+    );
     let codex = "COALESCE(i.transcript_path LIKE '%/.codex/%' OR i.tool_use_id LIKE 'exec-%', 0)";
     let denied = count(
         conn,
-        "SELECT COUNT(*) FROM injection WHERE hook = 'PreToolUse' AND channel = 'query' AND mode = 'deny'",
+        &format!("SELECT COUNT(*) FROM injection WHERE hook = 'PreToolUse' AND channel = 'query' AND mode = 'deny'{scope}"),
     )?;
     let mut by_kind = json!({"main": 0, "subagent": 0});
     if let (Value::Object(m), Value::Object(found)) = (
         &mut by_kind,
         grouped(
             conn,
-            "SELECT CASE WHEN agent_id IS NULL THEN 'main' ELSE 'subagent' END, COUNT(*) \
-             FROM injection WHERE hook = 'PreToolUse' AND channel = 'query' GROUP BY 1",
+            &format!(
+                "SELECT CASE WHEN agent_id IS NULL THEN 'main' ELSE 'subagent' END, COUNT(*) \
+                 FROM injection WHERE hook = 'PreToolUse' AND channel = 'query'{scope} GROUP BY 1"
+            ),
         )?,
     ) {
         m.extend(found);
@@ -335,7 +817,7 @@ fn query_deny(conn: &Connection, min_score: Option<f64>) -> anyhow::Result<Value
              THEN 'other_session_project_unknown' \
            WHEN EXISTS (SELECT 1 FROM event c WHERE c.session_id = i.session_id \
                           AND c.cwd_hash = e.cwd_hash) THEN 'other_session_same_project' \
-           ELSE 'other_project' END, COUNT(*) {ROWS} GROUP BY 1"
+           ELSE 'other_project' END, COUNT(*) {rows} GROUP BY 1"
     );
     if let (Value::Object(m), Value::Object(found)) = (&mut by_relation, grouped(conn, &relation)?)
     {
@@ -344,7 +826,7 @@ fn query_deny(conn: &Connection, min_score: Option<f64>) -> anyhow::Result<Value
     let within = |ms: i64| {
         count(
             conn,
-            &format!("SELECT COUNT(*) {ROWS} AND i.created_at - e.created_at <= {ms}"),
+            &format!("SELECT COUNT(*) {rows} AND i.created_at - e.created_at <= {ms}"),
         )
     };
     let mut labels = json!({"2": 0, "1": 0, "0": 0, "h": 0});
@@ -352,24 +834,29 @@ fn query_deny(conn: &Connection, min_score: Option<f64>) -> anyhow::Result<Value
         &mut labels,
         grouped(
             conn,
-            "SELECT o.label, COUNT(*) FROM outcome o JOIN injection i ON i.id = o.injection_id \
-             WHERE i.hook = 'PreToolUse' AND i.channel = 'query' GROUP BY o.label",
+            &format!(
+                "SELECT o.label, COUNT(*) FROM outcome o JOIN injection i ON i.id = o.injection_id \
+                 WHERE i.hook = 'PreToolUse' AND i.channel = 'query'{scope_i} GROUP BY o.label"
+            ),
         )?,
     ) {
         m.extend(found);
     }
     let searches = count(
         conn,
-        "SELECT COUNT(*) FROM event WHERE tool = 'WebSearch' AND origin = 'local'",
+        &format!(
+            "SELECT COUNT(*) FROM event WHERE tool = 'WebSearch' AND origin = 'local'{}",
+            sc.events("")
+        ),
     )?;
     let per_100 = (searches > 0).then(|| format!("{:.2}", denied as f64 * 100.0 / searches as f64));
 
     // Research after a deny: the same agent searches the same token set within 2 minutes.
-    let mut st = conn.prepare(
+    let mut st = conn.prepare(&format!(
         "SELECT session_id, agent_id, created_at, tool_use_id, trigger_text, \
                 (SELECT score FROM injection_item WHERE injection_id = injection.id AND position = 1) \
-         FROM injection WHERE hook = 'PreToolUse' AND channel = 'query' AND mode = 'deny'",
-    )?;
+         FROM injection WHERE hook = 'PreToolUse' AND channel = 'query' AND mode = 'deny'{scope}"
+    ))?;
     let denies: Vec<DenyRow> = st
         .query_map([], |r| {
             Ok((
@@ -493,10 +980,13 @@ fn import(conn: &Connection) -> anyhow::Result<Value> {
     }))
 }
 
-fn status(conn: &Connection) -> anyhow::Result<Value> {
+fn status(conn: &Connection, sc: &Scope) -> anyhow::Result<Value> {
     grouped(
         conn,
-        "SELECT status, COUNT(*) FROM event WHERE origin = 'local' GROUP BY status ORDER BY status",
+        &format!(
+            "SELECT status, COUNT(*) FROM event WHERE origin = 'local'{} GROUP BY status ORDER BY status",
+            sc.events("")
+        ),
     )
 }
 
@@ -516,7 +1006,12 @@ pub(crate) fn loop_key(injection_id: i64, position: i64) -> String {
 /// shown note counts. For `team` there is no per-100 figure (a teammate's capture is not yours);
 /// the line-7 inputs are `labelled`, `labelled_2`, the estimate `label2_estimate` (the label-2
 /// share of labelled notes times the notes shown) and `loop_labelled` (review key `L`).
-fn value(conn: &Connection, origin: Option<super::log::Origin>) -> anyhow::Result<Value> {
+fn value(
+    conn: &Connection,
+    origin: Option<super::log::Origin>,
+    sc: &Scope,
+) -> anyhow::Result<Value> {
+    let (scope_i, scope_j) = (sc.injections("i"), sc.injections("j"));
     // `ii` is joined wherever an item's origin is read.
     let only = origin.map_or(String::new(), |o| {
         format!(" AND ii.origin = '{}'", o.as_str())
@@ -525,7 +1020,7 @@ fn value(conn: &Connection, origin: Option<super::log::Origin>) -> anyhow::Resul
         conn,
         &format!(
             "SELECT COUNT(*) FROM injection_item ii JOIN injection i ON i.id = ii.injection_id \
-             WHERE i.mode IN ('inject','deny'){only}"
+             WHERE i.mode IN ('inject','deny'){only}{scope_i}"
         ),
     )?;
     let outcomes = "FROM outcome o JOIN injection i ON i.id = o.injection_id \
@@ -533,20 +1028,20 @@ fn value(conn: &Connection, origin: Option<super::log::Origin>) -> anyhow::Resul
     let label2 = count(
         conn,
         &format!(
-            "SELECT COUNT(*) {outcomes} WHERE i.mode IN ('inject','deny') AND o.label = '2'{only}"
+            "SELECT COUNT(*) {outcomes} WHERE i.mode IN ('inject','deny') AND o.label = '2'{only}{scope_i}"
         ),
     )?;
     let labelled = count(
         conn,
-        &format!("SELECT COUNT(*) {outcomes} WHERE i.mode IN ('inject','deny'){only}"),
+        &format!("SELECT COUNT(*) {outcomes} WHERE i.mode IN ('inject','deny'){only}{scope_i}"),
     )?;
     let mut st = conn.prepare(&format!(
         "SELECT i.channel, \
                 (SELECT COUNT(*) FROM injection_item ii JOIN injection j ON j.id = ii.injection_id \
-                   WHERE j.mode = 'inject' AND j.channel = i.channel{only}), \
+                   WHERE j.mode = 'inject' AND j.channel = i.channel{only}{scope_j}), \
                 COUNT(*), SUM(o.label = '2') \
          {outcomes} \
-         WHERE i.mode = 'inject'{only} GROUP BY i.channel ORDER BY i.channel"
+         WHERE i.mode = 'inject'{only}{scope_i} GROUP BY i.channel ORDER BY i.channel"
     ))?;
     let rows = st.query_map([], |r| {
         Ok((
@@ -564,11 +1059,16 @@ fn value(conn: &Connection, origin: Option<super::log::Origin>) -> anyhow::Resul
     }
     let deny2 = count(
         conn,
-        &format!("SELECT COUNT(*) {outcomes} WHERE i.mode = 'deny' AND o.label = '2'{only}"),
+        &format!(
+            "SELECT COUNT(*) {outcomes} WHERE i.mode = 'deny' AND o.label = '2'{only}{scope_i}"
+        ),
     )?;
     let captured = count(
         conn,
-        "SELECT COUNT(*) FROM event WHERE source = 'hook' AND origin = 'local'",
+        &format!(
+            "SELECT COUNT(*) FROM event WHERE source = 'hook' AND origin = 'local'{}",
+            sc.events("")
+        ),
     )?;
     let per_100 = (captured > 0).then(|| (estimate + deny2 as f64) * 100.0 / captured as f64);
     let mut v = json!({
@@ -585,7 +1085,7 @@ fn value(conn: &Connection, origin: Option<super::log::Origin>) -> anyhow::Resul
             &format!(
                 "SELECT COUNT(*) {outcomes} JOIN meta mk \
                    ON mk.key = 'review.loop.' || o.injection_id || '.' || o.position \
-                 WHERE i.mode IN ('inject','deny') AND o.label = '2'{only}"
+                 WHERE i.mode IN ('inject','deny') AND o.label = '2'{only}{scope_i}"
             ),
         )?;
         v["per_100_captured"] = Value::Null;
@@ -682,15 +1182,18 @@ fn team_text(v: &Value) -> String {
     )
 }
 
-fn followups(conn: &Connection) -> anyhow::Result<Value> {
+fn followups(conn: &Connection, sc: &Scope) -> anyhow::Result<Value> {
     let total = count(
         conn,
-        "SELECT COUNT(*) FROM injection WHERE mode IN ('inject','deny')",
+        &format!(
+            "SELECT COUNT(*) FROM injection WHERE mode IN ('inject','deny'){}",
+            sc.injections("")
+        ),
     )?;
     // One row per followed injection: the gap to the first follow-up fetch (same session and
     // agent, same URL as a shown note) and who made the earlier fetch the note came from
     // (0 the same agent, 1 a sibling, 2 another session; the nearest one when several notes).
-    let mut st = conn.prepare(
+    let mut st = conn.prepare(&format!(
         "SELECT MIN(e.created_at) - i.created_at, \
                 MIN(CASE WHEN src.session_id = i.session_id AND src.agent_id IS i.agent_id THEN 0 \
                          WHEN src.session_id = i.session_id THEN 1 ELSE 2 END) \
@@ -701,8 +1204,9 @@ fn followups(conn: &Connection) -> anyhow::Result<Value> {
            AND e.session_id = i.session_id AND e.agent_id IS i.agent_id \
            AND e.created_at > i.created_at \
            AND (i.tool_use_id IS NULL OR e.tool_use_id != i.tool_use_id) \
-         WHERE i.mode IN ('inject','deny') GROUP BY i.id",
-    )?;
+         WHERE i.mode IN ('inject','deny'){} GROUP BY i.id",
+        sc.injections("i")
+    ))?;
     let rows: Vec<(i64, i64)> = st
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
@@ -773,12 +1277,14 @@ struct Call {
     local: bool,
     /// `event.member`: the author of a team row.
     member: Option<String>,
+    /// `event.cwd_hash`: where the call was made.
+    cwd_hash: String,
 }
 
 fn load_calls(conn: &Connection) -> anyhow::Result<Vec<Call>> {
     let mut st = conn.prepare(
         "SELECT id, tool_use_id, created_at, session_id, agent_id, tool, url_norm, query, status, \
-                duration_ms, COALESCE(length(summary), 0), bytes, origin, member \
+                duration_ms, COALESCE(length(summary), 0), bytes, origin, member, cwd_hash \
          FROM event ORDER BY created_at, id",
     )?;
     let rows = st.query_map([], |r| {
@@ -805,6 +1311,7 @@ fn load_calls(conn: &Connection) -> anyhow::Result<Vec<Call>> {
             bytes: r.get(11)?,
             local: r.get::<_, String>(12)? == "local",
             member: r.get(13)?,
+            cwd_hash: r.get(14)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -951,6 +1458,7 @@ fn savings_core(
     pricing: &crate::config::Pricing,
     since_ms: Option<i64>,
     until_ms: Option<i64>,
+    sc: &Scope,
 ) -> anyhow::Result<SavingsCore> {
     let own = crate::matching::own_member_id();
     let all = load_calls(conn)?;
@@ -973,12 +1481,13 @@ fn savings_core(
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
 
-    let mut st = conn.prepare(
+    let mut st = conn.prepare(&format!(
         "SELECT id, created_at, session_id, agent_id, tool_use_id, rendered_chars, mode, \
                 COALESCE(transcript_path LIKE '%/.codex/%' OR tool_use_id LIKE 'exec-%', 0) \
-         FROM injection WHERE mode IN ('inject','deny') AND created_at >= ?1 AND created_at < ?2 \
+         FROM injection WHERE mode IN ('inject','deny') AND created_at >= ?1 AND created_at < ?2{} \
          ORDER BY created_at, id",
-    )?;
+        sc.injections("")
+    ))?;
     let injections: Vec<ShownInjection> = st
         .query_map(
             [since_ms.unwrap_or(i64::MIN), until_ms.unwrap_or(i64::MAX)],
@@ -1161,6 +1670,7 @@ pub(crate) fn day_totals(
         pricing,
         Some(day_start_ms),
         Some(day_start_ms + 86_400_000),
+        &Scope::none(),
     )?;
     let t = &core.total;
     Ok((
@@ -1173,11 +1683,30 @@ pub(crate) fn day_totals(
 
 /// Estimated savings (see [`savings_core`]), with the ceilings, the quota block and the split by
 /// origin (`by_origin.local`, `by_origin.team`: the fields of the notes, no ceilings).
-fn savings(conn: &Connection, since: Option<&str>, projects: &Path) -> anyhow::Result<Value> {
+fn savings(
+    conn: &Connection,
+    since: Option<&str>,
+    projects: &Path,
+    sc: &Scope,
+) -> anyhow::Result<Value> {
     let since_ms = since.map(super::parse_date).transpose()?;
     let pricing = crate::config::load(&crate::paths::config_path()?)?.pricing;
-    let core = savings_core(conn, &pricing, since_ms, None)?;
-    let calls: Vec<&Call> = core.local_calls.iter().collect();
+    let core = savings_core(conn, &pricing, since_ms, None, sc)?;
+    // The ceilings count repeat calls in the history; a scope limits them to its directories.
+    let in_scope: Option<HashSet<String>> = if sc.on {
+        Some(
+            conn.prepare("SELECT cwd_hash FROM scope_cwd")?
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?,
+        )
+    } else {
+        None
+    };
+    let calls: Vec<&Call> = core
+        .local_calls
+        .iter()
+        .filter(|c| in_scope.as_ref().is_none_or(|s| s.contains(&c.cwd_hash)))
+        .collect();
     let (rf_n, rf_ms, rf_chars, rf_bytes) = repeats(&calls, true);
     let (rs_n, rs_ms, rs_chars, rs_bytes) = repeats(&calls, false);
     let ceiling = |fetch: bool, n: i64, ms: i64, chars: i64, bytes: i64| {

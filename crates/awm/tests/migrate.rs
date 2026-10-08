@@ -72,6 +72,9 @@ const DATA_TABLES: &[(&str, &str)] = &[
 /// sha256 of `0003_team.sql` as released: databases at version 3 record it.
 const CHECKSUM_0003: &str = "6f944cd3d3d2deff31085bc15b6650b5fb3af53bf3456552ecf43745d7671186";
 
+/// sha256 of `0004_cwd.sql` as released: databases at version 4 record it.
+const CHECKSUM_0004: &str = "e04fe64c6d339e7c4b3c9cb14b4dc7f72ad75556433d9af364fbedcb35b9858d";
+
 fn db_in(dir: &Path) -> PathBuf {
     dir.join("awm.db")
 }
@@ -186,6 +189,7 @@ fn embedded_migrations_match_the_files() {
         "4eeb90b7505302c46eff8aee5d878a05f342be873ffdeaa9da16a8262c3adc72"
     );
     assert_eq!(db::checksum(MIGRATIONS[2].2), CHECKSUM_0003);
+    assert_eq!(db::checksum(MIGRATIONS[3].2), CHECKSUM_0004);
 }
 
 #[test]
