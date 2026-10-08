@@ -72,6 +72,10 @@ pub struct Record {
     pub agent_id: Option<String>,
     pub agent_type: Option<String>,
     pub cwd_hash: String,
+    /// The plain cwd behind `cwd_hash`, for the local `cwd` table (migration 0004); never an
+    /// `event` column and never synced. Empty when unknown: team rows, records rebuilt from
+    /// `event`, and spool files written before 0004.
+    pub cwd: String,
     pub created_at: i64,
     pub query: Option<String>,
     pub url: Option<String>,
@@ -104,6 +108,8 @@ struct RecordWire {
     agent_id: Option<String>,
     agent_type: Option<String>,
     cwd_hash: String,
+    #[serde(default)]
+    cwd: String,
     created_at: i64,
     query: Option<String>,
     url: Option<String>,
@@ -132,6 +138,7 @@ impl From<RecordWire> for Record {
             agent_id: w.agent_id,
             agent_type: w.agent_type,
             cwd_hash: w.cwd_hash,
+            cwd: w.cwd,
             created_at: w.created_at,
             query: w.query,
             url: w.url,
@@ -442,6 +449,7 @@ fn build(p: Parts, terms: &[String]) -> Option<Record> {
         agent_id: p.agent_id,
         agent_type: p.agent_type,
         cwd_hash: sha256_hex(p.cwd),
+        cwd: p.cwd.to_string(),
         created_at: p.created_at,
         query: None,
         url: None,
@@ -545,6 +553,7 @@ fn codex_base(
         agent_id: None,
         agent_type: None,
         cwd_hash: sha256_hex(cwd),
+        cwd: cwd.to_string(),
         created_at,
         query: None,
         url: None,

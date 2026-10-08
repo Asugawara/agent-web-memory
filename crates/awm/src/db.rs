@@ -23,6 +23,7 @@ pub const MIGRATIONS: &[(u32, &str, &str)] = &[
         include_str!("../migrations/0002_event_agent.sql"),
     ),
     (3, "0003_team", include_str!("../migrations/0003_team.sql")),
+    (4, "0004_cwd", include_str!("../migrations/0004_cwd.sql")),
 ];
 
 /// Who opens the database; decides creation and `busy_timeout`.

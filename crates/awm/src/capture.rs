@@ -10,6 +10,7 @@ use serde_json::Value;
 use url::Url;
 
 use crate::config::{Config, Mode};
+use crate::cwd;
 use crate::db::{self, Role, VersionCheck};
 use crate::hosts;
 use crate::paths;
@@ -159,7 +160,7 @@ fn store(
         Some(reason) => CaptureOutcome::Skipped(reason),
         None => {
             quarantine(&mut rec);
-            match insert(&mut conn, &rec) {
+            match insert(&mut conn, &rec, opts.now_ms) {
                 Ok(true) => CaptureOutcome::Captured,
                 Ok(false) => CaptureOutcome::Skipped("duplicate"),
                 Err(e) if is_busy(&e) && spool_on_busy => return spool(&rec, opts, &conn),
@@ -268,9 +269,12 @@ fn quarantine(rec: &mut Record) {
     );
 }
 
-/// Inserts the event and its results in one transaction; `false` when the
-/// `tool_use_id` already exists.
-fn insert(conn: &mut Connection, rec: &Record) -> anyhow::Result<bool> {
+/// Inserts the event, its results and its `cwd` row (migration 0004) in one transaction;
+/// `false` when the `tool_use_id` already exists.
+fn insert(conn: &mut Connection, rec: &Record, now_ms: i64) -> anyhow::Result<bool> {
+    // Before the write lock, and only for a cwd never seen: finding the repository root may stat
+    // slow (automounted) paths, and Codex runs capture inline.
+    let rec_cwd = cwd::resolve_once(conn, &rec.cwd)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let inserted = tx.execute(
         "INSERT INTO event (tool_use_id, tool, session_id, agent_id, agent_type, cwd_hash, \
@@ -315,6 +319,7 @@ fn insert(conn: &mut Connection, rec: &Record) -> anyhow::Result<bool> {
             st.execute(params![event_id, r.rank, r.url, r.url_norm, r.title])?;
         }
     }
+    cwd::store(&tx, &rec_cwd, now_ms)?;
     tx.commit()?;
     Ok(true)
 }

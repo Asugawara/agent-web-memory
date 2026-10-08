@@ -1,5 +1,5 @@
 //! Schema, migration runner and data path tests (plan-v2 §6.1, §6.2, §5.7;
-//! plan-v3-team §4.4 for 0003).
+//! plan-v3-team §4.4 for 0003; STATS1 for 0004).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -32,6 +32,7 @@ const TABLES: &[&str] = &[
     "team_device",
     "project",
     "share_rule",
+    "cwd",
 ];
 
 const INDEXES: &[&str] = &[
@@ -43,6 +44,7 @@ const INDEXES: &[&str] = &[
     "result_url_norm",
     "injection_created_at",
     "injection_agent",
+    "injection_cwd",
     "injection_item_event",
     "hook_run_started_at",
 ];
@@ -66,6 +68,9 @@ const DATA_TABLES: &[(&str, &str)] = &[
     ("hook_run", "id"),
     ("tombstone", "kind, value"),
 ];
+
+/// sha256 of `0003_team.sql` as released: databases at version 3 record it.
+const CHECKSUM_0003: &str = "6f944cd3d3d2deff31085bc15b6650b5fb3af53bf3456552ecf43745d7671186";
 
 fn db_in(dir: &Path) -> PathBuf {
     dir.join("awm.db")
@@ -102,7 +107,7 @@ fn fts_hits(conn: &Connection, term: &str) -> Vec<i64> {
 }
 
 #[test]
-fn fresh_database_migrates_to_version_3() {
+fn fresh_database_migrates_to_version_4() {
     let dir = tempfile::tempdir().unwrap();
     let mut conn = db::open(&db_in(dir.path()), Role::Cli).unwrap();
     assert_eq!(db::schema_version(&conn).unwrap(), 0);
@@ -111,11 +116,11 @@ fn fresh_database_migrates_to_version_3() {
         out,
         MigrateOutcome {
             from: 0,
-            to: 3,
+            to: 4,
             backup: None
         }
     );
-    assert_eq!(db::schema_version(&conn).unwrap(), 3);
+    assert_eq!(db::schema_version(&conn).unwrap(), 4);
     // The runner turns foreign keys back on after the 0003 rebuild.
     assert_eq!(count(&conn, "PRAGMA foreign_keys"), 1);
     let mut st = conn
@@ -136,6 +141,7 @@ fn fresh_database_migrates_to_version_3() {
                 db::checksum(MIGRATIONS[1].2)
             ),
             (3, "0003_team".to_string(), db::checksum(MIGRATIONS[2].2)),
+            (4, "0004_cwd".to_string(), db::checksum(MIGRATIONS[3].2)),
         ]
     );
     assert!(rows.iter().all(|(_, _, sum)| sum.len() == 64));
@@ -144,7 +150,7 @@ fn fresh_database_migrates_to_version_3() {
 #[test]
 fn embedded_migrations_match_the_files() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
-    assert_eq!(MIGRATIONS.len(), 3);
+    assert_eq!(MIGRATIONS.len(), 4);
     for (version, name, sql) in MIGRATIONS {
         let file = std::fs::read_to_string(dir.join(format!("{name}.sql"))).unwrap();
         assert_eq!(db::checksum(sql), db::checksum(&file), "{name}");
@@ -170,7 +176,7 @@ fn embedded_migrations_match_the_files() {
             assert_eq!(hits, allowed, "{name} contains {word}");
         }
     }
-    // 0001 and 0002 are applied on users' databases; their bytes must never change.
+    // 0001 to 0003 are applied on users' databases; their bytes must never change.
     assert_eq!(
         db::checksum(MIGRATIONS[0].2),
         "29660e731f4c8aecf3d376879706c7442c2c8d3df847d71c70688dcfca20e6eb"
@@ -179,6 +185,7 @@ fn embedded_migrations_match_the_files() {
         db::checksum(MIGRATIONS[1].2),
         "4eeb90b7505302c46eff8aee5d878a05f342be873ffdeaa9da16a8262c3adc72"
     );
+    assert_eq!(db::checksum(MIGRATIONS[2].2), CHECKSUM_0003);
 }
 
 #[test]
@@ -219,13 +226,13 @@ fn second_migrate_is_a_no_op() {
     assert_eq!(
         out,
         MigrateOutcome {
-            from: 3,
-            to: 3,
+            from: 4,
+            to: 4,
             backup: None
         }
     );
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM schema_version"), 3);
-    assert!(!dir.path().join("awm.db.bak-v3").exists());
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM schema_version"), 4);
+    assert!(!dir.path().join("awm.db.bak-v4").exists());
 }
 
 #[test]
@@ -262,24 +269,24 @@ fn check_version_reports_older_current_and_newer() {
     let mut conn = db::open(&db_in(dir.path()), Role::Cli).unwrap();
     assert_eq!(
         db::check_version(&conn).unwrap(),
-        VersionCheck::Older { db: 0, bin: 3 }
+        VersionCheck::Older { db: 0, bin: 4 }
     );
     db::migrate_with(&mut conn, &MIGRATIONS[..2]).unwrap();
     assert_eq!(
         db::check_version(&conn).unwrap(),
-        VersionCheck::Older { db: 2, bin: 3 }
+        VersionCheck::Older { db: 2, bin: 4 }
     );
     db::migrate(&mut conn).unwrap();
     assert_eq!(db::check_version(&conn).unwrap(), VersionCheck::Current);
     conn.execute(
         "INSERT INTO schema_version (version, name, checksum, applied_at) \
-         VALUES (4, '0004_future', 'x', 0)",
+         VALUES (5, '0005_future', 'x', 0)",
         [],
     )
     .unwrap();
     assert_eq!(
         db::check_version(&conn).unwrap(),
-        VersionCheck::Newer { db: 4, bin: 3 }
+        VersionCheck::Newer { db: 5, bin: 4 }
     );
 }
 
@@ -443,22 +450,22 @@ fn migrating_a_database_with_data_writes_a_backup() {
     insert_search(&conn, "tu1", "alpha");
 
     let mut next = MIGRATIONS.to_vec();
-    next.push((4, "0004_test", "CREATE TABLE extra (x INTEGER);"));
+    next.push((5, "0005_test", "CREATE TABLE extra (x INTEGER);"));
     let out = db::migrate_with(&mut conn, &next).unwrap();
 
-    let bak = dir.path().join("awm.db.bak-v3");
-    assert_eq!(out.from, 3);
-    assert_eq!(out.to, 4);
+    let bak = dir.path().join("awm.db.bak-v4");
+    assert_eq!(out.from, 4);
+    assert_eq!(out.to, 5);
     assert_eq!(
         out.backup.as_deref().map(|p| p.canonicalize().unwrap()),
         Some(bak.canonicalize().unwrap())
     );
     assert_eq!(leftover_tmp(dir.path()), Vec::<String>::new());
-    assert_eq!(db::schema_version(&conn).unwrap(), 4);
+    assert_eq!(db::schema_version(&conn).unwrap(), 5);
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM extra"), 0);
 
     let old = Connection::open(&bak).unwrap();
-    assert_eq!(db::schema_version(&old).unwrap(), 3);
+    assert_eq!(db::schema_version(&old).unwrap(), 4);
     assert_eq!(count(&old, "SELECT COUNT(*) FROM event"), 1);
     assert_eq!(fts_hits(&old, "alpha").len(), 1);
     #[cfg(unix)]
@@ -477,7 +484,7 @@ fn v1(dir: &Path) -> Connection {
 }
 
 #[test]
-fn v1_database_with_data_migrates_to_v3() {
+fn v1_database_with_data_migrates_to_v4() {
     let dir = tempfile::tempdir().unwrap();
     let mut conn = v1(dir.path());
     let a = insert_search(&conn, "tu1", "alpha");
@@ -492,19 +499,28 @@ fn v1_database_with_data_migrates_to_v3() {
     }
     assert_eq!(
         db::check_version(&conn).unwrap(),
-        VersionCheck::Older { db: 1, bin: 3 }
+        VersionCheck::Older { db: 1, bin: 4 }
     );
     let ev = insert_search(&conn, "tu4", "delta");
     insert_injection_chain(&conn, "0000abcd", ev);
     // A stale temporary from the old fixed name does not get in the way.
     std::fs::write(dir.path().join("awm.db.bak-v1.tmp"), "stale").unwrap();
 
-    // Both pending migrations run in the one transaction, after one backup at v1.
+    // Every pending migration runs in the one transaction, after one backup at v1.
     let out = db::migrate(&mut conn).unwrap();
     let bak = dir.path().join("awm.db.bak-v1");
-    assert_eq!((out.from, out.to), (1, 3));
+    assert_eq!((out.from, out.to), (1, 4));
     assert!(!dir.path().join("awm.db.bak-v2").exists());
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM schema_version"), 3);
+    assert!(!dir.path().join("awm.db.bak-v3").exists());
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM schema_version"), 4);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM injection WHERE cwd_hash IS NULL"
+        ),
+        1
+    );
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM cwd"), 0);
     assert_eq!(
         count(
             &conn,
@@ -1079,7 +1095,7 @@ fn assert_no_fk_violation(conn: &Connection) {
 }
 
 #[test]
-fn v2_database_with_data_migrates_to_v3_and_keeps_every_row() {
+fn v2_database_with_data_migrates_to_v4_and_keeps_every_row() {
     let dir = tempfile::tempdir().unwrap();
     let mut conn = v2(dir.path());
     seed(&conn, 40);
@@ -1088,12 +1104,12 @@ fn v2_database_with_data_migrates_to_v3_and_keeps_every_row() {
     assert_eq!(n_fts, 40);
     assert_eq!(
         db::check_version(&conn).unwrap(),
-        VersionCheck::Older { db: 2, bin: 3 }
+        VersionCheck::Older { db: 2, bin: 4 }
     );
 
     let out = db::migrate(&mut conn).unwrap();
     let bak = dir.path().join("awm.db.bak-v2");
-    assert_eq!((out.from, out.to), (2, 3));
+    assert_eq!((out.from, out.to), (2, 4));
     assert_eq!(
         out.backup.as_deref().map(|p| p.canonicalize().unwrap()),
         Some(bak.canonicalize().unwrap())
@@ -1130,9 +1146,17 @@ fn v2_database_with_data_migrates_to_v3_and_keeps_every_row() {
         "team_device",
         "project",
         "share_rule",
+        "cwd",
     ] {
         assert_eq!(count(&conn, &format!("SELECT COUNT(*) FROM {t}")), 0, "{t}");
     }
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM injection WHERE cwd_hash IS NULL"
+        ),
+        10
+    );
     pragma_ok(&conn, "quick_check");
     pragma_ok(&conn, "integrity_check");
     assert_no_fk_violation(&conn);
@@ -1174,13 +1198,13 @@ fn v2_database_with_data_migrates_to_v3_and_keeps_every_row() {
     assert_eq!(
         db::migrate(&mut conn).unwrap(),
         MigrateOutcome {
-            from: 3,
-            to: 3,
+            from: 4,
+            to: 4,
             backup: None
         }
     );
     assert_eq!(std::fs::read(&bak).unwrap(), bak_bytes);
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM schema_version"), 3);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM schema_version"), 4);
     assert_keeps(&conn, &before);
 }
 
@@ -1215,8 +1239,8 @@ fn concurrent_migrators_lose_nothing() {
         let mut round_wins = 0;
         for r in &results {
             match r {
-                Ok(o) if o.from == 2 && o.to == 3 && o.backup.is_some() => round_wins += 1,
-                Ok(o) if o.from == 3 && o.to == 3 && o.backup.is_none() => no_ops += 1,
+                Ok(o) if o.from == 2 && o.to == 4 && o.backup.is_some() => round_wins += 1,
+                Ok(o) if o.from == 4 && o.to == 4 && o.backup.is_none() => no_ops += 1,
                 Err(e) if e.contains("run the command again") => changed += 1,
                 // Threads of one process share a pid (RV5 m5); create_new refuses the name.
                 Err(e) if e.contains("File exists") => collided += 1,
@@ -1227,7 +1251,7 @@ fn concurrent_migrators_lose_nothing() {
         wins += round_wins;
 
         let mut conn = db::open(&path, Role::Cli).unwrap();
-        assert_eq!(db::schema_version(&conn).unwrap(), 3, "round {round}");
+        assert_eq!(db::schema_version(&conn).unwrap(), 4, "round {round}");
         assert_keeps(&conn, &before);
         pragma_ok(&conn, "quick_check");
         assert_no_fk_violation(&conn);
@@ -1237,7 +1261,7 @@ fn concurrent_migrators_lose_nothing() {
         assert_keeps(&old, &before);
         pragma_ok(&old, "quick_check");
         assert_eq!(leftover_tmp(dir.path()), Vec::<String>::new());
-        assert_eq!(db::migrate(&mut conn).unwrap().from, 3);
+        assert_eq!(db::migrate(&mut conn).unwrap().from, 4);
     }
     eprintln!(
         "concurrent migrators: {ROUNDS} rounds x {THREADS} threads: {wins} migrated, \
@@ -1253,8 +1277,8 @@ fn a_migration_that_breaks_a_foreign_key_is_rolled_back() {
     insert_search(&conn, "tu1", "alpha");
     let mut next = MIGRATIONS.to_vec();
     next.push((
-        4,
-        "0004_test",
+        5,
+        "0005_test",
         "CREATE TABLE extra (x INTEGER);\n\
          INSERT INTO result (event_id, rank, url, url_norm) VALUES (999, 1, 'u', 'u');",
     ));
@@ -1263,7 +1287,7 @@ fn a_migration_that_breaks_a_foreign_key_is_rolled_back() {
         err.contains("1 row(s) violate a foreign key (result rowid 1 -> event)"),
         "{err}"
     );
-    assert_eq!(db::schema_version(&conn).unwrap(), 3);
+    assert_eq!(db::schema_version(&conn).unwrap(), 4);
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM result"), 0);
     assert_eq!(
         count(
@@ -1275,11 +1299,11 @@ fn a_migration_that_breaks_a_foreign_key_is_rolled_back() {
     assert_eq!(count(&conn, "PRAGMA foreign_keys"), 1);
 
     // A migration that fails outright also leaves foreign keys on.
-    next[3] = (4, "0004_test", "CREATE TABLE (;");
+    next[4] = (5, "0005_test", "CREATE TABLE (;");
     let err = format!("{:#}", db::migrate_with(&mut conn, &next).unwrap_err());
-    assert!(err.contains("migration 0004_test failed"), "{err}");
+    assert!(err.contains("migration 0005_test failed"), "{err}");
     assert_eq!(count(&conn, "PRAGMA foreign_keys"), 1);
-    assert_eq!(db::schema_version(&conn).unwrap(), 3);
+    assert_eq!(db::schema_version(&conn).unwrap(), 4);
 }
 
 /// Library-level version of the `hooks_e2e` upgrade window (plan-v2 §5.4, F6) for a
@@ -1322,14 +1346,14 @@ fn capture_spools_at_version_2_and_the_spool_is_stored_after_migrating() {
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM event"), 0);
         assert_eq!(
             db::check_version(&conn).unwrap(),
-            VersionCheck::Older { db: 2, bin: 3 }
+            VersionCheck::Older { db: 2, bin: 4 }
         );
     }
 
     // What `awm doctor` does: migrate, then drain.
     let mut conn = db::open(&db_in(dir.path()), Role::Cli).unwrap();
     let out = db::migrate(&mut conn).unwrap();
-    assert_eq!((out.from, out.to), (2, 3));
+    assert_eq!((out.from, out.to), (2, 4));
     assert!(dir.path().join("awm.db.bak-v2").is_file());
     assert_eq!(capture::drain_spool(&opts).unwrap(), 2);
     assert_eq!(spool_files(), 0);
@@ -1345,12 +1369,142 @@ fn capture_spools_at_version_2_and_the_spool_is_stored_after_migrating() {
         count(&conn, "SELECT COUNT(*) FROM event WHERE agent = 'codex'"),
         1
     );
-    // The same call again is a duplicate; capture keeps working at v3 with the defaults.
+    // The same call again is a duplicate; capture keeps working at v4 with the defaults.
     assert_eq!(
         capture::run(&fetch, &opts).unwrap(),
         CaptureOutcome::Skipped("duplicate")
     );
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM event"), 2);
+}
+
+// ---- 0004_cwd (STATS1) ----
+
+#[test]
+fn fresh_schema_has_the_cwd_table_and_the_injection_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh(dir.path());
+    assert_eq!(
+        table_info(&conn, "cwd"),
+        vec![
+            col("cwd_hash", "TEXT", false, None),
+            col("path", "TEXT", true, None),
+            col("repo_root", "TEXT", false, None),
+            col("updated_at", "INTEGER", true, None),
+        ]
+    );
+    let pk: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('cwd') WHERE pk > 0")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(pk, ["cwd_hash"]);
+    let injection = table_info(&conn, "injection");
+    assert_eq!(
+        injection.last().unwrap(),
+        &col("cwd_hash", "TEXT", false, None)
+    );
+    let index: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_index_info('injection_cwd') ORDER BY seqno")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(index, ["cwd_hash"]);
+    // Local only: no foreign key ties it to anything synced.
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM pragma_foreign_key_list('cwd')"),
+        0
+    );
+    // The primary key refuses a second row for one hash; path is required.
+    conn.execute_batch("INSERT INTO cwd VALUES ('h', '/p', NULL, 1)")
+        .unwrap();
+    let err = conn
+        .execute_batch("INSERT INTO cwd VALUES ('h', '/q', NULL, 2)")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("UNIQUE constraint failed"), "{err}");
+    let err = conn
+        .execute_batch("INSERT INTO cwd (cwd_hash, updated_at) VALUES ('i', 1)")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("NOT NULL constraint failed"), "{err}");
+}
+
+/// A database at schema version 3 (the team release).
+fn v3(dir: &Path) -> Connection {
+    let mut conn = db::open(&db_in(dir), Role::Cli).unwrap();
+    db::migrate_with(&mut conn, &MIGRATIONS[..3]).unwrap();
+    conn
+}
+
+#[test]
+fn v3_database_with_data_migrates_to_v4_and_keeps_every_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut conn = v3(dir.path());
+    seed(&conn, 40);
+    conn.execute_batch(
+        "INSERT INTO project (cwd_hash, repo_key, updated_at) VALUES ('h', 'r', 1);
+         INSERT INTO share_rule VALUES ('cwd', 'h', 1);
+         UPDATE event SET origin = 'team', member = 'm', sync_id = 'u1' WHERE id = 2;",
+    )
+    .unwrap();
+    let before = snapshot(&conn);
+    let team_cols = columns(&conn, "event");
+    let team_before = dump(&conn, "event", "id", &team_cols);
+    let project_before = dump(&conn, "project", "cwd_hash", &columns(&conn, "project"));
+    assert_eq!(
+        db::check_version(&conn).unwrap(),
+        VersionCheck::Older { db: 3, bin: 4 }
+    );
+
+    let out = db::migrate(&mut conn).unwrap();
+    let bak = dir.path().join("awm.db.bak-v3");
+    assert_eq!((out.from, out.to), (3, 4));
+    assert_eq!(
+        out.backup.as_deref().map(|p| p.canonicalize().unwrap()),
+        Some(bak.canonicalize().unwrap())
+    );
+    assert_eq!(db::check_version(&conn).unwrap(), VersionCheck::Current);
+
+    assert_keeps(&conn, &before);
+    assert_eq!(dump(&conn, "event", "id", &team_cols), team_before);
+    assert_eq!(
+        dump(&conn, "project", "cwd_hash", &columns(&conn, "project")),
+        project_before
+    );
+    // Old injections have no caller cwd; nothing is invented for them.
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM injection WHERE cwd_hash IS NULL"
+        ),
+        10
+    );
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM cwd"), 0);
+    pragma_ok(&conn, "quick_check");
+    pragma_ok(&conn, "integrity_check");
+    assert_no_fk_violation(&conn);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM event_fts"), 40);
+
+    let old = Connection::open(&bak).unwrap();
+    assert_eq!(db::schema_version(&old).unwrap(), 3);
+    assert_keeps(&old, &before);
+    assert!(!columns(&old, "injection").contains(&"cwd_hash".to_string()));
+    drop(old);
+    #[cfg(unix)]
+    assert_eq!(mode(&bak), 0o600);
+
+    assert_eq!(
+        db::migrate(&mut conn).unwrap(),
+        MigrateOutcome {
+            from: 4,
+            to: 4,
+            backup: None
+        }
+    );
 }
 
 #[cfg(unix)]

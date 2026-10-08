@@ -60,7 +60,7 @@ pub fn parse_expires(s: &str) -> anyhow::Result<u32> {
 // Git remotes (plan-v3-team §4.4: read from `.git/config` without running git)
 
 /// The git directory, common directory and work tree root that hold `dir`, if any.
-fn git_dirs(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+pub(crate) fn git_dirs(dir: &Path) -> Option<(PathBuf, PathBuf)> {
     let mut cur = Some(dir);
     while let Some(d) = cur {
         let dot = d.join(".git");

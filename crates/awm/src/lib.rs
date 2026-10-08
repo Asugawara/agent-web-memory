@@ -5,6 +5,7 @@ pub mod bench;
 pub mod capture;
 pub mod cli;
 pub mod config;
+pub mod cwd;
 pub mod db;
 pub mod deadline;
 pub mod forget;

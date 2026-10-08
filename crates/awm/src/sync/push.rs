@@ -265,6 +265,8 @@ pub fn load_record(conn: &Connection, id: i64) -> Result<Option<(Record, Option<
                 agent_id: r.get("agent_id")?,
                 agent_type: r.get("agent_type")?,
                 cwd_hash: r.get("cwd_hash")?,
+                // The plain cwd stays in the local `cwd` table; the payload never needs it.
+                cwd: String::new(),
                 created_at: r.get("created_at")?,
                 query: r.get("query")?,
                 url: r.get("url")?,

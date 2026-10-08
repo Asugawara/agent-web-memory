@@ -18,6 +18,7 @@ use url::Url;
 use walkdir::WalkDir;
 
 use crate::config::{self, Config};
+use crate::cwd;
 use crate::db::{self, Role};
 use crate::gate::MACHINE_PREFIXES;
 use crate::hosts;
@@ -761,6 +762,13 @@ impl Run<'_> {
             return Ok(0);
         }
         let config = &self.opts.config;
+        // Before the write lock, once per directory: finding a repository root costs `stat`s.
+        let mut cwds: HashMap<String, cwd::Resolved> = HashMap::new();
+        for rec in batch.iter() {
+            if !cwds.contains_key(&rec.cwd) {
+                cwds.insert(rec.cwd.clone(), cwd::resolve(&self.conn, &rec.cwd)?);
+            }
+        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -785,6 +793,9 @@ impl Run<'_> {
             if !insert(&tx, &rec, source_id)? {
                 self.summary.skipped_duplicate += 1;
                 continue;
+            }
+            if let Some(c) = cwds.get(&rec.cwd) {
+                cwd::store(&tx, c, self.opts.now_ms)?;
             }
             inserted += 1;
             self.summary.records_inserted += 1;

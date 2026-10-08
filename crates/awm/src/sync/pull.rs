@@ -283,6 +283,7 @@ fn check_rec(
         agent_id: None,
         agent_type: None,
         cwd_hash: String::new(),
+        cwd: String::new(),
         created_at: created_secs.saturating_mul(1_000),
         query,
         url,

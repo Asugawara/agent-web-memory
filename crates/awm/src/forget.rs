@@ -1110,6 +1110,7 @@ fn rewrite_event(conn: &Connection, id: i64, u: &UrlTarget) -> anyhow::Result<()
         agent_id: None,
         agent_type: None,
         cwd_hash: String::new(),
+        cwd: String::new(),
         created_at: 0,
         query: query.clone(),
         url,

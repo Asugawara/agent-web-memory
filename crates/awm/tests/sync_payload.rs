@@ -31,6 +31,7 @@ fn fetch() -> Record {
         agent_id: Some("AGENT-ID-NEVER-SHARED".into()),
         agent_type: Some("AGENT-TYPE-NEVER-SHARED".into()),
         cwd_hash: "CWDHASH-NEVER-SHARED".into(),
+        cwd: "/Users/CWD-NEVER-SHARED/repo".into(),
         created_at: CREATED_MS,
         query: None,
         url: Some("https://sqlite.org/fts5.html".into()),
@@ -98,6 +99,7 @@ fn never_shared_fields_are_absent_from_the_json() {
         "AGENT-ID-NEVER-SHARED",
         "AGENT-TYPE-NEVER-SHARED",
         "CWDHASH-NEVER-SHARED",
+        "CWD-NEVER-SHARED",
         "NORM-NEVER-SHARED",
         "MATCH-TEXT-NEVER-SHARED",
         "NORM-https",
@@ -105,7 +107,8 @@ fn never_shared_fields_are_absent_from_the_json() {
         assert!(!body.contains(secret), "{secret} leaked: {body}");
     }
     // The key set is exactly the §15.1 list: no tool_use_id, session_id, agent_id, agent_type,
-    // cwd, cwd_hash, url_norm, match_text, quarantine_reason, prompt or tool response.
+    // cwd, cwd_hash, path, repo_root, url_norm, match_text, quarantine_reason, prompt or tool
+    // response.
     let v = json(&p);
     let allowed = [
         "schema",
@@ -127,6 +130,14 @@ fn never_shared_fields_are_absent_from_the_json() {
     ];
     for key in v.as_object().unwrap().keys() {
         assert!(allowed.contains(&key.as_str()), "unexpected key {key}");
+    }
+    // STATS1: the plain cwd and its repository root (the local `cwd` table) are never sent.
+    for name in ["cwd", "cwd_hash", "path", "repo_root"] {
+        assert!(v.get(name).is_none(), "{name} in the payload: {body}");
+        assert!(
+            !body.contains(&format!("\"{name}\"")),
+            "{name} in the payload: {body}"
+        );
     }
     for r in v["results"].as_array().unwrap() {
         let keys: Vec<&String> = r.as_object().unwrap().keys().collect();
