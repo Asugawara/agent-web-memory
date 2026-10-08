@@ -461,3 +461,41 @@ fn backfill_places_a_vanished_worktree_with_the_one_repository_of_that_name() {
     awm::cwd::backfill(&conn, &projects, None, 6).unwrap();
     assert_eq!(root_of(&h_gone), None);
 }
+
+/// The first run of the backfill on a database with no `cwd` rows: the repository and the
+/// vanished worktree both arrive through the transcripts in the same run, and the worktree is
+/// still placed with the repository (it does not need a second run).
+#[test]
+fn backfill_places_a_vanished_worktree_on_the_first_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = db(dir.path());
+    let main = checkout(&dir.path().join("dev/proj"));
+    let main_s = main.to_string_lossy().into_owned();
+    let main_name = main.file_name().unwrap().to_string_lossy().into_owned();
+    let gone = format!("/nonexistent-awm-stats2-first/.herdr/worktrees/{main_name}/t1");
+    let projects = dir.path().join("projects/p");
+    std::fs::create_dir_all(&projects).unwrap();
+    std::fs::write(
+        projects.join("a.jsonl"),
+        format!(
+            "{{\"type\":\"user\",\"cwd\":{main_s:?},\"timestamp\":\"2026-10-04T00:00:00Z\"}}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        projects.join("b.jsonl"),
+        format!("{{\"type\":\"user\",\"cwd\":{gone:?},\"timestamp\":\"2026-10-04T00:00:00Z\"}}\n"),
+    )
+    .unwrap();
+    event(&conn, 1, "s1", &sha256_hex(&main_s), 1);
+    event(&conn, 2, "s2", &sha256_hex(&gone), 2);
+    assert_eq!(rows(&conn), 0);
+
+    let b = awm::cwd::backfill(&conn, &projects, None, 5).unwrap();
+    assert_eq!(b.events_resolved, 2, "{b:?}");
+    assert_eq!(
+        row(&conn, &sha256_hex(&main_s)).unwrap().1,
+        Some(main_s.clone())
+    );
+    assert_eq!(row(&conn, &sha256_hex(&gone)).unwrap().1, Some(main_s));
+}

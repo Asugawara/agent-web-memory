@@ -353,11 +353,19 @@ pub fn backfill(
         gave_up = missing.iter().cloned().collect();
     }
 
-    // 3. Rows whose root was not found when the directory was first seen.
-    let rootless: Vec<(String, String)> = conn
+    // 3. Rows whose root was not found when the directory was first seen, and the paths this run
+    //    resolved without a root (not in the table yet, so the first run places them as well).
+    let mut rootless: Vec<(String, String)> = conn
         .prepare("SELECT cwd_hash, path FROM cwd WHERE repo_root IS NULL")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
+    let in_table: HashSet<String> = rootless.iter().map(|(h, _)| h.clone()).collect();
+    rootless.extend(
+        resolved
+            .values()
+            .filter(|r| r.root.is_none() && !r.path.is_empty() && !in_table.contains(&r.hash))
+            .map(|r| (r.hash.clone(), r.path.clone())),
+    );
     let mut roots: Vec<(String, String)> = Vec::new();
     let mut orphans: Vec<(String, String)> = Vec::new();
     for (h, p) in rootless {
@@ -374,6 +382,7 @@ pub fn backfill(
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         known.extend(roots.iter().map(|(_, r)| r.clone()));
+        known.extend(resolved.values().filter_map(|r| r.root.clone()));
         for (h, p) in orphans {
             let path = Path::new(&p);
             if path.exists() {
