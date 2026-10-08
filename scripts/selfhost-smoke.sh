@@ -654,7 +654,6 @@ sync_all() {
     fi
   done
   printf '%s sync: pushed %s, pulled %s (%s runs)\n' "$who" "$tp" "$tl" "$i" >&2
-  SYNC_PUSHED=$tp
   SYNC_PULLED=$tl
 }
 
@@ -690,7 +689,6 @@ wait_a_flushed() {
   die "A's outbox still holds $n rows after 10 s"
 }
 
-SYNC_PUSHED=0
 SYNC_PULLED=0
 step_push() {
   wait_a_flushed
