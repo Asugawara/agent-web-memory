@@ -4,7 +4,7 @@ use std::time::Duration;
 use awm::capture::{self, CaptureOpts, CaptureOutcome};
 use awm::config::{Config, Mode};
 use awm::db::{self, Role};
-use awm::record::{Agent, Record};
+use awm::record::{sha256_hex, Agent, Record};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
@@ -697,4 +697,95 @@ fn capture_spools_while_the_database_is_at_an_older_schema() {
         std::fs::read_dir(dir.path().join("spool")).unwrap().count(),
         1
     );
+}
+
+// ---- STATS1: the plain cwd (migration 0004) ----
+
+fn cwd_rows(c: &Connection) -> Vec<(String, String, Option<String>)> {
+    c.prepare("SELECT cwd_hash, path, repo_root FROM cwd ORDER BY path")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+#[test]
+fn a_capture_remembers_its_cwd_under_the_event_hash_once() {
+    let (_d, opts) = setup();
+    let fx = fixture("PostToolUse-WebFetch-plugin-3.json");
+    assert_eq!(capture::run(&fx, &opts).unwrap(), CaptureOutcome::Captured);
+    let cwd = fx["cwd"].as_str().unwrap().to_string();
+    let c = conn(&opts);
+    let hash: String = c
+        .query_row("SELECT cwd_hash FROM event", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(hash, sha256_hex(&cwd));
+    // The fixture's directory does not exist here: no repository root.
+    assert_eq!(cwd_rows(&c), vec![(hash.clone(), cwd.clone(), None)]);
+    let updated: i64 = c
+        .query_row("SELECT updated_at FROM cwd", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(updated, NOW);
+
+    // A second capture from the same cwd leaves one row.
+    let mut again = fetch_payload("tu-again", "https://example.com/a", 200, "text");
+    again["cwd"] = json!(cwd);
+    assert_eq!(
+        capture::run(&again, &opts).unwrap(),
+        CaptureOutcome::Captured
+    );
+    assert_eq!(count(&c, "SELECT COUNT(*) FROM event"), 2);
+    assert_eq!(cwd_rows(&c), vec![(hash, cwd, None)]);
+}
+
+#[test]
+fn a_capture_from_a_worktree_stores_its_main_checkout() {
+    let (d, opts) = setup();
+    let main = d.path().join("main");
+    std::fs::create_dir_all(main.join(".git/worktrees/wt")).unwrap();
+    std::fs::write(main.join(".git/worktrees/wt/commondir"), "../..\n").unwrap();
+    let wt = d.path().join("wt");
+    std::fs::create_dir_all(wt.join("sub")).unwrap();
+    std::fs::write(
+        wt.join(".git"),
+        format!("gitdir: {}\n", main.join(".git/worktrees/wt").display()),
+    )
+    .unwrap();
+    let cwd = wt.join("sub").to_string_lossy().into_owned();
+    let mut p = fetch_payload("tu-wt", "https://example.com/wt", 200, "text");
+    p["cwd"] = json!(cwd);
+    assert_eq!(capture::run(&p, &opts).unwrap(), CaptureOutcome::Captured);
+    assert_eq!(
+        cwd_rows(&conn(&opts)),
+        vec![(
+            sha256_hex(&cwd),
+            cwd,
+            Some(main.to_string_lossy().into_owned())
+        )]
+    );
+}
+
+#[test]
+fn a_spooled_record_keeps_its_cwd_and_an_old_spool_file_has_none() {
+    let (_d, opts) = setup();
+    let fx = fixture("PostToolUse-WebSearch-plugin-2.json");
+    let rec = Record::from_hook(&fx, NOW, &[]).unwrap().unwrap();
+    assert_eq!(rec.cwd, fx["cwd"].as_str().unwrap());
+    write_spool(&opts, &format!("{NOW}-new.json"), &rec, |_| {});
+    // A spool file written before migration 0004 has no `cwd` key.
+    let mut old = Record::from_hook(&fixture("PostToolUse-WebFetch-plugin-3.json"), NOW, &[])
+        .unwrap()
+        .unwrap();
+    old.cwd = "/should/not/appear".to_string();
+    write_spool(&opts, &format!("{}-old.json", NOW + 1), &old, |v| {
+        v.as_object_mut().unwrap().remove("cwd");
+    });
+    assert_eq!(capture::drain_spool(&opts).unwrap(), 2);
+    let c = conn(&opts);
+    assert_eq!(count(&c, "SELECT COUNT(*) FROM event"), 2);
+    let rows = cwd_rows(&c);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, rec.cwd_hash);
+    assert_eq!(rows[0].1, rec.cwd);
 }

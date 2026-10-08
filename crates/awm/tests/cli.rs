@@ -692,7 +692,7 @@ fn doctor_upgrades_a_v1_database_and_other_commands_wait_for_it() {
     assert!(
         doctor
             .stdout
-            .contains("database upgraded from schema version 1 to 3 (backup: ")
+            .contains("database upgraded from schema version 1 to 4 (backup: ")
             && doctor.stdout.contains("/awm.db.bak-v1)"),
         "{}",
         doctor.stdout
@@ -701,7 +701,7 @@ fn doctor_upgrades_a_v1_database_and_other_commands_wait_for_it() {
     assert!(
         again
             .stdout
-            .contains("database schema version 3 is current"),
+            .contains("database schema version 4 is current"),
         "{}",
         again.stdout
     );

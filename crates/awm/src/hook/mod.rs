@@ -22,6 +22,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 
 use crate::config::{self, Config, Mode, Notify};
+use crate::cwd;
 use crate::db::{self, Role, VersionCheck};
 use crate::deadline::Watchdog;
 use crate::matching::{self, Hit, MatchOpts};
@@ -581,15 +582,24 @@ where
     Ok((conn, verdict))
 }
 
-/// Writes the injection (with items) and the `hook_run` row in one transaction.
+/// Writes the injection (with items, and the caller's `cwd` row) and the `hook_run` row in one
+/// transaction.
 fn write_rows(conn: &mut Connection, env: &Env, meta: &RunMeta, verdict: &Verdict) -> Result<()> {
     let total_ms = millis(env.started.elapsed());
+    // Before the write lock, and only for a cwd never seen: finding the repository root may stat
+    // slow (automounted) paths.
+    let caller_cwd = match &verdict.injection {
+        Some(_) => Some(cwd::resolve_once(conn, &env.input.cwd)?),
+        None => None,
+    };
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if let Some(inj) = &verdict.injection {
+    if let (Some(inj), Some(caller_cwd)) = (&verdict.injection, &caller_cwd) {
+        cwd::store(&tx, caller_cwd, env.started_at_ms)?;
         tx.execute(
             "INSERT INTO injection (ref, created_at, hook, channel, mode, session_id, agent_id, \
              tool_use_id, transcript_path, trigger_text, cutoff, rendered, rendered_chars, \
-             latency_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             latency_ms, cwd_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 inj.ref_id,
                 env.started_at_ms,
@@ -604,7 +614,8 @@ fn write_rows(conn: &mut Connection, env: &Env, meta: &RunMeta, verdict: &Verdic
                 inj.cutoff,
                 inj.rendered,
                 i64::try_from(inj.rendered_chars).unwrap_or(i64::MAX),
-                total_ms
+                total_ms,
+                caller_cwd.hash
             ],
         )?;
         let id = tx.last_insert_rowid();

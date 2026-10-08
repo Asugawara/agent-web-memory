@@ -31,6 +31,7 @@ fn fetch(url: &str, summary: &str) -> Record {
         agent_id: None,
         agent_type: None,
         cwd_hash: CWD.into(),
+        cwd: String::new(),
         created_at: CREATED_MS,
         query: None,
         url: Some(url.into()),

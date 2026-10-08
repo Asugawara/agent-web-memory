@@ -1706,7 +1706,7 @@ fn the_upgrade_window_keeps_captures_until_doctor_migrates() {
     assert!(
         doctor
             .stdout
-            .contains("database upgraded from schema version 1 to 3"),
+            .contains("database upgraded from schema version 1 to 4"),
         "{}",
         doctor.stdout
     );
@@ -2725,4 +2725,57 @@ fn a_sibling_subagent_does_not_get_the_own_deny_of_the_main_agent() {
         "{reason}"
     );
     assert!(!reason.contains("your own WebFetch"), "{reason}");
+}
+
+// ---- STATS1: the caller's cwd on the injection row (migration 0004) ----
+
+#[test]
+fn an_injection_carries_the_callers_cwd_hash_and_its_cwd_row() {
+    let home = Home::new();
+    seed_example_fetch(&home);
+    // The caller works in a checkout under the test home.
+    let repo = home.path().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::create_dir_all(repo.join("sub")).unwrap();
+    let cwd = repo.join("sub").to_string_lossy().into_owned();
+    let hash = awm::record::sha256_hex(&cwd);
+
+    let out = home.hook("post-tool", &patch(new_fetch(), &[("cwd", json!(cwd))]));
+    assert!(out.context().starts_with("<awm-notes"), "{}", out.context());
+    assert_eq!(home.text("SELECT cwd_hash FROM injection"), hash);
+    let (path, root): (String, Option<String>) = home
+        .conn()
+        .query_row(
+            "SELECT path, repo_root FROM cwd WHERE cwd_hash = ?1",
+            [&hash],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(path, cwd);
+    assert_eq!(root.as_deref(), Some(repo.to_string_lossy().as_ref()));
+
+    // A deny from the same cwd records the same hash and leaves one cwd row for it.
+    home.seed(
+        &sibling_fetch(Some(("agent-a", "researcher")), "toolu_a"),
+        60_000,
+    );
+    let first = home.hook(
+        "pre-fetch",
+        &patch(pre_fetch(None, "toolu_main_1"), &[("cwd", json!(cwd))]),
+    );
+    deny_parts(&first);
+    assert_eq!(
+        home.text("SELECT cwd_hash FROM injection WHERE mode = 'deny'"),
+        hash
+    );
+    assert_eq!(
+        home.count(&format!(
+            "SELECT COUNT(*) FROM cwd WHERE cwd_hash = '{hash}'"
+        )),
+        1
+    );
+    assert_eq!(
+        home.count("SELECT COUNT(*) FROM injection WHERE cwd_hash IS NULL"),
+        0
+    );
 }

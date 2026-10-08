@@ -920,3 +920,48 @@ fn s4_shows_the_codex_line_only_when_the_directory_exists() {
     assert!(!s4(Some(env.data.join("missing")), false).contains("Codex"));
     assert!(!s4(Some(codex), true).contains("Codex"));
 }
+
+// ---- STATS1: imported events get `cwd` rows (migration 0004) ----
+
+#[test]
+fn imported_events_get_cwd_rows_for_both_agents() {
+    let env = Env::new();
+    let codex = env.with_codex();
+    import::import_all(&env.codex_opts(&codex)).unwrap();
+    let c = env.conn();
+    let rows: Vec<(String, String, Option<String>)> = c
+        .prepare("SELECT cwd_hash, path, repo_root FROM cwd ORDER BY path")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let hash = awm::record::sha256_hex;
+    // The fixtures' directories do not exist here: no repository root.
+    assert_eq!(
+        rows,
+        vec![
+            (
+                hash("/home/user/work/demo"),
+                "/home/user/work/demo".into(),
+                None
+            ),
+            (hash("/work/demo"), "/work/demo".into(), None),
+        ]
+    );
+    // Every imported event's hash has its row.
+    assert_eq!(
+        env.count(
+            "SELECT COUNT(*) FROM event e WHERE NOT EXISTS \
+             (SELECT 1 FROM cwd c WHERE c.cwd_hash = e.cwd_hash)"
+        ),
+        0
+    );
+    let updated: i64 = c
+        .query_row("SELECT MIN(updated_at) FROM cwd", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(updated, NOW);
+    // A rerun adds nothing.
+    import::import_all(&env.codex_opts(&codex)).unwrap();
+    assert_eq!(env.count("SELECT COUNT(*) FROM cwd"), 2);
+}
