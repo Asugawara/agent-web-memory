@@ -47,7 +47,7 @@ pub struct Args {
     /// Daily totals of the members who share them (shown when at least 3 members reported)
     #[arg(long)]
     pub team: bool,
-    /// One row per repository or per directory (alone: records, notes shown and denied; with
+    /// One row per repository or per directory (alone: records, notes injected and denied; with
     /// --savings: the savings columns). Places old rows from the transcripts first, which writes
     /// to the database
     #[arg(
@@ -91,6 +91,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             "--origin needs --value\n",
         )
         .exit();
+    }
+    // Validate PATH before anything is written: the backfill may walk every transcript.
+    if let Some(p) = &args.repo {
+        repo_roots(p)?;
     }
     let conn = super::open_db()?;
     if args.by.is_some() || args.repo.is_some() || args.dir.is_some() {
@@ -136,7 +140,7 @@ fn backfill(conn: &Connection, args: &Args) -> anyhow::Result<()> {
     let b = crate::cwd::backfill(conn, &projects, codex.as_deref(), super::now_ms())?;
     if b.injections_unresolved > 0 || b.events_unresolved > 0 {
         eprintln!(
-            "awm stats: {} injections and {} records could not be placed (their transcripts are gone)",
+            "awm stats: {} injections and {} records could not be placed (no transcript or record names their directory)",
             b.injections_unresolved, b.events_unresolved
         );
     }
@@ -192,19 +196,8 @@ impl Scope {
     /// The scope of `--repo` / `--dir`, with its `scope` object; `None` without either flag.
     fn from_args(conn: &Connection, args: &Args) -> anyhow::Result<Option<(Scope, Value)>> {
         let (kind, shown, hashes) = if let Some(p) = &args.repo {
-            let abs = absolute(p);
-            let canon = std::fs::canonicalize(&abs).ok();
-            let mut roots: Vec<PathBuf> = Vec::new();
-            for form in [Some(abs.clone()), canon].into_iter().flatten() {
-                if let Some(r) = crate::cwd::repo_root(&form) {
-                    if !roots.contains(&r) {
-                        roots.push(r);
-                    }
-                }
-            }
-            let Some(first) = roots.first() else {
-                anyhow::bail!("{} is not inside a git repository; use --dir", p.display());
-            };
+            let roots = repo_roots(p)?;
+            let first = &roots[0];
             let shown = first.to_string_lossy().into_owned();
             let mut hashes = Vec::new();
             let mut st = conn.prepare("SELECT cwd_hash FROM cwd WHERE repo_root = ?1")?;
@@ -257,6 +250,25 @@ impl Scope {
             json!({"kind": kind, "path": shown, "directories": directories}),
         )))
     }
+}
+
+/// The repository roots of `--repo PATH` (the given and the canonical form; at least one), or an
+/// error when PATH is not inside a git repository. Touches no database, so `run` calls it first.
+fn repo_roots(p: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let abs = absolute(p);
+    let canon = std::fs::canonicalize(&abs).ok();
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for form in [Some(abs), canon].into_iter().flatten() {
+        if let Some(r) = crate::cwd::repo_root(&form) {
+            if !roots.contains(&r) {
+                roots.push(r);
+            }
+        }
+    }
+    if roots.is_empty() {
+        anyhow::bail!("{} is not inside a git repository; use --dir", p.display());
+    }
+    Ok(roots)
 }
 
 /// `p` as an absolute path without `.` components (relative ones start at the current directory).
@@ -347,7 +359,7 @@ pub fn collect(conn: &Connection, args: &Args) -> anyhow::Result<Value> {
 /// `--by`: one row per repository or directory, and a `total` row. Rows are the `cwd` rows
 /// grouped by `repo_root` (a directory outside git by its own path, `(no repository) PATH`) or by
 /// `path`; what no `cwd` row names is `(unknown)`. Without `savings` the fields are `records`,
-/// `shown` (inject mode), `denied` and `refetch_after_deny`, ordered by `shown`, `records`, then
+/// `notes` (inject mode), `denied` and `refetch_after_deny` (all limited by `since_ms`), ordered by `notes`, `records`, then
 /// name; with it the savings of the group's injections (a group without any is not listed),
 /// ordered by cost. The call-cost medians the savings use stay global.
 fn by_groups(
@@ -439,16 +451,18 @@ fn by_groups(
         }
         Ok(m)
     };
-    let records = per_hash(
-        "SELECT COALESCE(cwd_hash, ''), COUNT(*), 0 FROM event WHERE origin = 'local' GROUP BY 1",
-    )?;
-    let notes = per_hash(
+    let from = since_ms.unwrap_or(i64::MIN);
+    let records = per_hash(&format!(
+        "SELECT COALESCE(cwd_hash, ''), COUNT(*), 0 FROM event \
+         WHERE origin = 'local' AND created_at >= {from} GROUP BY 1"
+    ))?;
+    let notes = per_hash(&format!(
         "SELECT COALESCE(cwd_hash, ''), COALESCE(SUM(mode = 'inject'), 0), COALESCE(SUM(mode = 'deny'), 0) \
-         FROM injection WHERE mode IN ('inject','deny') GROUP BY 1",
-    )?;
+         FROM injection WHERE mode IN ('inject','deny') AND created_at >= {from} GROUP BY 1"
+    ))?;
     let refetched = per_hash(&format!(
         "SELECT COALESCE(i.cwd_hash, ''), COUNT(*), 0 FROM injection i \
-         WHERE i.mode = 'deny' AND i.channel = 'url' AND {} GROUP BY 1",
+         WHERE i.mode = 'deny' AND i.channel = 'url' AND i.created_at >= {from} AND {} GROUP BY 1",
         refetched_sql()
     ))?;
     let mut sums: Vec<(String, [i64; 4])> = Vec::new();
@@ -471,7 +485,7 @@ fn by_groups(
             .then(b.1[0].cmp(&a.1[0]))
             .then_with(|| a.0.cmp(&b.0))
     });
-    let row = |label: &str, f: [i64; 4]| json!({key: label, "records": f[0], "shown": f[1], "denied": f[2], "refetch_after_deny": f[3]});
+    let row = |label: &str, f: [i64; 4]| json!({key: label, "records": f[0], "notes": f[1], "denied": f[2], "refetch_after_deny": f[3]});
     let mut all = [0_i64; 4];
     let mut out: Vec<Value> = Vec::new();
     for (label, f) in &sums {
@@ -523,7 +537,7 @@ fn by_text(section: &str, rows: &Value) -> String {
             "cost",
         ]
     } else {
-        vec!["records", "shown", "denied", "refetched"]
+        vec!["records", "notes", "denied", "refetched"]
     };
     for r in &rows {
         let mut cells = if savings {
@@ -538,7 +552,7 @@ fn by_text(section: &str, rows: &Value) -> String {
         } else {
             vec![
                 int(r, "records"),
-                int(r, "shown"),
+                int(r, "notes"),
                 int(r, "denied"),
                 int(r, "refetch_after_deny"),
             ]

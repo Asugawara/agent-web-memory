@@ -2580,6 +2580,39 @@ fn seed_where(env: &Env) -> Where {
     insert(&conn, &e6);
     conn.execute("UPDATE event SET cwd_hash = ?1 WHERE id = 6", [&hb])
         .unwrap();
+    // Out of scope for `--repo`, one of each kind the scope clauses must keep out: a URL deny that
+    // was refetched (injection 4, event 7, fetched again as event 8) in `plain`, a label `2` on the
+    // inject of injection 3, and a PreToolUse query deny (injection 5) on the search of event 3.
+    let mut e7 = ev(7, "WebFetch", "s7", BASE + 6_000);
+    e7.url = Some("https://example.org/p");
+    insert(&conn, &e7);
+    injection(&conn, 4, "deny", "url", "s7", BASE + 13_000, &[(7, 1.0)]);
+    let mut e8 = ev(8, "WebFetch", "s7", BASE + 21_000);
+    e8.url = Some("https://example.org/p");
+    insert(&conn, &e8);
+    label(&conn, 3, 1, "2");
+    qd_injection(
+        &conn,
+        5,
+        "deny",
+        "query",
+        ("s3", None),
+        "inj5",
+        None,
+        BASE + 14_000,
+        "rust clap derive",
+        3,
+    );
+    conn.execute(
+        "UPDATE event SET cwd_hash = ?1, duration_ms = 4000, bytes = 8000 WHERE id IN (7, 8)",
+        [&hp],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE injection SET cwd_hash = ?1 WHERE id IN (4, 5)",
+        [&hp],
+    )
+    .unwrap();
     Where { repo, a, b, plain }
 }
 
@@ -2607,22 +2640,22 @@ fn stats_by_repo_groups_the_directories_of_a_checkout() {
     let plain = format!("(no repository) {}", w.plain.display());
     let want = [
         (repo.as_str(), 4, 1, 1, 1),
-        (plain.as_str(), 1, 1, 0, 0),
+        (plain.as_str(), 3, 1, 2, 1),
         ("(unknown)", 1, 0, 0, 0),
-        ("total", 6, 2, 1, 1),
+        ("total", 8, 2, 3, 2),
     ];
     assert_eq!(rows.len(), want.len(), "{v}");
-    for (row, (label, records, shown, denied, refetch)) in rows.iter().zip(want) {
+    for (row, (label, records, notes, denied, refetch)) in rows.iter().zip(want) {
         assert_eq!(row["repo"], label, "{v}");
         assert_eq!(row["records"], records, "{label}");
-        assert_eq!(row["shown"], shown, "{label}");
+        assert_eq!(row["notes"], notes, "{label}");
         assert_eq!(row["denied"], denied, "{label}");
         assert_eq!(row["refetch_after_deny"], refetch, "{label}");
     }
     // The record whose directory no transcript names is reported once, on stderr.
     assert!(
         out.stderr.contains(
-            "awm stats: 0 injections and 1 records could not be placed (their transcripts are gone)"
+            "awm stats: 0 injections and 1 records could not be placed (no transcript or record names their directory)"
         ),
         "{}",
         out.stderr
@@ -2643,12 +2676,14 @@ fn stats_by_dir_lists_every_directory_and_text_ends_with_the_label() {
         w.b.to_string_lossy().into_owned(),
         w.plain.to_string_lossy().into_owned(),
     );
-    // shown desc, then records desc, then name; the sibling directory has nothing and is not listed.
+    // notes desc, then records desc, then name; the sibling directory has nothing and is not listed.
     assert_eq!(
         labels,
-        [a.as_str(), plain.as_str(), b.as_str(), "(unknown)", "total"]
+        [plain.as_str(), a.as_str(), b.as_str(), "(unknown)", "total"]
     );
-    assert_eq!(rows[0]["records"], 2);
+    assert_eq!(rows[0]["records"], 3);
+    assert_eq!(rows[1]["records"], 2);
+    assert_eq!(rows[0]["notes"], 1);
     assert_eq!(rows[2]["denied"], 1);
     let text = env.awm(&["stats", "--by", "dir"]);
     let text = text.ok();
@@ -2694,7 +2729,7 @@ fn stats_by_repo_with_savings_has_one_row_per_group_and_a_total() {
         );
     }
     assert_eq!(rows[2]["repo"], "total");
-    assert_eq!(rows[2]["shown"], 3);
+    assert_eq!(rows[2]["shown"], 5);
     assert_eq!(rows[2]["currency"], "USD");
     assert!(rows[0]["cost"].as_f64().unwrap() >= rows[1]["cost"].as_f64().unwrap());
     let global = json_of(&env.awm(&["stats", "--savings", "--json"]));
@@ -2726,6 +2761,15 @@ fn stats_repo_scopes_every_section_to_the_checkout() {
     assert_eq!(v["injections"]["shown_by_channel"], json!({"url": 2}));
     assert_eq!(v["injections"]["refetch_after_deny"]["denies"], 1);
     assert_eq!(v["injections"]["refetch_after_deny"]["refetched"], 1);
+    // The out-of-scope deny (refetched), label and query deny in `plain` stay out.
+    assert_eq!(v["injections"]["deny_by_kind"]["cached"], 1);
+    assert_eq!(v["injections"]["accepted"], 0);
+    assert_eq!(v["query_deny"]["denied"], 0);
+    let all = json_of(&env.awm(&["stats", "--json"]));
+    assert_eq!(all["injections"]["deny_by_kind"]["cached"], 2);
+    assert_eq!(all["injections"]["refetch_after_deny"]["denies"], 2);
+    assert_eq!(all["injections"]["accepted"], 1);
+    assert_eq!(all["query_deny"]["denied"], 1);
     let text = env.awm(&["stats", "--repo", &repo]);
     assert_eq!(
         text.ok().lines().next().unwrap(),
@@ -2735,10 +2779,17 @@ fn stats_repo_scopes_every_section_to_the_checkout() {
     assert_eq!(status["status"]["ok"], 4);
     let value = json_of(&env.awm(&["stats", "--repo", &repo, "--value", "--json"]));
     assert_eq!(value["value"]["shown_items"], 2);
+    assert_eq!(value["value"]["labelled_2"], 0);
     let follow = json_of(&env.awm(&["stats", "--repo", &repo, "--followups", "--json"]));
     assert_eq!(follow["followups"]["shown"]["injections"], 2);
+    assert_eq!(follow["followups"]["shown"]["followed_in_session"], 1);
     let s = json_of(&env.awm(&["stats", "--repo", &repo, "--savings", "--json"]));
     assert_eq!(s["savings"]["shown"], 2);
+    assert_eq!(s["savings"]["ceiling"]["repeat_fetches"]["count"], 1);
+    let all = json_of(&env.awm(&["stats", "--value", "--followups", "--savings", "--json"]));
+    assert_eq!(all["value"]["labelled_2"], 1);
+    assert_eq!(all["followups"]["shown"]["followed_in_session"], 2);
+    assert_eq!(all["savings"]["ceiling"]["repeat_fetches"]["count"], 2);
     assert!(s["savings"]["quota"].is_object());
     // A repository nothing was recorded in is an empty scope, not an error.
     let other = env.dir.path().join("empty-repo");
@@ -2814,4 +2865,68 @@ fn stats_scope_and_breakdown_flags_conflict_and_a_repo_needs_git() {
         "{}",
         out.stderr
     );
+}
+
+#[test]
+fn stats_by_dir_since_counts_only_the_newer_records_and_notes() {
+    let env = Env::new();
+    let w = seed_where(&env);
+    let conn = env.conn();
+    let ha = awm::record::sha256_hex(&w.a.to_string_lossy());
+    let new = BASE + 86_400_000 * 40;
+    let mut e = ev(20, "WebFetch", "s20", new);
+    e.url = Some("https://example.org/new");
+    insert(&conn, &e);
+    injection(&conn, 20, "inject", "url", "s20", new + 1_000, &[(20, 1.0)]);
+    conn.execute("UPDATE event SET cwd_hash = ?1 WHERE id = 20", [&ha])
+        .unwrap();
+    conn.execute("UPDATE injection SET cwd_hash = ?1 WHERE id = 20", [&ha])
+        .unwrap();
+    let a = w.a.to_string_lossy().into_owned();
+    let row_of = |v: &Value| {
+        v["by_dir"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["dir"] == a.as_str())
+            .cloned()
+            .unwrap()
+    };
+    let all = row_of(&json_of(&env.awm(&["stats", "--by", "dir", "--json"])));
+    assert_eq!(
+        (all["records"].clone(), all["notes"].clone()),
+        (json!(3), json!(2))
+    );
+    let t = time::OffsetDateTime::from_unix_timestamp((BASE + 86_400_000 * 30) / 1000).unwrap();
+    let since = format!("{:04}-{:02}-{:02}", t.year(), u8::from(t.month()), t.day());
+    let v = json_of(&env.awm(&["stats", "--by", "dir", "--since", &since, "--json"]));
+    let new = row_of(&v);
+    assert_eq!(
+        (new["records"].clone(), new["notes"].clone()),
+        (json!(1), json!(1))
+    );
+    let total = v["by_dir"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(total["records"], 1);
+    assert_eq!(total["denied"], 0);
+}
+
+#[test]
+fn stats_repo_outside_git_fails_before_the_backfill_writes_anything() {
+    let env = Env::new();
+    let w = seed_where(&env);
+    let counts = || {
+        let conn = env.conn();
+        let n = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+        (
+            n("SELECT COUNT(*) FROM cwd"),
+            n("SELECT COUNT(*) FROM meta WHERE key LIKE 'cwd.walked.%'"),
+        )
+    };
+    let before = counts();
+    let out = env.awm(&["stats", "--repo", &w.plain.to_string_lossy()]);
+    assert_ne!(out.code, Some(0));
+    assert_eq!(counts(), before);
+    // The same database does write its memo when the command is valid (event 5 stays unplaced).
+    env.awm(&["stats", "--by", "repo"]).ok();
+    assert_ne!(counts(), before);
 }
