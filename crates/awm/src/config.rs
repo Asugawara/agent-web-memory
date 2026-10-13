@@ -68,6 +68,11 @@ const REMOVED_KEYS: &[(&str, &str)] = &[
         "inject.max_per_agent",
         "there is no per-agent cap; inject.max_notes still limits one injection",
     ),
+    ("quota.capture", "the usage-limit samples were removed"),
+    (
+        "quota.retention_days",
+        "the usage-limit samples were removed",
+    ),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,26 +124,6 @@ pub struct CaptureConfig {
 pub struct Review {
     #[serde(deserialize_with = "de_u32")]
     pub daily_limit: u32,
-}
-
-/// Usage-limit samples from `awm statusline` (`[quota]`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Quota {
-    /// `false` pauses sample capture (the status line stays installed).
-    pub capture: bool,
-    /// Days a sample is kept at least; whole months are deleted after that.
-    #[serde(deserialize_with = "de_u32")]
-    pub retention_days: u32,
-}
-
-impl Default for Quota {
-    fn default() -> Self {
-        Quota {
-            capture: true,
-            retention_days: 92,
-        }
-    }
 }
 
 /// Team sync settings (`[team]`, plan-v3-team §4.7). Parsing and `config list` only.
@@ -227,7 +212,6 @@ pub struct Config {
     pub capture: CaptureConfig,
     pub review: Review,
     pub pricing: Pricing,
-    pub quota: Quota,
     pub team: Team,
     /// Out-of-range values that [`load`] clamped; never written by [`Config::save`].
     #[serde(skip)]
@@ -287,7 +271,6 @@ impl Default for Config {
             capture: CaptureConfig::default(),
             review: Review::default(),
             pricing: Pricing::default(),
-            quota: Quota::default(),
             team: Team::default(),
             warnings: Vec::new(),
         }
@@ -324,7 +307,6 @@ fn range(key: &str) -> Option<(u32, u32)> {
         "inject.max_notes" => (1, 3),
         "hooks.deadline_ms" => (100, 2000),
         "review.daily_limit" => (1, 50),
-        "quota.retention_days" => (7, 3650),
         "team.sync_interval_s" => (0, 86400),
         "team.summary_chars" => (1, 2000),
         "team.push_delay_s" => (0, 86400),
@@ -373,11 +355,6 @@ impl Config {
         clamp("inject.max_notes", &mut self.inject.max_notes, &mut w);
         clamp("hooks.deadline_ms", &mut self.hooks.deadline_ms, &mut w);
         clamp("review.daily_limit", &mut self.review.daily_limit, &mut w);
-        clamp(
-            "quota.retention_days",
-            &mut self.quota.retention_days,
-            &mut w,
-        );
         clamp(
             "team.sync_interval_s",
             &mut self.team.sync_interval_s,
@@ -428,8 +405,6 @@ impl Config {
             }
             "pricing.search_fee_per_call" => self.pricing.search_fee_per_call.to_string(),
             "pricing.main_input_per_mtok" => self.pricing.main_input_per_mtok.to_string(),
-            "quota.capture" => self.quota.capture.to_string(),
-            "quota.retention_days" => self.quota.retention_days.to_string(),
             "team.auto_sync" => self.team.auto_sync.to_string(),
             "team.sync_interval_s" => self.team.sync_interval_s.to_string(),
             "team.show" => self.team.show.to_string(),
@@ -596,8 +571,6 @@ impl Config {
             }
             "pricing.search_fee_per_call" => self.pricing.search_fee_per_call = price(key, value)?,
             "pricing.main_input_per_mtok" => self.pricing.main_input_per_mtok = price(key, value)?,
-            "quota.capture" => self.quota.capture = flag(key, value)?,
-            "quota.retention_days" => self.quota.retention_days = number(key, value)?,
             "team.auto_sync" => self.team.auto_sync = flag(key, value)?,
             "team.sync_interval_s" => self.team.sync_interval_s = number(key, value)?,
             "team.show" => self.team.show = flag(key, value)?,

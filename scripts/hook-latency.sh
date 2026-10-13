@@ -44,7 +44,6 @@ cd "$root"
 
 runs="${RUNS:-200}"
 limit_ms="${P95_LIMIT_MS:-100}"
-statusline_limit_ms="${STATUSLINE_P95_LIMIT_MS:-20}"
 fixtures_dir="crates/awm/tests/fixtures/hooks"
 projects_dir="crates/awm/tests/fixtures/projects"
 
@@ -114,59 +113,6 @@ if failed:
     print(f"hook-latency: FAILED (p95 above {limit:.0f} ms)")
     sys.exit(1)
 print(f"hook-latency: ok (every p95 <= {limit:.0f} ms)")
-PY
-
-python3 - "$bin" "$runs" "$statusline_limit_ms" "$home" crates/awm/tests/fixtures/statusline/integer.json <<'PY' || status=1
-import json
-import os
-import subprocess
-import sys
-import time
-
-bin_path, runs, limit, home, fixture = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), sys.argv[4], sys.argv[5]
-
-quota = os.path.join(home, "quota")
-os.makedirs(quota, mode=0o700, exist_ok=True)
-month_file = os.path.join(quota, "samples-%s.ndjson" % time.strftime("%Y-%m", time.gmtime()))
-now_ms = int(time.time() * 1000)
-with open(month_file, "w") as f:
-    size, i = 0, 0
-    while size < 16 * 1024 * 1024:
-        line = json.dumps({"v": 1, "t": now_ms - 1000000 + i, "sid": "fill-%d" % (i % 50), "model": "claude-opus-5-5",
-                           "h5": {"p": i % 100, "r": 1790910000}, "d7": {"p": 41, "r": 1791300000},
-                           "cost": round(i * 0.0137, 4), "dur": 3600000}, separators=(",", ":")) + "\n"
-        f.write(line)
-        size += len(line)
-        i += 1
-
-with open(fixture) as f:
-    base = json.load(f)
-
-
-def pct(sorted_values, p):
-    return sorted_values[min(len(sorted_values) - 1, int(round(p * (len(sorted_values) - 1))))]
-
-
-def call(cost):
-    payload = json.loads(json.dumps(base))
-    payload["cost"]["total_cost_usd"] = cost
-    t = time.perf_counter()
-    subprocess.run([bin_path, "statusline", "--quiet"], input=json.dumps(payload).encode(),
-                   capture_output=True, env=os.environ, check=True)
-    return (time.perf_counter() - t) * 1000.0
-
-
-call(0.5)  # warm-up
-before = os.path.getsize(month_file)
-times = sorted(call(1.0 + i * 0.001) for i in range(runs))
-grew = os.path.getsize(month_file) > before
-p50, p95 = pct(times, 0.50), pct(times, 0.95)
-verdict = "ok" if p95 <= limit and grew else "TOO SLOW" if grew else "NOTHING WRITTEN"
-print(f"statusline integer.json: n={runs} month_file={before / 1048576:.1f} MB p50={p50:.1f} ms p95={p95:.1f} ms [{verdict}]")
-if p95 > limit or not grew:
-    print(f"hook-latency: FAILED (statusline p95 above {limit:.0f} ms)")
-    sys.exit(1)
-print(f"hook-latency: statusline ok (p95 <= {limit:.0f} ms)")
 PY
 
 if [ "$team" = "unroutable" ]; then

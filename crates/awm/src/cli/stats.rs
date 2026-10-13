@@ -75,8 +75,7 @@ pub struct Args {
         conflicts_with_all = ["repo", "latency", "import", "team", "by"]
     )]
     pub dir: Option<PathBuf>,
-    /// Transcript directory for the quota block and for placing old rows (default
-    /// ~/.claude/projects)
+    /// Transcript directory for placing old rows (default ~/.claude/projects)
     #[arg(long, value_name = "DIR")]
     pub projects: Option<PathBuf>,
     /// Print JSON
@@ -342,12 +341,7 @@ pub fn collect(conn: &Connection, args: &Args) -> anyhow::Result<Value> {
         out.insert("followups".into(), followups(conn, &sc)?);
     }
     if args.savings {
-        // An unresolvable home only leaves the quota block without transcripts.
-        let projects = super::projects_dir(&args.projects).unwrap_or_default();
-        out.insert(
-            "savings".into(),
-            savings(conn, args.since.as_deref(), &projects, &sc)?,
-        );
+        out.insert("savings".into(), savings(conn, args.since.as_deref(), &sc)?);
     }
     if args.team {
         let since = args.since.as_deref().map(super::parse_date).transpose()?;
@@ -1246,17 +1240,8 @@ fn followups(conn: &Connection, sc: &Scope) -> anyhow::Result<Value> {
     }))
 }
 
-/// id, created_at, session, agent, triggering tool_use_id, rendered_chars, mode, Codex.
-type ShownInjection = (
-    i64,
-    i64,
-    String,
-    Option<String>,
-    Option<String>,
-    i64,
-    String,
-    bool,
-);
+/// id, created_at, session, agent, triggering tool_use_id, rendered_chars.
+type ShownInjection = (i64, i64, String, Option<String>, Option<String>, i64);
 
 /// One web call with the fields the savings estimate needs.
 struct Call {
@@ -1441,10 +1426,6 @@ struct SavingsCore {
     total: Acc,
     /// `[from your records, from teammates' records]`.
     by_origin: [Acc; 2],
-    /// Quota block inputs: the cost of every avoided non-Codex item, and the proven part.
-    quota_estimated: f64,
-    quota_proven: f64,
-    codex: i64,
     local_calls: Vec<Call>,
 }
 
@@ -1482,8 +1463,7 @@ fn savings_core(
         .collect::<rusqlite::Result<_>>()?;
 
     let mut st = conn.prepare(&format!(
-        "SELECT id, created_at, session_id, agent_id, tool_use_id, rendered_chars, mode, \
-                COALESCE(transcript_path LIKE '%/.codex/%' OR tool_use_id LIKE 'exec-%', 0) \
+        "SELECT id, created_at, session_id, agent_id, tool_use_id, rendered_chars \
          FROM injection WHERE mode IN ('inject','deny') AND created_at >= ?1 AND created_at < ?2{} \
          ORDER BY created_at, id",
         sc.injections("")
@@ -1499,8 +1479,6 @@ fn savings_core(
                     r.get(3)?,
                     r.get(4)?,
                     r.get(5)?,
-                    r.get(6)?,
-                    r.get::<_, i64>(7)? != 0,
                 ))
             },
         )?
@@ -1532,8 +1510,7 @@ fn savings_core(
 
     let mut total = Acc::default();
     let mut by_origin = [Acc::default(), Acc::default()];
-    let (mut quota_estimated, mut quota_proven, mut codex) = (0.0_f64, 0.0_f64, 0_i64);
-    for (id, at, session, agent, tool_use_id, rendered, mode, is_codex) in &injections {
+    for (id, at, session, agent, tool_use_id, rendered) in &injections {
         total.shown += 1;
         total.overhead += *rendered as f64 / 4.0;
         let rows: Vec<(i64, Option<i64>, String)> = items
@@ -1617,19 +1594,7 @@ fn savings_core(
             total.followed += 1;
         } else {
             total.avoided += 1;
-            if *is_codex {
-                codex += 1;
-            }
-            let costs = costs_of(None);
-            total.add(&costs);
-            if !*is_codex {
-                for &(two, _, _, _, c) in &costs {
-                    quota_estimated += c;
-                    if two || mode == "deny" {
-                        quota_proven += c;
-                    }
-                }
-            }
+            total.add(&costs_of(None));
         }
         // The same injection once per origin it shows; the rendered overhead is shared by items.
         for (o, acc) in by_origin.iter_mut().enumerate() {
@@ -1650,9 +1615,6 @@ fn savings_core(
     Ok(SavingsCore {
         total,
         by_origin,
-        quota_estimated,
-        quota_proven,
-        codex,
         local_calls: all.into_iter().filter(|c| c.local).collect(),
     })
 }
@@ -1681,14 +1643,9 @@ pub(crate) fn day_totals(
     ))
 }
 
-/// Estimated savings (see [`savings_core`]), with the ceilings, the quota block and the split by
+/// Estimated savings (see [`savings_core`]), with the ceilings and the split by
 /// origin (`by_origin.local`, `by_origin.team`: the fields of the notes, no ceilings).
-fn savings(
-    conn: &Connection,
-    since: Option<&str>,
-    projects: &Path,
-    sc: &Scope,
-) -> anyhow::Result<Value> {
+fn savings(conn: &Connection, since: Option<&str>, sc: &Scope) -> anyhow::Result<Value> {
     let since_ms = since.map(super::parse_date).transpose()?;
     let pricing = crate::config::load(&crate::paths::config_path()?)?.pricing;
     let core = savings_core(conn, &pricing, since_ms, None, sc)?;
@@ -1726,14 +1683,6 @@ fn savings(
             "summariser_tokens": bytes / 4,
         })
     };
-    let quota = quota_section(
-        core.quota_estimated,
-        core.quota_proven,
-        core.codex,
-        &pricing,
-        projects,
-        super::now_ms(),
-    );
     let mut out = core.total.json(&pricing);
     out["since"] = json!(since);
     out["pricing"] = json!({
@@ -1751,7 +1700,6 @@ fn savings(
         "local": core.by_origin[0].json(&pricing),
         "team": core.by_origin[1].json(&pricing),
     });
-    out["quota"] = quota;
     Ok(out)
 }
 
@@ -2078,242 +2026,7 @@ fn savings_text(v: &Value) -> String {
         100,
     );
     o.push_str(&footnote);
-    o.push_str(&quota_text(&v["quota"]));
     o
-}
-
-/// The `savings.quota` block (plan-quota §8, §10.2): the calibration of the status line samples
-/// priced with the saved cost. `estimated` and `proven` are in USD, the cost column's unit; with
-/// another currency no sample is read and the status is `not_usd`.
-fn quota_section(
-    estimated: f64,
-    proven: f64,
-    codex: i64,
-    pricing: &crate::config::Pricing,
-    projects: &Path,
-    now_ms: i64,
-) -> Value {
-    use crate::quota::{calibrate, store, totals};
-    let usd = pricing.currency == "USD";
-    let samples = match (usd, crate::paths::data_dir()) {
-        (true, Ok(dir)) => store::read_all(&dir.join(crate::quota::DIR)),
-        _ => Vec::new(),
-    };
-    let sids: HashSet<String> = samples.iter().map(|s| s.sid.clone()).collect();
-    let sessions = totals::read(projects, &sids);
-    let cal = calibrate::calibrate(&samples, &sessions, now_ms);
-    let mut v = serde_json::to_value(&cal).unwrap_or(Value::Null);
-    if !usd {
-        v["status"] = json!("not_usd");
-    }
-    let pct = |band: &calibrate::Band, saved: f64| {
-        serde_json::to_value(band.scale(saved)).unwrap_or(Value::Null)
-    };
-    for (rate, out) in cal
-        .rates
-        .iter()
-        .zip(v["rates"].as_array_mut().into_iter().flatten())
-    {
-        out["five_hour_pct"] = json!({
-            "estimated": pct(&rate.k5, estimated),
-            "proven": pct(&rate.k5, proven),
-        });
-        out["seven_day_pct"] = match &rate.k7 {
-            Some(k7) => json!({"estimated": pct(k7, estimated), "proven": pct(k7, proven)}),
-            None => Value::Null,
-        };
-    }
-    v["saved_usd"] = json!({"estimated": estimated, "proven": proven});
-    v["codex_injections_excluded"] = json!(codex);
-    // One rate prices all of the savings; false when a valid window lies outside every
-    // rate's group (another account-week), or when several rates price them differently.
-    let covered = |rate: &calibrate::Rate| {
-        rate.d7_reset.is_none()
-            || cal
-                .windows
-                .list
-                .iter()
-                .filter(|w| w.verdict == calibrate::Verdict::Valid)
-                .all(|w| Some(w.d7_reset) == rate.d7_reset)
-    };
-    v["rates_cover_all_savings"] = json!(cal.rates.len() < 2 && cal.rates.iter().all(covered));
-    v
-}
-
-/// `text` wrapped at 100 columns with every line indented by four spaces.
-fn wrap_deep(text: &str) -> String {
-    wrap(text, 98).lines().map(|l| format!("  {l}\n")).collect()
-}
-
-/// `{x:.2}%` below 10, `{x:.1}%` from 10.
-fn pct(x: f64) -> String {
-    if x < 10.0 {
-        format!("{x:.2}%")
-    } else {
-        format!("{x:.1}%")
-    }
-}
-
-/// A whole number without decimals, else one decimal.
-fn points(x: f64) -> String {
-    if x.fract() == 0.0 {
-        format!("{x:.0}")
-    } else {
-        format!("{x:.1}")
-    }
-}
-
-/// The quota block of `awm stats --savings` (plan-quota §10.1), appended after the footnote.
-fn quota_text(v: &Value) -> String {
-    let n = |path: &[&str]| num(v, path);
-    let int = |path: &[&str]| n(path) as i64;
-    match v["status"].as_str().unwrap_or("no_samples") {
-        "not_usd" => {
-            return wrap(
-                "quota: shown only with [pricing] currency = \"USD\"; the status line reports cost in USD.",
-                100,
-            )
-        }
-        "no_samples" => {
-            return wrap(
-                "quota: no status line samples yet. To see these savings as a share of your 5-hour \
-                 and 7-day usage limits, run: awm setup --statusline",
-                100,
-            )
-        }
-        "collecting" => {
-            return wrap(
-                &format!(
-                    "quota: collecting status line samples ({} from {} sessions, the first on {}). \
-                     A figure needs 5 five-hour windows on 2 days with at least 10 points and $20 \
-                     of local use each, per 7-day reset; {} valid windows so far.",
-                    int(&["samples"]),
-                    int(&["sessions"]),
-                    super::fmt_day(int(&["first_sample_ms"])),
-                    int(&["windows", "valid"]),
-                ),
-                100,
-            )
-        }
-        _ => {}
-    }
-    let rates = v["rates"].as_array().cloned().unwrap_or_default();
-    let mut o = wrap(
-        &format!(
-            "quota: share of your Claude usage limits ({} status line samples from {} sessions)",
-            int(&["samples"]),
-            int(&["sessions"]),
-        ),
-        100,
-    );
-    for r in &rates {
-        let f = |path: &[&str]| num(r, path);
-        let label = match r["d7_reset"].as_i64() {
-            None => "all windows".to_string(),
-            Some(0) => "no 7-day reset".to_string(),
-            Some(d) => format!("7d reset {}", super::fmt_day(d * 1000)),
-        };
-        let k5 = f(&["k5", "w1"]);
-        o.push_str(&wrap(
-            &format!(
-                "{label}, {} windows on {} days: 1% of a 5h window = {} (windows {}-{})",
-                int_of(r, "windows"),
-                int_of(r, "days"),
-                money(1.0 / k5, "USD"),
-                money(1.0 / f(&["spread5", "p75"]), "USD"),
-                money(1.0 / f(&["spread5", "p25"]), "USD"),
-            ),
-            100,
-        ));
-        // `pending`: the estimated figure says so when σ is unknown; a proven one stays silent.
-        let line = |name: &str, pcts: &Value| {
-            let part = |kind: &str, pending: bool| {
-                let at = |w: &str| pcts[kind][w].as_f64();
-                let x = at("w1").unwrap_or(0.0);
-                let range = match (at("w10"), at("w0")) {
-                    _ if x <= 0.0 => String::new(),
-                    (Some(lo), Some(hi)) => format!(" ({}-{})", pct(lo), pct(hi)),
-                    _ if pending => " (range pending)".to_string(),
-                    _ => String::new(),
-                };
-                (pct(x), range)
-            };
-            let (est, est_range) = part("estimated", true);
-            let (proven, mut proven_range) = part("proven", false);
-            if n(&["saved_usd", "proven"]) <= 0.0 {
-                proven_range = " (no denied calls or labelled items yet)".to_string();
-            }
-            format!(
-                "{name}: estimated {est} of one window in total{est_range}, proven {proven}{proven_range}"
-            )
-        };
-        o.push_str(&wrap_deep(&line("5h", &r["five_hour_pct"])));
-        if r["seven_day_pct"].is_null() {
-            o.push_str(&wrap_deep(&format!(
-                "7d: collecting ({} of 10 points of 7-day use in these windows)",
-                points(f(&["dp7_sum"]))
-            )));
-        } else {
-            o.push_str(&wrap_deep(&line("7d", &r["seven_day_pct"])));
-        }
-    }
-    let mut notes = Vec::new();
-    if rates.len() >= 2 {
-        notes.push(
-            "savings are not split by account; each line prices all of them at its own rate."
-                .to_string(),
-        );
-    } else if v["rates_cover_all_savings"] == json!(false) {
-        notes.push("savings from all accounts are priced at this account-week's rate".to_string());
-    }
-    for r in &rates {
-        let weeks = int_of(r, "account_weeks");
-        if r["selection"] == "pooled" && weeks > 1 {
-            notes.push(format!(
-                "these windows come from {weeks} account-weeks, pooled; their plans may differ."
-            ));
-        }
-    }
-    let saturated = int(&["windows", "saturated"]);
-    if saturated > 0 {
-        notes.push(format!(
-            "{saturated} windows reached 100%; samples after that point are not used."
-        ));
-    }
-    if let Some(r) = rates.iter().find(|r| r["cache_read_share"].is_null()) {
-        notes.push(format!(
-            "the cache-read range needs the totals of 3 finished sessions in these windows; {} so far.",
-            int_of(r, "sessions_with_totals")
-        ));
-    }
-    let codex = int(&["codex_injections_excluded"]);
-    if codex > 0 {
-        notes.push(format!(
-            "{codex} Codex {} not counted (Codex has its own limits).",
-            if codex == 1 {
-                "injection is"
-            } else {
-                "injections are"
-            }
-        ));
-    }
-    for note in notes {
-        o.push_str(&wrap(&format!("note: {note}"), 100));
-    }
-    o.push_str(&wrap(
-        "estimated: an upper bound; it assumes every avoided note replaced a call, and the fetch \
-         summariser read <= bytes / 4 tokens. proven: denied calls and items you labelled 2. $: \
-         list-price use as Claude Code reports it to the status line. Ranges: the limit counting \
-         cached tokens at 10x to 0x their list price; models and other token kinds weighted like \
-         list prices. Use on claude.ai or other machines, which the samples cannot see, makes the \
-         figures too high.",
-        100,
-    ));
-    o
-}
-
-fn int_of(v: &Value, key: &str) -> i64 {
-    v[key].as_i64().unwrap_or(0)
 }
 
 /// `sync_state` key: the last UTC day (days since 1970-01-01) whose `stats` record was queued.
