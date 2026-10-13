@@ -68,11 +68,6 @@ const REMOVED_KEYS: &[(&str, &str)] = &[
         "inject.max_per_agent",
         "there is no per-agent cap; inject.max_notes still limits one injection",
     ),
-    ("quota.capture", "the usage-limit samples were removed"),
-    (
-        "quota.retention_days",
-        "the usage-limit samples were removed",
-    ),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
