@@ -1185,35 +1185,6 @@ fn tmp_file(e: &std::fs::DirEntry) -> bool {
             .is_some_and(crate::matching::calibrate::is_copy_name)
 }
 
-/// Legacy: `quota/` was written by the removed `awm statusline`; purge and uninstall still
-/// accept and delete it.
-const LEGACY_QUOTA_DIR: &str = "quota";
-
-/// Legacy: a usage sample in `quota/`, written by the removed `awm statusline`: a regular file
-/// named `samples-YYYY-MM.ndjson` (symlinks are not files here).
-fn quota_file(e: &std::fs::DirEntry) -> bool {
-    e.file_type().is_ok_and(|t| t.is_file())
-        && e.file_name().to_str().is_some_and(is_legacy_sample_name)
-}
-
-/// `samples-` + 4 digits + `-` + 01-12 + `.ndjson`, and nothing else.
-fn is_legacy_sample_name(name: &str) -> bool {
-    let Some(rest) = name
-        .strip_prefix("samples-")
-        .and_then(|r| r.strip_suffix(".ndjson"))
-    else {
-        return false;
-    };
-    let b = rest.as_bytes();
-    b.len() == 7
-        && b[..4].iter().all(u8::is_ascii_digit)
-        && b[4] == b'-'
-        && matches!(
-            &rest[5..],
-            "01" | "02" | "03" | "04" | "05" | "06" | "07" | "08" | "09" | "10" | "11" | "12"
-        )
-}
-
 fn print_deleted(out: &mut dyn Write, d: &Deleted, again: Option<&str>) -> anyhow::Result<()> {
     writeln!(
         out,
@@ -1381,7 +1352,7 @@ fn ours(name: &str) -> bool {
 }
 
 /// Whether `path` reads as an awm configuration: TOML whose top-level keys
-/// are all keys of [`Config`](crate::config::Config) (or the legacy `[quota]`). Values are not checked,
+/// are all keys of [`Config`](crate::config::Config). Values are not checked,
 /// so a mistyped value does not make the owner's own file foreign.
 fn awm_config(path: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -1393,16 +1364,12 @@ fn awm_config(path: &Path) -> bool {
     let Ok(known) = toml::Table::try_from(crate::config::Config::default()) else {
         return false;
     };
-    // Legacy: the `[quota]` table of the removed usage-limit samples is still ours.
-    table
-        .keys()
-        .all(|k| known.contains_key(k) || k == LEGACY_QUOTA_DIR)
+    table.keys().all(|k| known.contains_key(k))
 }
 
 /// Entries of the data dir that awm did not create, as paths relative to it.
 /// A symlink with an awm name is ours (only the link is deleted); `spool/`
-/// must be a symlink or a directory of regular `*.json` files, and `quota/` a
-/// symlink or a directory of regular sample files ([`quota_file`]).
+/// must be a symlink or a directory of regular `*.json` files.
 fn foreign_entries(dir: &Path) -> anyhow::Result<Vec<String>> {
     let mut foreign = Vec::new();
     for e in std::fs::read_dir(dir)
@@ -1415,10 +1382,7 @@ fn foreign_entries(dir: &Path) -> anyhow::Result<Vec<String>> {
             continue;
         };
         let ok = if kind.is_symlink() {
-            ours(&name)
-                || name == paths::CONFIG_FILE
-                || name == paths::SPOOL_DIR
-                || name == LEGACY_QUOTA_DIR
+            ours(&name) || name == paths::CONFIG_FILE || name == paths::SPOOL_DIR
         } else if let (true, Some(allowed)) = (kind.is_dir(), dir_filter(&name)) {
             for f in std::fs::read_dir(e.path())
                 .with_context(|| format!("cannot read {}", e.path().display()))?
@@ -1443,13 +1407,11 @@ fn foreign_entries(dir: &Path) -> anyhow::Result<Vec<String>> {
 }
 
 /// The files a real directory of the data dir may hold, by its name: `spool/`
-/// holds [`spool_file`]s, `quota/` holds [`quota_file`]s and `tmp/` holds
-/// [`tmp_file`]s. `None` for any other directory, which is foreign.
+/// holds [`spool_file`]s and `tmp/` holds [`tmp_file`]s. `None` for any other
+/// directory, which is foreign.
 fn dir_filter(name: &str) -> Option<fn(&std::fs::DirEntry) -> bool> {
     if name == paths::SPOOL_DIR {
         Some(spool_file)
-    } else if name == LEGACY_QUOTA_DIR {
-        Some(quota_file)
     } else if name == paths::TMP_DIR {
         Some(tmp_file)
     } else {
@@ -1641,8 +1603,7 @@ fn purge_all_with(
         }
     }
     // Only awm's entries are left: files and symlinks (removed as links, never
-    // followed), a real `spool/` holding only `*.json` files and a real
-    // `quota/` holding only sample files.
+    // followed) and a real `spool/` holding only `*.json` files.
     for e in std::fs::read_dir(&dir)
         .with_context(|| format!("cannot read {}", dir.display()))?
         .flatten()

@@ -48,4 +48,4 @@
 - **Local install script**: `bash scripts/install-local.sh` builds and installs the binary locally.
 
 ### Removed
-- **Usage-limit samples**: `awm statusline`, `awm setup --statusline` / `--remove-statusline`, the `[quota]` settings (`quota.capture`, `quota.retention_days`; a `config.toml` that still has them loads, and `awm config set` says they were removed), the quota block of `awm stats --savings` and the `quota samples` line of `awm doctor`. Claude Code no longer passes a 5-hour or 7-day limit to the status line. The `quota/` directory in the data directory is deleted by `awm purge --all`.
+- **Usage-limit samples**: `awm statusline`, `awm setup --statusline` / `--remove-statusline`, the `[quota]` settings (`quota.capture`, `quota.retention_days`), the quota block of `awm stats --savings` and the `quota samples` line of `awm doctor`. Claude Code no longer passes a 5-hour or 7-day limit to the status line.

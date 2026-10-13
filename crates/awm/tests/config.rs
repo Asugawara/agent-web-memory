@@ -276,26 +276,6 @@ fn team_defaults_parse_set_and_clamp() {
 }
 
 #[test]
-fn removed_quota_keys_are_read_without_error_and_rejected_by_set() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("config.toml");
-    std::fs::write(&path, "[quota]\ncapture = true\nretention_days = 5\n").unwrap();
-    // The section left over from an older version loads, and each key is reported.
-    let (loaded, legacy) = config::load_with_legacy(&path).unwrap();
-    assert_eq!(loaded, Config::default());
-    for key in ["quota.capture", "quota.retention_days"] {
-        assert!(legacy.iter().any(|l| l.contains(key)), "{key}: {legacy:?}");
-    }
-    let mut c = Config::default();
-    for key in ["quota.capture", "quota.retention_days"] {
-        let err = c.set(key, "7").unwrap_err();
-        assert!(err.to_string().contains("was removed"), "{key}: {err}");
-        assert_eq!(c.get(key), None);
-    }
-    assert_eq!(c, Config::default());
-}
-
-#[test]
 fn legacy_shadow_values_load_with_the_mapping_and_removed_keys_are_ignored() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
