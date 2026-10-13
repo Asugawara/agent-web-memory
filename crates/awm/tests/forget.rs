@@ -1044,7 +1044,6 @@ fn uninstall_deletes_the_data_dir_and_prints_the_remaining_steps() {
             "To finish:",
             "  claude plugin uninstall agent-web-memory@agent-web-memory",
             "  claude plugin marketplace remove agent-web-memory",
-            "  If your status line script calls \"awm statusline\", remove that line.",
             "  rm ~/.local/bin/awm",
         ]
     );
@@ -1616,7 +1615,7 @@ fn purge_all_removes_symlinks_but_not_their_targets() {
 }
 
 // ---------------------------------------------------------------------------
-// QP: usage samples in `quota/` (plan-quota §5.2)
+// Legacy `quota/`: written by the removed `awm statusline`; purge and uninstall still delete it
 
 impl Env {
     fn quota(&self) -> PathBuf {
@@ -1669,55 +1668,6 @@ fn uninstall_deletes_quota_samples() {
         tail.contains(&"  claude plugin uninstall agent-web-memory@agent-web-memory"),
         "{out}"
     );
-}
-
-fn write_settings(env: &Env, text: &str) -> PathBuf {
-    let path = env.root.join("home/.claude/settings.json");
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, text).unwrap();
-    path
-}
-
-const REMOVE_LINE: &str = "  awm setup --remove-statusline --yes";
-const REMINDER: &str = "  If your status line script calls \"awm statusline\", remove that line.";
-
-#[test]
-fn uninstall_names_the_status_line_removal_when_it_is_awms() {
-    let env = Env::new();
-    let text = "{\"statusLine\": {\"type\": \"command\", \"command\": \"/usr/local/bin/awm statusline --quiet\"}}";
-    let path = write_settings(&env, text);
-    let (code, out, err) = env.awm(&["uninstall", "--yes"]);
-    assert_eq!(code, Some(0), "{out}{err}");
-    let lines: Vec<&str> = out.lines().collect();
-    let remove = lines.iter().position(|l| *l == REMOVE_LINE).expect(&out);
-    let binary = lines
-        .iter()
-        .rposition(|l| l.starts_with("  ") && !l.contains("plugin") && *l != REMOVE_LINE)
-        .unwrap();
-    assert!(remove < binary, "{out}");
-    assert!(!out.contains(REMINDER), "{out}");
-    assert_eq!(std::fs::read_to_string(path).unwrap(), text);
-}
-
-#[test]
-fn uninstall_reminds_about_a_status_line_that_is_not_awms_or_missing() {
-    for settings in [
-        Some("{\"statusLine\": {\"type\": \"command\", \"command\": \"~/bin/my-line.sh\"}}"),
-        Some("{\"model\": \"x\"}"),
-        None,
-    ] {
-        let env = Env::new();
-        let path = settings.map(|t| write_settings(&env, t));
-        let (code, out, err) = env.awm(&["uninstall", "--yes"]);
-        assert_eq!(code, Some(0), "{out}{err}");
-        let lines: Vec<&str> = out.lines().collect();
-        let reminder = lines.iter().position(|l| *l == REMINDER).expect(&out);
-        assert!(!out.contains(REMOVE_LINE), "{out}");
-        assert!(reminder + 1 < lines.len(), "binary line follows: {out}");
-        if let (Some(p), Some(t)) = (path, settings) {
-            assert_eq!(std::fs::read_to_string(p).unwrap(), t);
-        }
-    }
 }
 
 #[test]

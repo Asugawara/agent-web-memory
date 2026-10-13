@@ -129,7 +129,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     spool(&dir, &cfg)?;
     latency_summary(&conn)?;
     consent(&conn)?;
-    quota_samples(&dir);
     // Only a machine in a team has this section; without `team.toml` the output is unchanged.
     if dir.join(crate::paths::TEAM_TOML).exists() {
         failed |= team_section(&dir);
@@ -208,31 +207,6 @@ fn consent(conn: &Connection) -> anyhow::Result<()> {
         _ => println!("[warn] recording is off. Run: awm init --record"),
     }
     Ok(())
-}
-
-/// One line, never a failure.
-fn quota_samples(dir: &std::path::Path) {
-    let now = super::now_ms();
-    let (n, newest) =
-        crate::quota::store::recent(&dir.join(crate::quota::DIR), now - 24 * 3_600_000);
-    match newest.filter(|_| n > 0) {
-        Some(t) => {
-            let mins = (now - t).max(0) / 60_000;
-            let age = if mins >= 60 {
-                format!("{}h{}m", mins / 60, mins % 60)
-            } else if mins > 0 {
-                format!("{mins}m")
-            } else {
-                format!("{}s", ((now - t).max(0) / 1000))
-            };
-            ok(&format!(
-                "quota samples: {n} in the last 24 h (last {age} ago)"
-            ));
-        }
-        None => ok(
-            "quota samples: none in the last 24 h (optional; to enable: awm setup --statusline)",
-        ),
-    }
 }
 
 /// The team lines of `awm doctor` (plan-v3-team §4.9). They read `awm team status` rather than

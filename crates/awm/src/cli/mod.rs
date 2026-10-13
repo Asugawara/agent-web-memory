@@ -13,7 +13,6 @@ pub mod search;
 pub mod serve;
 pub mod setup;
 pub mod stats;
-pub mod statusline;
 pub mod sync;
 pub mod team;
 pub mod uninstall;

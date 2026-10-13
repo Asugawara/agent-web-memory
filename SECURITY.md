@@ -3,12 +3,12 @@
 ## What is protected in v0.1
 
 - **Data location**: Research stays on the machine unless you join a team (see "Team sync" below); the default build has no HTTP client.
-- **File permissions**: The data directory is mode 0700 and the database file and usage-limit sample files are mode 0600.
+- **File permissions**: The data directory is mode 0700 and the database file is mode 0600.
 - **Redaction before storage**: API keys, secrets, private IPs, file paths, and email addresses are redacted before being written to disk.
 - **Working directories, local only**: for your own records the database also keeps the working directory each call was made from and the repository checkout that holds it, as plain paths (table `cwd`, schema version 4), so `awm stats` can be split by repository and directory. They are not redacted (they are the names to show) and never leave the machine: a team record carries neither (`sync_payload.rs` `never_shared_fields_are_absent_from_the_json`). Records pulled from teammates have no `cwd` row. Backups taken while migrating (`awm.db.bak-v*`) hold the same paths once the database is at version 4. The `cwd` rows and the `cwd.walked.*` meta rows stay until `awm purge --all`; `awm forget` and `awm purge --before` do not remove them.
 - **Private hosts never stored**: URLs on private networks (`localhost`, `192.168.*`, `10.*`, etc.) are never recorded.
 - **Injected text is bounded**: Notes are wrapped in XML tags, sanitized, capped at 9,500 characters, and labeled with their source and age. A PreToolUse deny (on by default for repeated fetches of a URL and for repeated searches; `short_circuit.mode` and `short_circuit.query` switch them off) hands the agent the same sanitised earlier result (up to 8,000 characters) as `additionalContext` (a one-line reason carries no page text), capped at 9,500 characters.
-- **Deletion is verifiable**: `awm forget` deletes the selected records immediately (tombstones stop them coming back); `awm purge` deletes by date or everything. Usage-limit samples expire after `quota.retention_days` (92 days by default, deleted by whole month); `awm purge --all` deletes them and `awm purge --before` leaves them to retention.
+- **Deletion is verifiable**: `awm forget` deletes the selected records immediately (tombstones stop them coming back); `awm purge` deletes by date or everything.
 - **Quarantine for unreliable records**: Mark a note or URL as unreliable with `awm quarantine`; quarantined records are never injected.
 - **Build integrity**: Builds are local for now: `scripts/install-local.sh` builds from source with `--locked`; a committed `Cargo.lock`, the default build has no network dependencies (`scripts/check.sh` no-network step); release builds add `sync` (an HTTP client used only by `awm sync`) and `serve`. No telemetry.
 - **No telemetry**: No metrics, counters, or analytics are collected or sent anywhere.

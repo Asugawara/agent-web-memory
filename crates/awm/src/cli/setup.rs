@@ -26,12 +26,6 @@ pub struct Args {
     /// Remove the awm hooks from $CODEX_HOME/hooks.json
     #[arg(long, conflicts_with_all = ["hooks_in_settings", "remove_hooks"])]
     pub remove_codex_hooks: bool,
-    /// Show how to record usage-limit samples from the Claude Code status line
-    #[arg(long, conflicts_with_all = ["hooks_in_settings", "remove_hooks", "codex_hooks", "remove_codex_hooks", "remove_statusline"])]
-    pub statusline: bool,
-    /// Remove awm's status line from ~/.claude/settings.json
-    #[arg(long, conflicts_with_all = ["hooks_in_settings", "remove_hooks", "codex_hooks", "remove_codex_hooks", "statusline"])]
-    pub remove_statusline: bool,
     /// Do not ask for confirmation
     #[arg(long)]
     pub yes: bool,
@@ -262,187 +256,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     result
 }
 
-/// This binary's path, single-quoted (`'` written as `'\''`) when it has any character
-/// outside `[A-Za-z0-9_./-]`.
-fn exe_for_shell(exe: &str) -> String {
-    let plain = !exe.is_empty()
-        && exe
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'/' | b'-'));
-    if plain {
-        exe.to_string()
-    } else {
-        format!("'{}'", exe.replace('\'', "'\\''"))
-    }
-}
-
-/// The inverse of [`exe_for_shell`]: a path in one single-quoted word, or unquoted.
-fn unquote_exe(word: &str) -> String {
-    match word.strip_prefix('\'').and_then(|w| w.strip_suffix('\'')) {
-        Some(inner) => inner.replace("'\\''", "'"),
-        None => word.to_string(),
-    }
-}
-
-/// The line to add to a status line script right after the line that reads stdin. The
-/// redirect and the `&` are required: without them the background process keeps the
-/// status line's stdout open and Claude Code waits for it (plan-quota §4.3).
-fn statusline_line(exe: &str) -> String {
-    format!(
-        "printf '%s' \"$input\" | {} statusline --quiet >/dev/null 2>&1 &",
-        exe_for_shell(exe)
-    )
-}
-
-/// True for `awm statusline` and `<path>/awm statusline` (path as [`exe_for_shell`] writes it),
-/// optionally followed by ` --quiet`.
-pub(crate) fn is_our_statusline(command: &str) -> bool {
-    let c = command.trim();
-    let c = c.strip_suffix(" --quiet").unwrap_or(c);
-    let Some(exe) = c.strip_suffix(" statusline") else {
-        return false;
-    };
-    let exe = unquote_exe(exe);
-    Path::new(&exe).file_name().is_some_and(|f| f == "awm")
-}
-
-/// Asks (or refuses without a terminal) as the hook flags do. False: the answer was no.
-fn confirm(
-    args: &Args,
-    flag: &str,
-    terminal: bool,
-    input: &mut dyn BufRead,
-    out: &mut dyn Write,
-) -> anyhow::Result<bool> {
-    if args.yes {
-        return Ok(true);
-    }
-    if !terminal {
-        bail!("no terminal for confirmation; nothing changed. Re-run with --yes: awm setup {flag} --yes");
-    }
-    write!(out, "Continue? [y/N] ")?;
-    out.flush()?;
-    let mut answer = String::new();
-    input.read_line(&mut answer)?;
-    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-        Ok(true)
-    } else {
-        writeln!(out, "Nothing changed.")?;
-        Ok(false)
-    }
-}
-
-/// Backs up an existing settings file once, then writes `settings`.
-fn write_settings(
-    path: &Path,
-    existed: bool,
-    settings: &Value,
-    out: &mut dyn Write,
-) -> anyhow::Result<()> {
-    if existed {
-        let backup = PathBuf::from(format!("{}.awm-backup", path.display()));
-        if !backup.exists() {
-            std::fs::copy(path, &backup)
-                .with_context(|| format!("cannot write the backup {}", backup.display()))?;
-            writeln!(out, "Backup: {}", backup.display())?;
-        }
-    } else if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut text = serde_json::to_string_pretty(settings)?;
-    text.push('\n');
-    std::fs::write(path, text).with_context(|| format!("cannot write {}", path.display()))
-}
-
-/// `--statusline` and `--remove-statusline` (plan-quota §4.3). An existing `statusLine` is
-/// never edited; only a `statusLine` that runs `awm statusline` is ever removed.
-pub fn run_statusline(
-    args: &Args,
-    path: &Path,
-    terminal: bool,
-    input: &mut dyn BufRead,
-    out: &mut dyn Write,
-) -> anyhow::Result<()> {
-    let (mut settings, existed) = match std::fs::read_to_string(path) {
-        Ok(text) => (
-            serde_json::from_str::<Value>(&text).with_context(|| {
-                format!("{} is not valid JSON; nothing changed", path.display())
-            })?,
-            true,
-        ),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (json!({}), false),
-        Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
-    };
-    let root = settings
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("{} is not a JSON object; nothing changed", path.display()))?;
-    let exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "awm".to_string());
-    let current = root.get("statusLine").map(|v| {
-        v["command"]
-            .as_str()
-            .map_or_else(|| v.to_string(), str::to_string)
-    });
-
-    if args.remove_statusline {
-        let Some(command) = current else {
-            writeln!(
-                out,
-                "{}: no status line; nothing to remove.",
-                path.display()
-            )?;
-            return Ok(());
-        };
-        if !is_our_statusline(&command) {
-            writeln!(
-                out,
-                "The status line ({command}) is not awm's; nothing changed. \
-                 If you added the awm line to your status line script, remove that line yourself."
-            )?;
-            return Ok(());
-        }
-        writeln!(
-            out,
-            "Removing the status line ({command}) from {}.",
-            path.display()
-        )?;
-        if !confirm(args, "--remove-statusline", terminal, input, out)? {
-            return Ok(());
-        }
-        root.remove("statusLine");
-        write_settings(path, existed, &settings, out)?;
-        writeln!(out, "Done.")?;
-        return Ok(());
-    }
-
-    if let Some(command) = current {
-        writeln!(
-            out,
-            "You already have a status line ({command}); nothing changed. To record usage \
-             samples, add this line to your status line script right after the line that reads \
-             stdin (keep the redirect and the &):"
-        )?;
-        writeln!(out, "{}", statusline_line(&exe))?;
-        return Ok(());
-    }
-    let command = format!("{} statusline", exe_for_shell(&exe));
-    let entry = json!({"type": "command", "command": command});
-    writeln!(
-        out,
-        "Adding a status line to {}:\n{{\"statusLine\": {}}}",
-        path.display(),
-        entry
-    )?;
-    if !confirm(args, "--statusline", terminal, input, out)? {
-        return Ok(());
-    }
-    root.insert("statusLine".to_string(), entry);
-    write_settings(path, existed, &settings, out)?;
-    writeln!(out, "Done.")?;
-    Ok(())
-}
-
 pub fn run_with(
     args: &Args,
     path: &Path,
@@ -450,16 +263,10 @@ pub fn run_with(
     input: &mut dyn BufRead,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
-    if args.statusline || args.remove_statusline {
-        return run_statusline(args, path, terminal, input, out);
-    }
     let adding = args.hooks_in_settings || args.codex_hooks;
     let removing = args.remove_hooks || args.remove_codex_hooks;
     if !adding && !removing {
-        bail!(
-            "choose --hooks-in-settings, --remove-hooks, --codex-hooks, --remove-codex-hooks, \
-             --statusline or --remove-statusline"
-        );
+        bail!("choose --hooks-in-settings, --remove-hooks, --codex-hooks or --remove-codex-hooks");
     }
     let codex = args.codex_hooks || args.remove_codex_hooks;
     let target = if codex { Target::Codex } else { Target::Claude };

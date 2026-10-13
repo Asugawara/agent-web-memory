@@ -44,12 +44,8 @@ This asks whether to record future research and whether to import your past rese
 - Your API keys (redacted before storage)
 - Private network URLs
 
-**With status line samples on (`awm setup --statusline`):**
-- Time, session ID, model, the 5-hour and 7-day usage percentages and reset times, and the session's estimated cost
-- Kept at least 92 days and deleted by whole months (so up to 123 days); `awm purge --all` and `awm uninstall` delete them, `awm purge --before` does not
-
 **Stored in:**
-- The data directory, ~/Library/Application Support/agent-web-memory/ on macOS or ~/.local/share/agent-web-memory/ on Linux: the database awm.db and, with status line samples on, quota/samples-YYYY-MM.ndjson
+- The data directory, ~/Library/Application Support/agent-web-memory/ on macOS or ~/.local/share/agent-web-memory/ on Linux: the database awm.db
 - This machine only, unless you join a team; hooks never make network requests
 
 **Delete everything at any time:**
@@ -66,17 +62,16 @@ awm purge --all
 | `awm search {query}` | Search stored records |
 | `awm log` | Show recent notes injected into your agents |
 | `awm stats` | Show statistics (records by tool and agent, quarantined count) |
-| `awm stats --savings` | Estimate time and tokens the shown notes saved, and their share of your usage limits (`--since YYYY-MM-DD`, `--json`) |
+| `awm stats --savings` | Estimate time and tokens the shown notes saved (`--since YYYY-MM-DD`, `--json`) |
 | `awm stats --by repo` | The same headline numbers per repository: records, notes injected (`notes`), denied, refetched after a deny (`--by dir` per directory; `--since YYYY-MM-DD` limits the counts; with `--savings`, the savings columns per group, where `shown` counts notes and denies) |
 | `awm stats --repo .` | Every section for one repository only, including its worktrees (`--dir PATH` for a directory and everything under it) |
 | `awm review` | Review and label notes you were shown |
 | `awm forget` | Delete records: `awm forget last`, `awm forget <url>`, `awm forget --id N`, `awm forget --ref REF` (asks first; `--yes` skips the question) |
-| `awm purge` | `awm purge --before YYYY-MM-DD` deletes records older than the date (usage-limit samples expire on their own); `awm purge --all` deletes the whole data directory |
+| `awm purge` | `awm purge --before YYYY-MM-DD` deletes records older than the date; `awm purge --all` deletes the whole data directory |
 | `awm quarantine` | Mark records as unreliable |
 | `awm unquarantine` | Lift quarantine |
 | `awm calibrate` | Calibrate matching thresholds |
-| `awm setup` | Set up the plugin integration (`--statusline` adds usage-limit samples) |
-| `awm statusline` | Record usage-limit samples from Claude Code's status line (`--quiet` prints nothing) |
+| `awm setup` | Set up the plugin integration |
 | `awm export` | Export records |
 | `awm reindex` | Rebuild the search index |
 | `awm config` | Show or change settings (mode, channels, cutoffs) |
@@ -86,7 +81,7 @@ awm purge --all
 
 ### How savings are estimated
 
-`awm stats --by repo|dir` and `--repo [PATH]` / `--dir [PATH]` (default `.`) split or limit the numbers by where the agent was working. A repository is the main checkout that holds the directory, found by walking up to a `.git` (a linked worktree counts toward the checkout it was made from); a directory outside git is listed on its own as `(no repository) PATH`. `--dir PATH` takes that directory and everything under it. `--by` prints one row per group and a `total` row (JSON: `by_repo` / `by_dir`, last element `total`); `notes` = notes injected, `denied` = denies, and with `--savings` `shown` counts both; `--repo` and `--dir` print every section for the one scope, with a `scope:` line first (JSON: a top-level `scope` object with `kind`, `path` and `directories`), and work with `--savings`, `--status`, `--value` and `--followups`. Rows from before awm remembered working directories are placed from the transcripts on the first run of any of these flags (later runs fill in what changed): an injection takes the directory of the nearest line of its transcript, or, when the transcript is gone, of the first record of its session (this assumes a session stays in one directory, which is not verified), and a record takes the directory a transcript under `~/.claude/projects` or `~/.codex/sessions` starts in. **This writes to the database** (the `cwd` table and `injection.cwd_hash`); what no transcript names is listed as `(unknown)` and reported on stderr. A directory first seen outside git that has become a checkout since is placed in it on the same run. A worktree directory that no longer exists (`.../worktrees/REPO/BRANCH`) is placed with the repository of the same name when there is exactly one. The call-cost medians the savings use stay global (what a call costs does not depend on the directory); the quota block of `--savings` measures the scope's savings against your whole usage limit (the rates are calibrated on all sessions), and the ceilings (repeat calls) are limited to the scope. The paths are stored and printed on this machine only, and are never synced or exported.
+`awm stats --by repo|dir` and `--repo [PATH]` / `--dir [PATH]` (default `.`) split or limit the numbers by where the agent was working. A repository is the main checkout that holds the directory, found by walking up to a `.git` (a linked worktree counts toward the checkout it was made from); a directory outside git is listed on its own as `(no repository) PATH`. `--dir PATH` takes that directory and everything under it. `--by` prints one row per group and a `total` row (JSON: `by_repo` / `by_dir`, last element `total`); `notes` = notes injected, `denied` = denies, and with `--savings` `shown` counts both; `--repo` and `--dir` print every section for the one scope, with a `scope:` line first (JSON: a top-level `scope` object with `kind`, `path` and `directories`), and work with `--savings`, `--status`, `--value` and `--followups`. Rows from before awm remembered working directories are placed from the transcripts on the first run of any of these flags (later runs fill in what changed): an injection takes the directory of the nearest line of its transcript, or, when the transcript is gone, of the first record of its session (this assumes a session stays in one directory, which is not verified), and a record takes the directory a transcript under `~/.claude/projects` or `~/.codex/sessions` starts in. **This writes to the database** (the `cwd` table and `injection.cwd_hash`); what no transcript names is listed as `(unknown)` and reported on stderr. A directory first seen outside git that has become a checkout since is placed in it on the same run. A worktree directory that no longer exists (`.../worktrees/REPO/BRANCH`) is placed with the repository of the same name when there is exactly one. The call-cost medians the savings use stay global (what a call costs does not depend on the directory); the ceilings (repeat calls) are limited to the scope. The paths are stored and printed on this machine only, and are never synced or exported.
 
 `awm stats --savings` counts a shown note as avoided when the same session and agent did not call its URL or query again afterwards, and prices it at the median duration and summary length (chars / 4) of earlier calls of the same URL or query. This is an estimate of something that did not happen, so it also prints the part you confirmed in `awm review` (label 2), the token overhead of the notes, and the repeat calls in your history as an upper bound. It also prints a separate line, the page bytes not fetched: for each avoided fetch, the median size of earlier fetches of that URL, with summariser tokens = bytes / 4. That is an upper bound, and the table keeps it in its own column, because the page is read by Claude Code's fetch summariser and the main model never sees those tokens; on API billing they are cost, on a subscription they are usage, not dollars. Searches add 0. The first summary line adds the summariser tokens and the main-model net into one net and prints both parts, since not running the summariser is most of what an avoided fetch saves.
 
@@ -102,12 +97,6 @@ main_input_per_mtok = 0.0          # your main model's input price; 0 = not pric
 ```
 
 Main-model tokens are priced only when `main_input_per_mtok` is set; the first summary line then also shows a net cost after the note overhead. A subscription pays none of this per call, so read the cost as what the same calls would cost on API billing.
-
-### Savings in your usage limits (subscription)
-
-On a Claude Pro or Max subscription the `cost` column is what the same calls would cost on API billing. `awm stats --savings` can also show the savings as a share of your 5-hour and 7-day usage limits. It needs the limit usage that Claude Code passes to your status line, so run `awm setup --statusline` once. When you have no status line, it adds one. When you have your own, it changes nothing and prints one line to paste into your script right after the line that reads stdin; keep the `>/dev/null 2>&1 &` at its end, or Claude Code waits for awm before it draws the status line. The samples stay in `quota/` in the data directory for at least 92 days (`quota.retention_days`, deleted by whole months); `awm purge --all` and `awm uninstall` delete them, `awm purge --before` does not.
-
-In each 5-hour window, awm compares the rise of the usage percentage with the list-price cost that your Claude Code sessions on this machine reported over the same time. The total rise over all windows with at least 10 points and $20 of use, divided by their total cost, is the share of a window per dollar. Accounts are told apart by their 7-day reset, and each account-week gets its own rate once it has 5 such windows on 2 days. The savings in the `cost` column times that rate give the share. Two figures are shown: `estimated` counts every note whose page or search was not repeated afterwards, which is an upper bound because the agent might not have needed it; `proven` counts only calls that were denied and items you labelled 2 in `awm review`. The range comes from how the limits count cached tokens, which Anthropic does not document: from free (the high end) to ten times their list price (the low end). awm reads the cache-read share of your sessions from the totals Claude Code writes at the end of each transcript, and their start times from the first line; nothing from them is stored. The figures leave out the context the notes replaced or added and the requests they saved, and use on claude.ai or on other machines, which the samples cannot see, makes them too high. awm assumes the limits weigh models and other token kinds like list prices, and needs `[pricing]` in USD. Codex calls are not part of these figures; Codex has its own limits.
 
 ### Blocking repeats (short-circuit)
 
@@ -175,7 +164,7 @@ To delete everything:
    ```bash
    awm uninstall
    ```
-   This shows the data directory size and record count, then deletes it after you confirm, including usage-limit samples.
+   This shows the data directory size and record count, then deletes it after you confirm.
 
 2. **Remove the plugin from Claude Code:**
    ```bash
@@ -183,9 +172,7 @@ To delete everything:
    claude plugin marketplace remove agent-web-memory
    ```
 
-3. **Remove the status line sample capture:** run `awm setup --remove-statusline --yes` if awm wrote your status line, or remove the `awm statusline` line from your status line script.
-
-4. **Remove the binary:**
+3. **Remove the binary:**
    ```bash
    bash scripts/uninstall-local.sh
    ```

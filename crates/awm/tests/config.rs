@@ -276,37 +276,23 @@ fn team_defaults_parse_set_and_clamp() {
 }
 
 #[test]
-fn quota_defaults_ranges_and_set_errors() {
-    let c = Config::default();
-    assert!(c.quota.capture);
-    assert_eq!(c.quota.retention_days, 92);
-    assert_eq!(c.get("quota.capture").unwrap(), "true");
-    assert_eq!(c.get("quota.retention_days").unwrap(), "92");
-
+fn removed_quota_keys_are_read_without_error_and_rejected_by_set() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
-    std::fs::write(&path, "[quota]\nretention_days = 5\n").unwrap();
-    let loaded = config::load(&path).unwrap();
-    assert_eq!(loaded.quota.retention_days, 7);
-    assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
-    assert!(loaded.warnings[0].contains("quota.retention_days"));
-    assert!(loaded.quota.capture);
-    std::fs::write(&path, "[quota]\nretention_days = 99999\n").unwrap();
-    assert_eq!(config::load(&path).unwrap().quota.retention_days, 3650);
-
+    std::fs::write(&path, "[quota]\ncapture = true\nretention_days = 5\n").unwrap();
+    // The section left over from an older version loads, and each key is reported.
+    let (loaded, legacy) = config::load_with_legacy(&path).unwrap();
+    assert_eq!(loaded, Config::default());
+    for key in ["quota.capture", "quota.retention_days"] {
+        assert!(legacy.iter().any(|l| l.contains(key)), "{key}: {legacy:?}");
+    }
     let mut c = Config::default();
-    c.save(&path).unwrap();
-    let saved = std::fs::read_to_string(&path).unwrap();
-    assert!(c.set("quota.retention_days", "3651").is_err());
-    assert!(c.set("quota.retention_days", "6").is_err());
-    assert!(c.set("quota.capture", "maybe").is_err());
+    for key in ["quota.capture", "quota.retention_days"] {
+        let err = c.set(key, "7").unwrap_err();
+        assert!(err.to_string().contains("was removed"), "{key}: {err}");
+        assert_eq!(c.get(key), None);
+    }
     assert_eq!(c, Config::default());
-    c.set("quota.retention_days", "7").unwrap();
-    c.set("quota.capture", "false").unwrap();
-    assert_eq!(c.get("quota.retention_days").unwrap(), "7");
-    assert_eq!(c.get("quota.capture").unwrap(), "false");
-    // The file the failed sets would have written is untouched (`save` runs after `set`).
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
 }
 
 #[test]

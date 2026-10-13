@@ -26,8 +26,6 @@ enum Command {
     Log(cli::log::Args),
     /// Show statistics
     Stats(cli::stats::Args),
-    /// Record usage-limit samples from Claude Code's status line
-    Statusline(cli::statusline::Args),
     /// Review stored notes
     Review(cli::review::Args),
     /// Forget records
@@ -123,14 +121,6 @@ fn main() {
     if std::env::args_os().nth(1).is_some_and(|a| a == "hook") {
         run_hook();
     }
-    // `statusline` exits 0 whatever it is given, except for the usage.
-    if std::env::args_os()
-        .nth(1)
-        .is_some_and(|a| a == "statusline")
-        && !std::env::args_os().any(|a| a == "-h" || a == "--help")
-    {
-        run_hook();
-    }
     let cli = Cli::parse();
     if let Err(err) = dispatch(cli.command) {
         eprintln!("awm: {err}");
@@ -145,7 +135,6 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Search(a) => cli::search::run(a),
         Command::Log(a) => cli::log::run(a),
         Command::Stats(a) => cli::stats::run(a),
-        Command::Statusline(a) => cli::statusline::run(a),
         Command::Review(a) => cli::review::run(a),
         Command::Forget(a) => forget::run(a),
         Command::Purge(a) => forget::run_purge(a),

@@ -62,38 +62,9 @@ pub fn run_with(
             io.out,
             "  claude plugin marketplace remove agent-web-memory"
         )?;
-        if has_our_statusline(home) {
-            writeln!(io.out, "  awm setup --remove-statusline --yes")?;
-        } else {
-            writeln!(
-                io.out,
-                "  If your status line script calls \"awm statusline\", remove that line."
-            )?;
-        }
         writeln!(io.out, "  {}", binary_removal(exe, home))?;
     }
     Ok(outcome)
-}
-
-/// True when `{home}/.claude/settings.json` has a `statusLine` that runs `awm statusline`.
-/// Read only: uninstall never edits settings.
-fn has_our_statusline(home: Option<&Path>) -> bool {
-    let path = match home {
-        Some(h) => h.join(".claude").join("settings.json"),
-        None => match crate::cli::setup::settings_path() {
-            Ok(p) => p,
-            Err(_) => return false,
-        },
-    };
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return false;
-    };
-    v["statusLine"]["command"]
-        .as_str()
-        .is_some_and(crate::cli::setup::is_our_statusline)
 }
 
 /// The binary removal line for the detected install method (§2.3 step 4).
