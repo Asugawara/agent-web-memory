@@ -97,8 +97,6 @@ The project is organized into modules:
 - `db.rs`: Database connection and migrations
 - `hook/`: Entry points for Claude Code hooks (session start, tool use, etc.)
 
-See `docs/plan-v2.md` for detailed specifications.
-
 ## Reporting issues
 
 File an issue on GitHub with:

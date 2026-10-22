@@ -122,7 +122,7 @@ Settings of older versions keep working: `shadow` reads as `inject` for `mode`, 
 
 ## Codex
 
-Codex support is experimental (started 2026-10-02; spike in `docs/reports/codex-hooks.md`, tested with Codex CLI 0.159.3).
+Codex support is experimental (started 2026-10-02, tested with Codex CLI 0.159.3).
 
 **What works**
 - Notes about earlier research are shown with your prompt (`UserPromptSubmit`). A note holds the earlier result in full (sanitised, up to 8,000 characters); a block of notes is at most 9,500 characters, about 2,400 tokens.
@@ -185,7 +185,7 @@ For a fetch of a URL it already holds, it is one: the call is denied once with a
 
 ### Why local first?
 
-Uploading research creates a privacy boundary you lose control of. Local-first means your data never leaves your machine unless you copy it. Team sync is optional: when you join a team, see `docs/self-host.md` for self-hosting options and `docs/plan-v3-team.md` §3.2 for what fields are shared (your prompts, transcripts and file paths never leave your machine; summaries are cut to 1,000 characters by default; authenticated-SaaS pages share only the URL and title).
+Uploading research creates a privacy boundary you lose control of. Local-first means your data never leaves your machine unless you copy it. Team sync is optional: when you join a team, see `docs/self-host.md` for self-hosting options and `docs/sync-v1.md` for what fields are shared (your prompts, transcripts and file paths never leave your machine; summaries are cut to 1,000 characters by default; authenticated-SaaS pages share only the URL and title).
 
 ### Does it work in subagents?
 

@@ -46,7 +46,7 @@ When you run `awm team join`, team sync is end-to-end encrypted: the server hold
 7. Elimination of prompt injection.
 8. Legal compulsion against a member or a customer organisation.
 
-The full threat model, key handling and deletion guarantees are in `docs/plan-v3-team.md` §5.
+The key handling is specified in `docs/sync-v1-crypto.md` and the deletion guarantees in `docs/sync-v1.md`.
 
 ## What is *not* defended (local mode, v0.1)
 
@@ -60,6 +60,6 @@ Future versions may add:
 
 ## Reporting a security issue
 
-To report a vulnerability, please email security@example.invalid with the subject line `[SECURITY] agent-web-memory vulnerability`.
+To report a vulnerability, use GitHub private vulnerability reporting: open the **Security** tab of this repository and choose **Report a vulnerability**.
 
-Do not open a public issue. We will acknowledge receipt within 48 hours and follow up with a fix timeline. GitHub private vulnerability reporting will replace this when the repository is public.
+Do not open a public issue. We will acknowledge receipt within 48 hours and follow up with a fix timeline.

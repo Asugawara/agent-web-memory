@@ -1,6 +1,6 @@
 # awm sync protocol v1
 
-Status: frozen for v0.2 by TM2 (2026-10-02). Source: `docs/plan-v3-team.md` §4.3 (with §3.6, §3.7, §3.9.5, §4.10, §5.1) and the protocol findings of `docs/reports/RV8-team.md`. The serde types are `crates/awm-proto/src/wire.rs`; the JSON Schema snapshots are `crates/awm-proto/schemas/v1/`; the fixtures are `crates/awm-proto/tests/fixtures/v1/`; `crates/awm-proto/tests/wire_snapshots.rs` ties the three together (§17). Where this document and the plan differ, this document is the protocol and `docs/reports/TM2.md` lists the differences.
+Status: frozen for v0.2 (2026-10-02). The serde types are `crates/awm-proto/src/wire.rs`; the JSON Schema snapshots are `crates/awm-proto/schemas/v1/`; the fixtures are `crates/awm-proto/tests/fixtures/v1/`; `crates/awm-proto/tests/wire_snapshots.rs` ties the three together (§17). This document is the protocol.
 
 The record envelope's cryptography (seal, open, wraps, MACs) is TM3's; this document names every field that envelope and those MACs must bind (§5) and the envelope's outer structure the server checks (§9.1).
 
