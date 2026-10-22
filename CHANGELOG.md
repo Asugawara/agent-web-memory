@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.0
+
 ### Database migration
 - **Schema version 2** (`0002_event_agent`): adds `event.agent` (`claude` or `codex`); existing records become `claude`. Run `awm doctor` once after upgrading: it writes a backup `awm.db.bak-v1` next to the database and migrates. Until then hooks show nothing and spool their captures, and other commands ask you to run `awm doctor`; `awm doctor` migrates and then ingests the spool, so nothing captured in between is lost. An older `awm` run against the migrated database skips its captures and discards any pending spool files (that binary cannot be fixed), so run `awm doctor` with the new binary before any old one can run, and keep `~/.local/bin/awm` first in `PATH`. Rollback: install the previous `awm`, close every agent session, delete `awm.db-wal` and `awm.db-shm` if present, and copy `awm.db.bak-v1` over `awm.db`.
 - **Schema version 4** (`0004_cwd`): adds the local-only table `cwd` (the plain working directory behind each `cwd_hash` and the repository checkout that holds it, found from the filesystem without running git) and `injection.cwd_hash` (the caller's directory; unset on older rows). New captures, imports and injections fill them; older rows are filled by a later backfill. Nothing of it is synced. Upgrade and rollback as for version 2: `awm doctor` writes `awm.db.bak-v3` (or the backup of whatever version the database was at) and migrates; to roll back, copy that backup over `awm.db`. Hooks never migrate: after installing this build, hooks stay silent and capture spools until `awm doctor` runs.
