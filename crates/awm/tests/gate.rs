@@ -142,13 +142,24 @@ fn cjk_runs_of_two_or_more_characters_count() {
     assert!(skip("\u{304a}\u{9858}\u{3044}\u{3057}\u{307e}\u{3059}"));
     assert!(skip("\u{306f}\u{3044}"));
     // Single characters do not count.
-    assert_eq!(content_words("\u{3042}\u{3001}\u{3044}\u{3001}\u{3046}\u{3001}\u{3048}"), 0);
+    assert_eq!(
+        content_words("\u{3042}\u{3001}\u{3044}\u{3001}\u{3046}\u{3001}\u{3048}"),
+        0
+    );
 }
 
 #[test]
 fn mixed_cjk_and_english_prompts_count_both() {
-    assert_eq!(content_words("SQLite \u{306e} WAL \u{30e2}\u{30fc}\u{30c9} \u{306b}\u{3064}\u{3044}\u{3066}"), 4);
-    assert_eq!(bm25("SQLite \u{306e} WAL \u{30e2}\u{30fc}\u{30c9} \u{306b}\u{3064}\u{3044}\u{3066}"), Gate::PromptBm25);
+    assert_eq!(
+        content_words(
+            "SQLite \u{306e} WAL \u{30e2}\u{30fc}\u{30c9} \u{306b}\u{3064}\u{3044}\u{3066}"
+        ),
+        4
+    );
+    assert_eq!(
+        bm25("SQLite \u{306e} WAL \u{30e2}\u{30fc}\u{30c9} \u{306b}\u{3064}\u{3044}\u{3066}"),
+        Gate::PromptBm25
+    );
     assert!(skip("fix \u{30c6}\u{30b9}\u{30c8}"));
 }
 
