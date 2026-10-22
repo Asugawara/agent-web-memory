@@ -506,7 +506,7 @@ fn the_deadline_fires_before_a_slow_hook_prints() {
 }
 
 #[test]
-fn a_locked_database_gives_no_output_within_600_ms() {
+fn a_locked_database_gives_no_output_within_the_deadline() {
     let home = Home::new();
     seed_example_fetch(&home);
     // The exclusive locking mode keeps readers out, as a long migration would.
@@ -519,8 +519,10 @@ fn a_locked_database_gives_no_output_within_600_ms() {
         .unwrap();
     let out = home.hook("post-tool", &new_fetch());
     assert_silent(&out);
+    // The 500 ms deadline plus the process start and exit (the bound of the deadline test above:
+    // 600 ms failed at 693 ms on a loaded macOS runner).
     assert!(
-        out.elapsed < Duration::from_millis(600),
+        out.elapsed < Duration::from_millis(790),
         "{:?}",
         out.elapsed
     );

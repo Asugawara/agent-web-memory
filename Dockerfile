@@ -12,13 +12,15 @@ COPY . .
 RUN cargo build --release --locked --features sync,serve -p agent-web-memory
 # The state directory, owned by the runtime user (distroless "nonroot" is uid/gid 65532) so that
 # a named volume mounted at /data starts with the right owner. Mode 0700 as `awm serve` expects.
-RUN mkdir /data && chmod 0700 /data && chown 65532:65532 /data
+# It sits under /rootfs so that the final stage copies it as an entry of "/" (see below).
+RUN mkdir -p /rootfs/data && chmod 0700 /rootfs/data && chown 65532:65532 /rootfs/data
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=builder /src/target/release/awm /usr/local/bin/awm
-# COPY recreates the directory with the default mode (0755), so the mode is set again here
-# (BuildKit's --chmod); without it a fresh container's `awm serve check` fails on files.
-COPY --from=builder --chown=65532:65532 --chmod=0700 /data /data
+# `COPY <dir> /data` copies the contents into a /data that the builder creates with the default
+# mode (0755) on some Docker versions, and a fresh container's `awm serve check` then fails on
+# files. Copying /data as an entry of "/" keeps its own mode and owner; --chmod states them again.
+COPY --from=builder --chown=65532:65532 --chmod=0700 /rootfs/ /
 COPY LICENSE THIRD_PARTY_LICENSES.md /licenses/
 
 # AWM_DATA and AWM_LISTEN are read by `awm serve` and by `awm serve healthcheck` alike (the

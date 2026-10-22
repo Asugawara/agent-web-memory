@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use awm::capture::{self, CaptureOpts, CaptureOutcome};
 use awm::config::{Config, Mode};
@@ -342,16 +341,7 @@ fn spool_files(dir: &Path) -> Vec<PathBuf> {
 #[test]
 fn locked_database_spools_and_next_run_drains() {
     let (_d, opts) = setup();
-    let db_path = opts.data_dir.join("awm.db");
-    let (tx, rx) = std::sync::mpsc::channel();
-    let locker = std::thread::spawn(move || {
-        let c = Connection::open(&db_path).unwrap();
-        c.execute_batch("BEGIN EXCLUSIVE").unwrap();
-        tx.send(()).unwrap();
-        std::thread::sleep(Duration::from_secs(3));
-        c.execute_batch("ROLLBACK").unwrap();
-    });
-    rx.recv().unwrap();
+    let locker = lock_db(&opts);
     let first = fixture("PostToolUse-WebFetch-plugin-3.json");
     let out = capture::run(&first, &opts).unwrap();
     assert_eq!(out, CaptureOutcome::Spooled);
@@ -362,7 +352,7 @@ fn locked_database_spools_and_next_run_drains() {
         name.starts_with(&format!("{NOW}-toolu_fixture000000000002")),
         "{name}"
     );
-    locker.join().unwrap();
+    locker.release();
 
     let mut later = opts.clone();
     later.now_ms = NOW + 10_000;
@@ -380,25 +370,41 @@ fn locked_database_spools_and_next_run_drains() {
     );
 }
 
-/// Holds an exclusive lock on the database for `secs` seconds.
-fn lock_db(opts: &CaptureOpts, secs: u64) -> std::thread::JoinHandle<()> {
+/// An exclusive lock on the database, held until `release` (or until it is dropped, so a failed
+/// assertion does not leave the thread behind). A fixed hold time raced the 2 s busy timeout on a
+/// slow runner: the lock was gone before the write started and the record was stored, not spooled.
+struct DbLock {
+    release: std::sync::mpsc::Sender<()>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl DbLock {
+    fn release(self) {
+        drop(self.release);
+        self.thread.join().unwrap();
+    }
+}
+
+fn lock_db(opts: &CaptureOpts) -> DbLock {
     let db_path = opts.data_dir.join("awm.db");
-    let (tx, rx) = std::sync::mpsc::channel();
-    let locker = std::thread::spawn(move || {
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
         let c = Connection::open(&db_path).unwrap();
         c.execute_batch("BEGIN EXCLUSIVE").unwrap();
-        tx.send(()).unwrap();
-        std::thread::sleep(Duration::from_secs(secs));
+        ready_tx.send(()).unwrap();
+        // Returns once the sender is dropped.
+        let _ = release_rx.recv();
         c.execute_batch("ROLLBACK").unwrap();
     });
-    rx.recv().unwrap();
-    locker
+    ready_rx.recv().unwrap();
+    DbLock { release, thread }
 }
 
 #[test]
 fn a_private_host_fetch_under_a_locked_database_leaves_no_spool_file() {
     let (_d, opts) = setup();
-    let locker = lock_db(&opts, 3);
+    let locker = lock_db(&opts);
     let p = fetch_payload(
         "toolu_priv",
         "http://localhost:8080/admin",
@@ -408,13 +414,13 @@ fn a_private_host_fetch_under_a_locked_database_leaves_no_spool_file() {
     let out = capture::run(&p, &opts).unwrap();
     assert_eq!(out, CaptureOutcome::Skipped("private host"));
     assert!(spool_files(&opts.data_dir).is_empty());
-    locker.join().unwrap();
+    locker.release();
 }
 
 #[test]
 fn the_spool_file_holds_no_secret_from_the_payload() {
     let (_d, opts) = setup();
-    let locker = lock_db(&opts, 3);
+    let locker = lock_db(&opts);
     let key = "AKIAIOSFODNN7EXAMPLE";
     let url = format!("https://api.example.com/v1?k={key}");
     let p = fetch_payload("toolu_sec", &url, 200, &format!("the key is {key}"));
@@ -423,7 +429,7 @@ fn the_spool_file_holds_no_secret_from_the_payload() {
     assert_eq!(files.len(), 1);
     let bytes = std::fs::read_to_string(&files[0]).unwrap();
     assert!(!bytes.contains(key), "{bytes}");
-    locker.join().unwrap();
+    locker.release();
 }
 
 #[test]
@@ -438,23 +444,20 @@ fn drain_spool_stops_at_the_first_locked_file() {
     )
     .unwrap()
     .unwrap();
-    for (i, id) in ["toolu_a", "toolu_b"].iter().enumerate() {
-        let mut r = rec.clone();
-        r.tool_use_id = (*id).to_string();
-        std::fs::write(
-            dir.join(format!("{}-{id}.json", NOW + i as i64)),
-            serde_json::to_string(&r).unwrap(),
-        )
-        .unwrap();
-    }
-    let locker = lock_db(&opts, 4);
-    let start = std::time::Instant::now();
+    std::fs::write(
+        dir.join(format!("{NOW}-toolu_a.json")),
+        serde_json::to_string(&rec).unwrap(),
+    )
+    .unwrap();
+    // Drained after the locked file would be: a drain that went on past it would delete this
+    // one as unreadable. (A wall-clock bound on the busy wait does not hold on the macOS
+    // runner, where the 2 s timeout takes about 4 s.)
+    std::fs::write(dir.join(format!("{}-toolu_b.json", NOW + 1)), "not json").unwrap();
+    let locker = lock_db(&opts);
     let deleted = capture::drain_spool(&opts).unwrap();
-    // One busy timeout is 2 s; a second file must not cost another.
-    assert!(start.elapsed() < Duration::from_millis(3500));
     assert_eq!(deleted, 0);
     assert_eq!(spool_files(&opts.data_dir).len(), 2);
-    locker.join().unwrap();
+    locker.release();
 }
 
 fn search_payload(id: &str, query: &str) -> Value {

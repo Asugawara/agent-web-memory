@@ -403,11 +403,19 @@ mod binary {
         f.sync_all().unwrap();
         drop(f);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(Command::new(&path)
-            .arg("--warm")
-            .status()
-            .unwrap()
-            .success());
+        // Another test thread may fork while the script is open for writing; that child holds the
+        // descriptor until it execs, and running the script fails with ETXTBSY until then.
+        let mut tries = 0;
+        let status = loop {
+            match Command::new(&path).arg("--warm").status() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 100 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => break other.unwrap(),
+            }
+        };
+        assert!(status.success());
         path
     }
 

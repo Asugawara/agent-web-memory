@@ -51,10 +51,9 @@ jobs:
       # Pebble (the local ACME server of the TLS tests and the smoke): pinned release, archive
       # verified against PEBBLE_LINUX_SHA256 before it is unpacked.
       PEBBLE_VERSION: v2.10.1
-      # SHA-256 of pebble-linux-amd64.tar.gz of the v2.10.1 release. NOT FILLED IN: it could not
-      # be fetched where this workflow was written (P-GH: download the asset once, run
-      # `sha256sum` on it and paste the value here; the install step fails until then).
-      PEBBLE_LINUX_SHA256: "FILL-IN-SHA256-OF-pebble-linux-amd64.tar.gz-v2.10.1"
+      # SHA-256 of pebble-linux-amd64.tar.gz of the v2.10.1 release (the release publishes no
+      # checksum file: taken from a download of the asset).
+      PEBBLE_LINUX_SHA256: "4f2fcb5bca8c85c9cf73ad140fccfc0d2be40bd81ab99879c79b7b8a0b4f70ed"
     steps:
       - uses: actions/checkout@v4
 
@@ -194,4 +193,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: scripts/check.sh
+        env:
+          # The Postgres and ACME cases run in the ubuntu job.
+          AWM_CHECK_ALLOW_SKIP: "1"
         run: bash scripts/check.sh

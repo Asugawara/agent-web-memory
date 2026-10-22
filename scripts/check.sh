@@ -37,7 +37,8 @@ cargo test -p agent-web-memory --locked --features sync,serve
 step "test (awm-server)"
 # awm-server with every feature (RVT2 M6): its tests are behind features (plan-v3-team §4.1, TM6),
 # and the Postgres and ACME cases need AWM_TEST_PG_URL and PEBBLE_BIN. Without them those cases
-# print a SKIP line and pass: counted here, a printed SKIP locally, a failure in CI.
+# print a SKIP line and pass: counted here, a printed SKIP locally, a failure in CI (the macOS
+# job sets AWM_CHECK_ALLOW_SKIP=1: it has no Postgres or Pebble, the ubuntu job runs those cases).
 server_log="$(mktemp)"
 trap 'rm -f "$server_log"' EXIT
 if ! cargo test -p awm-server --locked --features all -- --show-output >"$server_log" 2>&1; then
@@ -57,7 +58,7 @@ skipped_cases() {
 }
 if [ -z "${AWM_TEST_PG_URL:-}" ] || [ -z "${PEBBLE_BIN:-}" ]; then
   echo "SKIP: $(skipped_cases AWM_TEST_PG_URL) Postgres / $(skipped_cases PEBBLE_BIN) ACME cases not run (set AWM_TEST_PG_URL and PEBBLE_BIN)"
-  if [ "${CI:-}" = "true" ]; then
+  if [ "${CI:-}" = "true" ] && [ "${AWM_CHECK_ALLOW_SKIP:-}" != "1" ]; then
     echo "test (awm-server): FAILED (CI must set AWM_TEST_PG_URL and PEBBLE_BIN)"
     exit 1
   fi

@@ -28,6 +28,28 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
+/// The fixtures carry fixed 2026-09-20 timestamps, but the `awm` binary reads the real clock and
+/// `init` looks back 30 days for the page fetched twice: move them to yesterday so the test does
+/// not age out.
+fn date_fixtures_yesterday(dir: &Path) {
+    let day = (time::OffsetDateTime::now_utc() - time::Duration::days(1)).date();
+    let day = format!(
+        "{:04}-{:02}-{:02}",
+        day.year(),
+        u8::from(day.month()),
+        day.day()
+    );
+    for e in std::fs::read_dir(dir).unwrap() {
+        let path = e.unwrap().path();
+        if path.is_dir() {
+            date_fixtures_yesterday(&path);
+        } else {
+            let text = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, text.replace("2026-09-20", &day)).unwrap();
+        }
+    }
+}
+
 struct Env {
     _dir: tempfile::TempDir,
     projects: PathBuf,
@@ -409,6 +431,7 @@ fn init_without_a_terminal_prints_the_consent_text_and_creates_no_database() {
 #[test]
 fn init_with_record_and_import_creates_the_database_and_prints_s5() {
     let env = Env::new();
+    date_fixtures_yesterday(&env.projects);
     let home = env.data.join("fresh");
     let (out, ok) = awm(
         &home,
