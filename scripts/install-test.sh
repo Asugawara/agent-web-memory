@@ -63,7 +63,7 @@ echo "install-test: (a) good install"
 run "$work/p1" >"$work/a.log" 2>&1 || { cat "$work/a.log"; fail "(a) install failed"; }
 [ "$("$work/p1/bin/awm" --version)" = "awm $v" ] || fail "(a) wrong binary"
 for f in "$work"/p1/bin/.awm.*; do [ ! -e "$f" ] || fail "(a) temp file left behind"; done
-[ ! -e "$HOME/.claude" ] && [ ! -e "$HOME/.codex" ] || fail "(a) touched the home"
+if [ -e "$HOME/.claude" ] || [ -e "$HOME/.codex" ]; then fail "(a) touched the home"; fi
 
 echo "install-test: (b) second run"
 run "$work/p1" >"$work/b.log" 2>&1 || fail "(b) second run failed"
