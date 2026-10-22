@@ -111,7 +111,8 @@ fn test_plugin_manifest() {
         }
     }
 
-    // Assert plugin.json and marketplace.json versions are equal
+    // Assert plugin.json and marketplace.json versions both equal the crate version
+    let crate_version = env!("CARGO_PKG_VERSION");
     let plugin_version = plugin_json["version"]
         .as_str()
         .expect("plugin.json version missing");
@@ -119,8 +120,12 @@ fn test_plugin_manifest() {
         .as_str()
         .expect("marketplace.json version missing");
     assert_eq!(
-        plugin_version, marketplace_version,
-        "plugin.json and marketplace.json versions should match"
+        plugin_version, crate_version,
+        "plugin.json version should match the crate version"
+    );
+    assert_eq!(
+        marketplace_version, crate_version,
+        "marketplace.json version should match the crate version"
     );
 
     // Assert marketplace plugins[0].source is ./plugin
@@ -132,9 +137,10 @@ fn test_plugin_manifest() {
         "marketplace.json plugins[0].source should be './plugin'"
     );
 
-    // Assert awm-hook contains --plugin-version 0.1.0
+    // Assert awm-hook passes the crate version as --plugin-version
+    let expected = format!("--plugin-version {crate_version}");
     assert!(
-        awm_hook_text.contains("--plugin-version 0.1.0"),
-        "awm-hook should contain '--plugin-version 0.1.0'"
+        awm_hook_text.contains(&expected),
+        "awm-hook should contain '{expected}'"
     );
 }

@@ -13,7 +13,8 @@ body:
       options:
         - "claude plugin marketplace add"
         - "claude plugin install"
-        - "awm binary install (scripts/install-local.sh)"
+        - "awm binary install (curl installer, scripts/install.sh)"
+        - "awm binary install (build from source, scripts/install-local.sh)"
         - "awm init"
         - "First note injection"
         - Other

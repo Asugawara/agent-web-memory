@@ -6,10 +6,7 @@ for c in "$AWM_BIN" "$(command -v awm 2>/dev/null)" "$HOME/.local/bin/awm" "$HOM
   if [ -n "$c" ] && [ -x "$c" ]; then exec "$c" hook "$ev" --plugin-version 0.1.0; fi
 done
 if [ "$ev" = "session-start" ]; then
-  case "$(uname -s)" in
-    Darwin) line='brew install Asugawara/tap/awm' ;;
-    *) line='curl -fsSL https://github.com/Asugawara/agent-web-memory/releases/latest/download/install.sh | sh' ;;
-  esac
+  line='curl -fsSL https://github.com/Asugawara/agent-web-memory/releases/latest/download/install.sh | sh'
   printf '{"systemMessage":"agent-web-memory: the awm binary is not installed. Install it with: %s   then run: awm init"}\n' "$line"
 fi
 exit 0

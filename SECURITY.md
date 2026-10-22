@@ -10,7 +10,7 @@
 - **Injected text is bounded**: Notes are wrapped in XML tags, sanitized, capped at 9,500 characters, and labeled with their source and age. A PreToolUse deny (on by default for repeated fetches of a URL and for repeated searches; `short_circuit.mode` and `short_circuit.query` switch them off) hands the agent the same sanitised earlier result (up to 8,000 characters) as `additionalContext` (a one-line reason carries no page text), capped at 9,500 characters.
 - **Deletion is verifiable**: `awm forget` deletes the selected records immediately (tombstones stop them coming back); `awm purge` deletes by date or everything.
 - **Quarantine for unreliable records**: Mark a note or URL as unreliable with `awm quarantine`; quarantined records are never injected.
-- **Build integrity**: Builds are local for now: `scripts/install-local.sh` builds from source with `--locked`; a committed `Cargo.lock`, the default build has no network dependencies (`scripts/check.sh` no-network step); release builds add `sync` (an HTTP client used only by `awm sync`) and `serve`. No telemetry.
+- **Build integrity**: Release archives are built by `.github/workflows/release.yml` from a tagged commit with `--locked` and published with `SHA256SUMS`; `scripts/install.sh` checks the archive against it before installing it (the checksum does not protect against a compromised release); `scripts/install-local.sh` builds from source with `--locked`; a committed `Cargo.lock`, the default build has no network dependencies (`scripts/check.sh` no-network step); release builds add `sync` (an HTTP client used only by `awm sync`) and `serve`. No telemetry.
 - **No telemetry**: No metrics, counters, or analytics are collected or sent anywhere.
 
 ## Team sync (optional, v0.2 and later)
