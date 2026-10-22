@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use awm::capture::{self, CaptureOpts, CaptureOutcome};
 use awm::config::{Config, Mode};
@@ -445,20 +444,17 @@ fn drain_spool_stops_at_the_first_locked_file() {
     )
     .unwrap()
     .unwrap();
-    for (i, id) in ["toolu_a", "toolu_b"].iter().enumerate() {
-        let mut r = rec.clone();
-        r.tool_use_id = (*id).to_string();
-        std::fs::write(
-            dir.join(format!("{}-{id}.json", NOW + i as i64)),
-            serde_json::to_string(&r).unwrap(),
-        )
-        .unwrap();
-    }
+    std::fs::write(
+        dir.join(format!("{NOW}-toolu_a.json")),
+        serde_json::to_string(&rec).unwrap(),
+    )
+    .unwrap();
+    // Drained after the locked file would be: a drain that went on past it would delete this
+    // one as unreadable. (A wall-clock bound on the busy wait does not hold on the macOS
+    // runner, where the 2 s timeout takes about 4 s.)
+    std::fs::write(dir.join(format!("{}-toolu_b.json", NOW + 1)), "not json").unwrap();
     let locker = lock_db(&opts);
-    let start = std::time::Instant::now();
     let deleted = capture::drain_spool(&opts).unwrap();
-    // One busy timeout is 2 s; a second file must not cost another.
-    assert!(start.elapsed() < Duration::from_millis(3500));
     assert_eq!(deleted, 0);
     assert_eq!(spool_files(&opts.data_dir).len(), 2);
     locker.release();

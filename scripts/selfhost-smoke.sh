@@ -351,7 +351,9 @@ setup_mode() {
 }
 
 setup_pebble() {
-  [ -n "${PEBBLE_BIN:-}" ] && [ -x "$PEBBLE_BIN" ] || die "PEBBLE_BIN must name the pebble binary"
+  if [ -z "${PEBBLE_BIN:-}" ] || [ ! -x "$PEBBLE_BIN" ]; then
+    die "PEBBLE_BIN must name the pebble binary"
+  fi
   command -v openssl >/dev/null 2>&1 || die "openssl is required for --tls pebble"
   local d="$WORK/pebble" listen mgmt http tls
   mkdir -p "$d"
@@ -522,7 +524,9 @@ step_init() {
   local sha exp
   sha="$(printf '%s\n' "$out" | sed -n 's/^AWM_BOOTSTRAP_SHA256=//p')"
   exp="$(printf '%s\n' "$out" | sed -n 's/^AWM_BOOTSTRAP_EXPIRES=//p')"
-  [ -n "$BOOT_TOKEN" ] && [ -n "$sha" ] && [ -n "$exp" ] || die "serve init --print-hash printed no token"
+  if [ -z "$BOOT_TOKEN" ] || [ -z "$sha" ] || [ -z "$exp" ]; then
+    die "serve init --print-hash printed no token"
+  fi
   if [ "$MODE" = image ]; then
     BOOT_ENV=(-e "AWM_BOOTSTRAP_SHA256=$sha" -e "AWM_BOOTSTRAP_EXPIRES=$exp")
   else
