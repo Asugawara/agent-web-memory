@@ -1,8 +1,11 @@
 # CI (plan-v3-team §9.1, §6.5). `release.yml` is P-GH's; the weekly `cargo deny` job is TM25's.
 #
-# Ubuntu: scripts/check.sh, the Postgres and Pebble test lines, hook-nonet (self-test and run),
-# the systemd unit checks, the container image, the three self-hosting smoke modes (and the
-# seeded restore), shellcheck. macOS: scripts/check.sh only.
+# Ubuntu runs four jobs: `ubuntu-lint` (scripts/check.sh lint, shellcheck), `ubuntu-test`
+# (scripts/check.sh test, the Postgres and Pebble test lines, hook-nonet), `ubuntu-smoke` (the
+# systemd unit checks, the container image, the self-hosting smoke modes and the seeded restore),
+# and the `ubuntu` gate, which is green only when the three before it are. macOS: scripts/check.sh test.
+#
+# The required checks are `ubuntu` and `macos`.
 #
 # No secrets are used anywhere: the Postgres service container has throw-away credentials and
 # the pull_request trigger from a fork gets a read-only token.
@@ -24,11 +27,61 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # CI debug and test builds keep file:line but drop the rest of the debuginfo, which makes links
+  # faster and the cache smaller. The test profile inherits it.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
-  ubuntu:
+  ubuntu-lint:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+          # cargo-deny: the pinned release binary (a few seconds) rather than `cargo install`, which
+          # compiles for minutes and is not covered by the cargo cache (it caches no ~/.cargo/bin).
+          # scripts/check.sh fails under CI when cargo-deny is absent (VF-A A2).
+          curl -fsSL https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz |
+            sudo tar -xz --strip-components=1 -C /usr/local/bin --wildcards '*/cargo-deny'
+          cargo-deny --version
+
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: |
+          set -euo pipefail
+          rustup toolchain install --profile minimal --component rustfmt --component clippy "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup show active-toolchain
+
+      # Dependencies only (not the workspace crates). Saved from main alone; pull requests restore
+      # main's entry, so caches do not evict each other.
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+
+      - name: scripts/check.sh lint
+        run: bash scripts/check.sh lint
+
+      - name: shellcheck (the smoke script, strict)
+        run: shellcheck scripts/selfhost-smoke.sh
+
+      - name: shellcheck (the other scripts and the hook, warnings and errors)
+        run: |
+          set -euo pipefail
+          files=(plugin/hooks/awm-hook)
+          for f in scripts/*.sh; do
+            [ "$f" = scripts/selfhost-smoke.sh ] || files+=("$f")
+          done
+          shellcheck --severity=warning "${files[@]}"
+
+  ubuntu-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     services:
       postgres:
         image: postgres:16
@@ -61,13 +114,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends jq sqlite3 curl openssl postgresql-client shellcheck strace
-          # cargo-deny: the pinned release binary (a few seconds) rather than `cargo install`, which
-          # compiles for minutes and is not covered by the cargo cache (it caches no ~/.cargo/bin).
-          # scripts/check.sh fails under CI when cargo-deny is absent (VF-A A2).
-          curl -fsSL https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz |
-            sudo tar -xz --strip-components=1 -C /usr/local/bin --wildcards '*/cargo-deny'
-          cargo-deny --version
+          sudo apt-get install -y --no-install-recommends jq sqlite3 curl openssl postgresql-client strace
 
       - name: Rust toolchain (rust-toolchain.toml)
         run: |
@@ -75,16 +122,13 @@ jobs:
           rustup toolchain install --profile minimal --component rustfmt --component clippy "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)"
           rustup show active-toolchain
 
-      - name: Cargo cache
-        uses: actions/cache@v4
+      # Dependencies only (not the workspace crates). Saved from main alone; pull requests restore
+      # main's entry, so caches do not evict each other.
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
 
       - name: Install Pebble
         run: |
@@ -98,11 +142,11 @@ jobs:
           chmod +x "$bin"
           echo "PEBBLE_BIN=$bin" >> "$GITHUB_ENV"
 
-      # check.sh runs awm-server with every feature (RVT2 M6, FT2): the Postgres cases use
+      # check.sh test runs awm-server with every feature (RVT2 M6, FT2): the Postgres cases use
       # AWM_TEST_PG_URL (job env) and the ACME cases PEBBLE_BIN (set above). With CI=true it
       # fails instead of printing SKIP when either is unset.
-      - name: scripts/check.sh
-        run: bash scripts/check.sh
+      - name: scripts/check.sh test
+        run: bash scripts/check.sh test
 
       - name: Hook without network, self-test (TM13)
         run: bash scripts/hook-nonet.sh --self-test
@@ -110,14 +154,75 @@ jobs:
       - name: Hook without network (TM13)
         run: bash scripts/hook-nonet.sh
 
-      - name: Release binary
-        run: cargo build --release --locked -p agent-web-memory --features sync,serve
+  ubuntu-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: awm
+          POSTGRES_PASSWORD: awm
+          POSTGRES_DB: awm_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U awm -d awm_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # A superuser URL: the tests create their own schemas and the awm_owner / awm_app roles,
+      # the smoke script its own database and roles. Without it every Postgres case would
+      # return early and pass (TM26), so it is set for the whole job.
+      AWM_TEST_PG_URL: postgres://awm:awm@127.0.0.1:5432/awm_test
+      # Pebble (the local ACME server of the TLS tests and the smoke): pinned release, archive
+      # verified against PEBBLE_LINUX_SHA256 before it is unpacked.
+      PEBBLE_VERSION: v2.10.1
+      # SHA-256 of pebble-linux-amd64.tar.gz of the v2.10.1 release (the release publishes no
+      # checksum file: taken from a download of the asset).
+      PEBBLE_LINUX_SHA256: "4f2fcb5bca8c85c9cf73ad140fccfc0d2be40bd81ab99879c79b7b8a0b4f70ed"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq sqlite3 curl openssl postgresql-client
+
+      - name: Install Pebble
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/pebble.tar.gz" \
+            "https://github.com/letsencrypt/pebble/releases/download/${PEBBLE_VERSION}/pebble-linux-amd64.tar.gz"
+          echo "${PEBBLE_LINUX_SHA256}  $RUNNER_TEMP/pebble.tar.gz" | sha256sum --check --strict -
+          mkdir -p "$RUNNER_TEMP/pebble"
+          tar -xzf "$RUNNER_TEMP/pebble.tar.gz" -C "$RUNNER_TEMP/pebble"
+          bin="$(find "$RUNNER_TEMP/pebble" -type f -name pebble | head -n 1)"
+          chmod +x "$bin"
+          echo "PEBBLE_BIN=$bin" >> "$GITHUB_ENV"
+
+      - name: Container image
+        run: docker build -t awm:dev .
+
+      # The smoke clients and the systemd check use the binary that ships in the image, built by
+      # the Dockerfile with the same toolchain and features. That avoids a second release build.
+      # The Debian bookworm glibc build runs on ubuntu-latest.
+      - name: awm binary from the image
+        run: |
+          set -euo pipefail
+          cid="$(docker create awm:dev)"
+          docker cp "$cid:/usr/local/bin/awm" "$RUNNER_TEMP/awm"
+          docker rm "$cid"
+          "$RUNNER_TEMP/awm" --version
+          echo "AWM_BIN=$RUNNER_TEMP/awm" >> "$GITHUB_ENV"
 
       - name: systemd unit (verify and exposure score)
         run: |
           set -euo pipefail
           sudo useradd --system --no-create-home --shell /usr/sbin/nologin awm || true
-          sudo install -m 0755 target/release/awm /usr/local/bin/awm
+          sudo install -m 0755 "$AWM_BIN" /usr/local/bin/awm
           sudo install -d -m 0755 /etc/awm
           sudo install -m 0600 /dev/null /etc/awm/serve.env
           systemd-analyze verify deploy/systemd/awm-serve.service
@@ -130,9 +235,6 @@ jobs:
           fi
           echo "exposure level: $score (limit 3.0)"
           awk -v s="$score" 'BEGIN { exit !(s <= 3.0) }'
-
-      - name: Container image
-        run: docker build -t awm:dev .
 
       - name: Smoke, SqliteStore with built-in TLS against Pebble
         run: bash scripts/selfhost-smoke.sh --store sqlite --tls pebble
@@ -148,17 +250,22 @@ jobs:
           AWM_SMOKE_MAX_RESTORE_S: "60"
         run: bash scripts/selfhost-smoke.sh --store sqlite --tls pebble --seed 20000
 
-      - name: shellcheck (the smoke script, strict)
-        run: shellcheck scripts/selfhost-smoke.sh
-
-      - name: shellcheck (the other scripts and the hook, warnings and errors)
+  # The required check `ubuntu` (branch protection): green only when every ubuntu-* job is.
+  # `always()`: without it a failed need skips this job, and a skipped required check passes.
+  ubuntu:
+    if: always()
+    needs: [ubuntu-lint, ubuntu-test, ubuntu-smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: All ubuntu jobs passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
         run: |
-          set -euo pipefail
-          files=(plugin/hooks/awm-hook)
-          for f in scripts/*.sh; do
-            [ "$f" = scripts/selfhost-smoke.sh ] || files+=("$f")
+          echo "results: $RESULTS"
+          for r in $RESULTS; do
+            [ "$r" = success ] || exit 1
           done
-          shellcheck --severity=warning "${files[@]}"
 
   macos:
     runs-on: macos-latest
@@ -166,34 +273,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Tools
-        run: |
-          set -euo pipefail
-          mkdir -p "$HOME/.local/bin"
-          curl -fsSL https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-aarch64-apple-darwin.tar.gz |
-            tar -xz --strip-components=1 -C "$HOME/.local/bin" --include '*/cargo-deny'
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/cargo-deny" --version
-
       - name: Rust toolchain (rust-toolchain.toml)
         run: |
           set -euo pipefail
           rustup toolchain install --profile minimal --component rustfmt --component clippy "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)"
           rustup show active-toolchain
 
-      - name: Cargo cache
-        uses: actions/cache@v4
+      # Dependencies only (not the workspace crates). Saved from main alone; pull requests restore
+      # main's entry, so caches do not evict each other.
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
 
-      - name: scripts/check.sh
+      # macOS runs only the test group. The lint group checks the same code on ubuntu, because the
+      # only platform cfgs are `unix` and `not(unix)` and there are no target-specific dependencies.
+      - name: scripts/check.sh test
         env:
           # The Postgres and ACME cases run in the ubuntu job.
           AWM_CHECK_ALLOW_SKIP: "1"
-        run: bash scripts/check.sh
+        run: bash scripts/check.sh test
