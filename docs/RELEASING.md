@@ -37,7 +37,7 @@ The plugin comes from the default branch, while the binary comes from the latest
 
 The draft release stays and `latest` does not move, so users keep the previous release. To retry:
 
-1. Delete the draft: `gh release delete vX.Y.Z` (do not delete a published release).
+1. If `gh release view vX.Y.Z` shows a draft, delete it with `gh release delete vX.Y.Z`. Do not delete a published release, and do not add `--cleanup-tag`: without the tag the failed jobs cannot be re-run. A failure before the draft exists (build, sums, install-sh) leaves nothing to delete.
 2. Re-run the failed jobs of the workflow run: `gh run rerun <run-id> --failed`.
 
 ## Release assets
