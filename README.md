@@ -1,13 +1,40 @@
 # agent-web-memory
 
+English | [日本語](README.ja.md)
+
 Local memory for your Claude Code agents. Records every WebSearch and WebFetch call into one local SQLite file, and shows your agents their earlier findings when they repeat web research — without sending data anywhere.
 
 ## Install
 
-### 1. Build and install the binary
+### 1. Install the binary
 
 ```bash
-cd path/to/agent-web-memory
+curl -fsSL https://github.com/Asugawara/agent-web-memory/releases/latest/download/install.sh | sh
+```
+
+The script downloads the archive for your OS and CPU from the latest GitHub release, checks its SHA-256 against the release's `SHA256SUMS`, and installs `awm` to `~/.local/bin/awm`. It does not touch your Claude Code settings or your data. Read it first: [scripts/install.sh](scripts/install.sh). The checksum catches a damaged or mixed-up download, but it does not protect you against a compromised release.
+
+Requirements: macOS or Linux (Linux needs glibc 2.35 or newer; the binaries are built on Ubuntu 22.04), x86_64 or aarch64, `curl` or `wget`, and `tar`. No Rust or Node.js. Windows is not supported.
+
+`~/.local/bin` must be on your PATH. The script prints the line to add for your shell.
+
+| Option | Meaning |
+|--------|---------|
+| `--version vX.Y.Z` | Install this version, e.g. `curl -fsSL <url> \| sh -s -- --version v0.1.0` |
+| `--force` | Reinstall even when that version is already installed |
+
+| Environment | Meaning |
+|-------------|---------|
+| `AWM_INSTALL_PREFIX` | The binary goes to `$AWM_INSTALL_PREFIX/bin`. Default `~/.local` |
+| `AWM_INSTALL_VERSION` | Version to install. Default: the latest release |
+| `AWM_INSTALL_BASE_URL` | Where releases are downloaded from. Default `https://github.com/Asugawara/agent-web-memory/releases` |
+| `AWM_INSTALL_DOWNLOADER` | `curl` or `wget` |
+
+**Build from source** (needs Rust):
+
+```bash
+git clone https://github.com/Asugawara/agent-web-memory.git
+cd agent-web-memory
 bash scripts/install-local.sh
 ```
 
@@ -18,7 +45,7 @@ When you install a build with a newer database schema over an existing database,
 ### 2. Add the plugin to Claude Code
 
 ```bash
-claude plugin marketplace add path/to/agent-web-memory
+claude plugin marketplace add Asugawara/agent-web-memory
 claude plugin install agent-web-memory@agent-web-memory
 ```
 
@@ -151,6 +178,16 @@ awm setup --remove-codex-hooks
 - **Deletable**: `awm forget` and `awm purge` permanently remove records. `awm config set mode off` pauses recording without deleting anything.
 - **Your control**: `awm config` lets you turn off channels, adjust matching thresholds, and pause recording.
 
+## Update
+
+Run the install command again. It replaces the binary when a newer release exists; `--force` reinstalls the same version.
+
+```bash
+curl -fsSL https://github.com/Asugawara/agent-web-memory/releases/latest/download/install.sh | sh
+```
+
+Then run `awm doctor` once, because hooks never migrate the database.
+
 ## Uninstall
 
 To pause without deleting anything:
@@ -173,6 +210,14 @@ To delete everything:
    ```
 
 3. **Remove the binary:**
+
+   If you installed with the script:
+   ```bash
+   rm ~/.local/bin/awm
+   ```
+   (or `$AWM_INSTALL_PREFIX/bin/awm` if you set that)
+
+   If you built from a checkout:
    ```bash
    bash scripts/uninstall-local.sh
    ```

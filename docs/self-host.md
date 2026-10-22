@@ -52,7 +52,7 @@ You need root on the host, port 443 open to the internet, and DNS for your name 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
 tar xzf awm-VERSION-x86_64-unknown-linux-gnu.tar.gz
-install -m 0755 awm /usr/local/bin/awm
+install -m 0755 awm-VERSION-x86_64-unknown-linux-gnu/awm /usr/local/bin/awm
 awm --version
 ```
 
@@ -303,7 +303,7 @@ On Postgres (path A) the lines `files` and the integrity pragma are skipped, ope
 
 **The binary never updates itself and never calls home.** You decide when. `awm serve check` prints the version and the `min_client` the server enforces.
 
-- **systemd**: download the new release, verify it against `SHA256SUMS`, `install -m 0755 awm /usr/local/bin/awm`, `systemctl restart awm-serve`, `awm serve check`. The server runs its migrations at start and keeps `server.db.bak-vN` first. A server refuses a database from a newer version (exit 3): downgrade by restoring a backup, not by running an old binary on a new database.
+- **systemd**: download the new release, verify it against `SHA256SUMS`, `install -m 0755 awm-VERSION-x86_64-unknown-linux-gnu/awm /usr/local/bin/awm`, `systemctl restart awm-serve`, `awm serve check`. The server runs its migrations at start and keeps `server.db.bak-vN` first. A server refuses a database from a newer version (exit 3): downgrade by restoring a backup, not by running an old binary on a new database.
 - **docker compose**: `docker compose pull && docker compose up -d` (or `--build`). The certificate and data live in the volume and survive.
 - **Members** update their `awm` when they like. To require a minimum client version (after a protocol or redaction fix), raise `min_client` as an admin: `awm team policy set min_client=0.2.1`. Older clients then stop syncing with a message; hooks and local use are untouched. Check the release notes for fixes that matter to you.
 - After an upgrade: `awm serve check`, and one `awm sync` from a member machine.
