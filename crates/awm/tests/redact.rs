@@ -7,8 +7,8 @@ fn run(text: &str) -> (String, u32) {
 #[test]
 fn secret_shapes_are_redacted() {
     let aws = "AKIAIOSFODNN7EXAMPLE";
-    let asia = "ASIAIOSFODNN7EXAMPLE";
-    let gcp = "AIzaSy0123456789abcdefghijklmnopqrstuvw";
+    let asia = format!("ASIA{}", "IOSFODNN7EXAMPLE");
+    let gcp = format!("AIzaSy{}", "0123456789abcdefghijklmnopqrstuvw");
     assert_eq!(gcp.len(), 39);
     let ghp = format!("ghp_{}", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8");
     let gho = format!("gho_{}", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8");
