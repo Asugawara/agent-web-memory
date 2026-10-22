@@ -102,9 +102,6 @@ jobs:
       # AWM_TEST_PG_URL (job env) and the ACME cases PEBBLE_BIN (set above). With CI=true it
       # fails instead of printing SKIP when either is unset.
       - name: scripts/check.sh
-        env:
-          # The Postgres and ACME cases run in the ubuntu job.
-          AWM_CHECK_ALLOW_SKIP: "1"
         run: bash scripts/check.sh
 
       - name: Hook without network, self-test (TM13)
@@ -196,4 +193,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: scripts/check.sh
+        env:
+          # The Postgres and ACME cases run in the ubuntu job.
+          AWM_CHECK_ALLOW_SKIP: "1"
         run: bash scripts/check.sh
