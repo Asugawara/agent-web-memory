@@ -128,6 +128,9 @@ bin="$root/target/debug/awm"
 home="$(mktemp -d)"
 trap 'rm -rf "$home"' EXIT
 export AWM_HOME="$home"
+# A hook catches its own panic and exits 0; only with AWM_DEBUG=1 does it say so on stderr,
+# which the panic check below reads. AWM_DEBUG changes nothing but stderr output.
+export AWM_DEBUG=1
 fixtures="crates/awm/tests/fixtures/hooks"
 
 AWM_SEED_HOME="$home" cargo test --locked -p agent-web-memory --features sync,serve \
