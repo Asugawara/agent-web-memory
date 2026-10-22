@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 # No hook opens an internet socket (plan-v3-team §4.1 item 5; TM13).
 #
-# Builds a `sync,serve` release binary, configures a team (an unroutable server, and
+# Builds a `sync,serve` debug binary, configures a team (an unroutable server, and
 # `team.sync_interval_s = 0` so every session-start and capture spawns `awm sync`), runs every
 # hook under `strace -f -e trace=%network,%process`, and fails if a `socket(AF_INET...)`, `socket(AF_INET6...)`
 # or a `connect()` to an internet address appears in the hook process. The detached
 # `awm sync --once --quiet` child is a separate process and is excluded by its pid: it is the
 # process that `execve`s with the arguments `sync --once --quiet` (and its descendants).
 #
+# A debug build is enough: the hook code path is the same, and the only `cfg(debug_assertions)`
+# difference on it is `AWM_TEST_SYNC_EXE` in `sync/spawn.rs`, which this script does not set.
+# It also fails when a hook panics and when a hook run ends at its deadline or in an error.
+#
 # Linux only (strace). Elsewhere it prints "linux only" and exits 0; CI runs it on Linux and
-# needs `strace` and `python3` installed (`apt-get install -y strace python3`).
+# needs `strace`, `python3` and `sqlite3` installed (`apt-get install -y strace python3 sqlite3`).
 #
 #   scripts/hook-nonet.sh              build, trace every hook
 #   scripts/hook-nonet.sh --self-test  check the log analysis on synthetic strace output (any OS)
@@ -116,16 +120,17 @@ if [ "$(uname -s)" != "Linux" ]; then
 fi
 command -v strace >/dev/null || { echo "hook-nonet: strace is not installed (apt-get install -y strace)"; exit 2; }
 command -v python3 >/dev/null || { echo "hook-nonet: python3 is not installed"; exit 2; }
+command -v sqlite3 >/dev/null || { echo "hook-nonet: sqlite3 is not installed"; exit 2; }
 
-cargo build --release --locked -p agent-web-memory --features sync,serve
-bin="$root/target/release/awm"
+cargo build --locked -p agent-web-memory --features sync,serve
+bin="$root/target/debug/awm"
 
 home="$(mktemp -d)"
 trap 'rm -rf "$home"' EXIT
 export AWM_HOME="$home"
 fixtures="crates/awm/tests/fixtures/hooks"
 
-AWM_SEED_HOME="$home" cargo test --release --locked -p agent-web-memory --features sync,serve \
+AWM_SEED_HOME="$home" cargo test --locked -p agent-web-memory --features sync,serve \
   --test hooks_e2e seed_latency_db -- --ignored --exact >/dev/null
 
 # A team on an unroutable server; every session-start and capture spawns `awm sync`.
@@ -138,7 +143,9 @@ device_id = "00000000-0000-4000-8000-000000000003"
 TOML
 echo '{}' >"$home/team.key"
 chmod 600 "$home/team.toml" "$home/team.key"
-printf '[team]\nsync_interval_s = 0\n' >"$home/config.toml"
+# The debug build is slow: a hook cut short by the default 500 ms deadline leaves a short trace
+# that would pass. 2000 is the maximum the config accepts.
+printf '[team]\nsync_interval_s = 0\n\n[hooks]\ndeadline_ms = 2000\n' >"$home/config.toml"
 
 status=0
 n=0
@@ -156,7 +163,7 @@ p["session_id"] = "nonet-%s" % sys.argv[2]
 p["tool_use_id"] = "toolu_nonet_%s" % sys.argv[2]
 print(json.dumps(p))
 PY
-  strace -f -qq -e trace=%network,%process -s 200 -o "$log" "$bin" hook "$hook" <"$home/payload-$n.json" >/dev/null 2>&1 || true
+  strace -f -qq -e trace=%network,%process -s 200 -o "$log" "$bin" hook "$hook" <"$home/payload-$n.json" >/dev/null 2>"$home/stderr-$n.log" || true
   # The detached child outlives the hook; give it a moment to exec so it is in the log.
   sleep 1
   if offenders="$(analyze "$log")"; then
@@ -164,6 +171,11 @@ PY
   else
     echo "FAIL $hook ($fixture): an internet socket in the hook process:"
     echo "$offenders" | head -5
+    status=1
+  fi
+  if grep -q 'panicked' "$home/stderr-$n.log"; then
+    echo "FAIL $hook ($fixture): the hook panicked:"
+    head -5 "$home/stderr-$n.log"
     status=1
   fi
 }
@@ -179,6 +191,14 @@ trace prompt UserPromptSubmit-none-plugin-1.json
 # The exclusion must have been exercised: a trace holds the spawned `awm sync` child.
 if ! grep -lq '"sync", "--once", "--quiet"' "$home"/strace-*.log; then
   echo "FAIL no trace holds the spawned awm sync child: the spawn was not exercised"
+  status=1
+fi
+
+# A hook that ended at its deadline or in an error stopped early: its trace proves nothing.
+early="$(sqlite3 "$home/awm.db" "SELECT count(*) FROM hook_run WHERE outcome IN ('deadline','error')")"
+if [ "$early" != 0 ]; then
+  echo "FAIL $early hook run(s) ended at the deadline or in an error:"
+  sqlite3 "$home/awm.db" "SELECT hook, outcome, total_ms, error FROM hook_run WHERE outcome IN ('deadline','error')" | head -5
   status=1
 fi
 
