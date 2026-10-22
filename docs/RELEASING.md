@@ -33,6 +33,13 @@ Tag a stable version. A tag with a hyphen (for example `v0.1.0-rc.1`) is publish
 
 The plugin comes from the default branch, while the binary comes from the latest release. Merge a minor or major bump right before tagging. If the release fails, hold further version bumps on `main` until it is fixed; otherwise users see an "Upgrade awm" prompt that `install.sh` cannot resolve.
 
+## If publish fails
+
+The draft release stays and `latest` does not move, so users keep the previous release. To retry:
+
+1. Delete the draft: `gh release delete vX.Y.Z` (do not delete a published release).
+2. Re-run the failed jobs of the workflow run: `gh run rerun <run-id> --failed`.
+
 ## Release assets
 
 - `awm-<version>-<triple>.tar.gz` for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`. Each unpacks to a directory `awm-<version>-<triple>/` with `awm`, `LICENSE` and `THIRD_PARTY_LICENSES.md`.

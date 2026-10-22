@@ -24,6 +24,7 @@ main() {
     say "warning: running as root: the files under $PREFIX will be owned by root"
   fi
   detect_triple
+  TMP=$(mktemp -d)
   resolve_version
   install_version
   path_hint
@@ -58,6 +59,7 @@ parse_args() {
     esac
   done
   V=${V#v}
+  [ -z "$V" ] || case $V in *[!0-9A-Za-z.+-]*) err "invalid version: $V"; exit 2 ;; esac
 }
 
 need() {
@@ -118,7 +120,7 @@ fetch() {
 
 resolve_version() {
   [ -z "$V" ] || return 0
-  t=$(mktemp)
+  t=$TMP/sums
   if ! fetch "$BASE/latest/download/SHA256SUMS" "$t" 2>/dev/null; then
     rm -f "$t"
     err "no published release found at $BASE (or no network)"
@@ -155,7 +157,6 @@ install_version() {
   fi
 
   name=awm-$V-$TRIPLE
-  TMP=$(mktemp -d)
   say "downloading awm $V ($TRIPLE)"
   fetch "$BASE/download/v$V/$name.tar.gz" "$TMP/$name.tar.gz" \
     || { err "download failed: $BASE/download/v$V/$name.tar.gz"; exit 1; }

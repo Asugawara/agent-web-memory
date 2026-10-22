@@ -186,6 +186,7 @@ jobs:
           got="$("$RUNNER_TEMP/prefix/bin/awm" --version)"
           if [ "$got" != "awm $V" ]; then echo "version mismatch: got $got, want awm $V"; exit 1; fi
           if [ -e "$HOME/.claude" ]; then echo "install.sh wrote $HOME/.claude"; exit 1; fi
+          if [ -e "$HOME/.codex" ]; then echo "install.sh wrote $HOME/.codex"; exit 1; fi
       - name: install.sh with wget
         if: runner.os == 'Linux'
         run: |

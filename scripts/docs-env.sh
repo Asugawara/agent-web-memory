@@ -10,8 +10,7 @@ cd "$(dirname "$0")/.."
 # `from_env(.., "AWM_X")`), `ENV AWM_X=` in the Dockerfile (continuation lines joined) and
 # `AWM_X:` keys in the compose file. A documented name that ends in `_` (`AWM_ACME_*`) is a
 # prefix of a read name. Names of other tools are allow-listed.
-doc_files=(docs/self-host.md deploy README.md)
-[ -f README.ja.md ] && doc_files+=(README.ja.md)
+doc_files=(docs/self-host.md deploy README.md README.ja.md)
 doc_names="$(grep -rhoE 'AWM_[A-Z0-9_]+' "${doc_files[@]}" | sort -u)"
 read_names="$(
   {

@@ -63,6 +63,7 @@ echo "install-test: (a) good install"
 run "$work/p1" >"$work/a.log" 2>&1 || { cat "$work/a.log"; fail "(a) install failed"; }
 [ "$("$work/p1/bin/awm" --version)" = "awm $v" ] || fail "(a) wrong binary"
 for f in "$work"/p1/bin/.awm.*; do [ ! -e "$f" ] || fail "(a) temp file left behind"; done
+[ ! -e "$HOME/.claude" ] && [ ! -e "$HOME/.codex" ] || fail "(a) touched the home"
 
 echo "install-test: (b) second run"
 run "$work/p1" >"$work/b.log" 2>&1 || fail "(b) second run failed"
@@ -78,7 +79,16 @@ cp "$mirror/download/v$v/SHA256SUMS" "$work/good"
 sum_line=$(grep "awm-$v-$triple" "$work/good" | sed 's/^[0-9a-f]*/0000000000000000000000000000000000000000000000000000000000000000/')
 echo "$sum_line" >"$mirror/download/v$v/SHA256SUMS"
 if run "$work/p2" --version "v$v" >"$work/d.log" 2>&1; then fail "(d) tampered sums installed"; fi
+grep -q "checksum mismatch" "$work/d.log" || fail "(d) failed for another reason"
 [ ! -e "$work/p2/bin/awm" ] || fail "(d) a binary was installed"
+cp "$work/good" "$mirror/download/v$v/SHA256SUMS"
+
+echo "install-test: (g) SHA256SUMS has no line for the archive"
+grep -v "awm-$v-$triple" "$work/good" >"$mirror/download/v$v/SHA256SUMS" || true
+echo "0 other.tar.gz" >>"$mirror/download/v$v/SHA256SUMS"
+if run "$work/p5" --version "v$v" >"$work/g.log" 2>&1; then fail "(g) installed without a checksum line"; fi
+grep -q "checksum mismatch" "$work/g.log" || fail "(g) failed for another reason"
+[ ! -e "$work/p5/bin/awm" ] || fail "(g) a binary was installed"
 cp "$work/good" "$mirror/download/v$v/SHA256SUMS"
 
 echo "install-test: (e) unsupported platform"
@@ -88,12 +98,18 @@ cat >"$work/fakebin/uname" <<'STUB'
 case "$1" in -s) echo Plan9 ;; *) echo mips ;; esac
 STUB
 chmod 755 "$work/fakebin/uname"
-if PATH="$work/fakebin:$PATH" run "$work/p3" >"$work/e.log" 2>&1; then fail "(e) unsupported platform installed"; fi
+if (PATH="$work/fakebin:$PATH"; run "$work/p3") >"$work/e.log" 2>&1; then fail "(e) unsupported platform installed"; fi
+grep -q "unsupported platform" "$work/e.log" || fail "(e) failed for another reason"
 [ ! -e "$work/p3/bin/awm" ] || fail "(e) a binary was installed"
 
 echo "install-test: (f) bin/awm is a directory"
 mkdir -p "$work/p4/bin/awm"
 if run "$work/p4" >"$work/f.log" 2>&1; then fail "(f) installed over a directory"; fi
+grep -q "is a directory" "$work/f.log" || fail "(f) failed for another reason"
 [ -z "$(ls -A "$work/p4/bin/awm")" ] || fail "(f) something was moved into the directory"
+
+echo "install-test: (h) invalid version is rejected"
+rc=0; run "$work/p6" --version ../x >"$work/h.log" 2>&1 || rc=$?
+if [ "$rc" != 2 ] || ! grep -q "invalid version" "$work/h.log"; then fail "(h) --version ../x not rejected with exit 2"; fi
 
 echo "install-test: ok"
